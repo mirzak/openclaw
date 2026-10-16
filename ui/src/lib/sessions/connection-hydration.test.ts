@@ -3,7 +3,7 @@ import {
   GatewayProtocolClient,
   type GatewayProtocolSocketHandlers,
 } from "@openclaw/gateway-client/browser";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 // @vitest-environment node
 import { SIDEBAR_SESSION_ROSTER_LIMIT } from "../../../../src/shared/session-list-limits.ts";
 import { createDeferred } from "../../../../test/helpers/promise.js";
@@ -52,6 +52,33 @@ function hydration(request: GatewayBrowserClient["request"]) {
   cleanup.push(harness.sessions.dispose);
   return harness;
 }
+function observer(
+  subscribe: (attempt: number) => unknown,
+  list: (params: Record<string, unknown> | undefined, attempt: number) => unknown = () =>
+    sessionsResult([], 1),
+) {
+  let subscriptions = 0;
+  let lists = 0;
+  const request = requestFor(
+    () => subscribe(++subscriptions),
+    (params) => list(params, ++lists),
+  );
+  return {
+    ...hydration(request as unknown as GatewayBrowserClient["request"]),
+    request,
+    get subscriptionCalls() {
+      return subscriptions;
+    },
+  };
+}
+function retryOnce(message: string) {
+  return (attempt: number) => {
+    if (attempt === 1) {
+      throw retryError(message);
+    }
+    return { subscribed: true };
+  };
+}
 function connection(
   request: GatewayBrowserClient["request"],
   selectedId = "main",
@@ -86,6 +113,7 @@ function connection(
     },
     selectedId,
   );
+  cleanup.push(sessions.dispose);
   return {
     sessions,
     client,
@@ -97,7 +125,6 @@ function connection(
     },
   };
 }
-
 const listCallsOf = (request: { mock: { calls: readonly (readonly unknown[])[] } }) =>
   request.mock.calls.filter(([method]) => method === "sessions.list");
 
@@ -136,641 +163,489 @@ const targetedSessionReconciliationCases = [
       ).toBe(true);
     },
   },
-];
+] as const;
 
-describe("session connection hydration", () => {
-  it("lets a queued foreground refresh supersede an owner-first bootstrap roster", async () => {
-    const roster: SessionsListResult = {
-      ...sessionsResult([], 1),
-      count: 3,
-      sessions: [
-        {
-          key: "agent:main:mine-new",
-          kind: "direct",
-          updatedAt: 3,
-          createdActor: { type: "human", id: "operator" },
-        },
-        {
-          key: "agent:main:mine-old",
-          kind: "direct",
-          updatedAt: 1,
-          createdActor: { type: "human", id: "operator" },
-        },
-        {
-          key: "agent:main:theirs",
-          kind: "direct",
-          updatedAt: 2,
-          createdActor: { type: "human", id: "collaborator" },
-        },
-      ],
-    };
-    const bootstrap = createDeferred<SessionsListResult>();
-    const queuedResult = sessionsResult(
-      [{ key: "agent:other:queued", kind: "direct", updatedAt: 4 }],
-      1,
-    );
-    const queuedList = createDeferred<SessionsListResult>();
-    const request = requestFor(
-      () => ({ subscribed: true }),
-      (params) => (params?.search === "queued" ? queuedList.promise : bootstrap.promise),
-    );
+it("lets a queued foreground refresh supersede an owner-first bootstrap roster", async () => {
+  const owned = (key: string, updatedAt: number, id: string) => ({
+    key: `agent:main:${key}`,
+    kind: "direct" as const,
+    updatedAt,
+    createdActor: { type: "human" as const, id },
+  });
+  const roster = sessionsResult(
+    [
+      owned("mine-new", 3, "operator"),
+      owned("mine-old", 1, "operator"),
+      owned("theirs", 2, "collaborator"),
+    ],
+    1,
+  );
+  const bootstrap = createDeferred<SessionsListResult>();
+  const queuedResult = sessionsResult(
+    [{ key: "agent:other:queued", kind: "direct", updatedAt: 4 }],
+    1,
+  );
+  const queuedList = createDeferred<SessionsListResult>();
+  const request = requestFor(
+    () => ({ subscribed: true }),
+    (params) => (params?.search === "queued" ? queuedList.promise : bootstrap.promise),
+  );
+  const h = connection(request as unknown as GatewayBrowserClient["request"], "main", {
+    sessionKey: "agent:main:mine-new",
+    selfUser: { id: "operator", name: "Operator" },
+  });
+  const { sessions, client } = h;
+  h.update({ client, phase: "connected" });
 
-    const h = connection(request as unknown as GatewayBrowserClient["request"], "main", {
-      sessionKey: "agent:main:mine-new",
-      selfUser: { id: "operator", name: "Operator" },
-    });
-    const { sessions, client } = h;
-    h.update({ client, phase: "connected" });
-
-    await waitForFast(() =>
-      expect(request).toHaveBeenCalledWith(
-        "sessions.list",
-        expect.objectContaining({
-          agentId: "main",
-          ownerFirst: true,
-          limit: SIDEBAR_SESSION_ROSTER_LIMIT,
-        }),
-      ),
-    );
+  await waitForFast(() =>
     expect(request).toHaveBeenCalledWith(
-      "sessions.subscribe",
-      {},
-      { timeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS },
-    );
-    expect(listCallsOf(request)).toHaveLength(1);
-    expect(sessions.state.result).toBeNull();
-    const queuedRefresh = sessions.refresh({ agentId: "other", search: "queued", force: true });
-    h.update({ selfUser: { id: "collaborator", name: "Collaborator" } });
+      "sessions.list",
+      expect.objectContaining({
+        agentId: "main",
+        ownerFirst: true,
+        limit: SIDEBAR_SESSION_ROSTER_LIMIT,
+      }),
+    ),
+  );
+  expect(request).toHaveBeenCalledWith(
+    "sessions.subscribe",
+    {},
+    { timeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS },
+  );
+  expect(listCallsOf(request)).toHaveLength(1);
+  expect(sessions.state.result).toBeNull();
+  const queuedRefresh = sessions.refresh({ agentId: "other", search: "queued", force: true });
+  h.update({ selfUser: { id: "collaborator", name: "Collaborator" } });
 
-    bootstrap.resolve(roster);
-    await waitForFast(() => expect(listCallsOf(request)).toHaveLength(2));
-    expect(sessions.state.result).toBeNull();
-    expect(request.mock.calls.at(-1)?.[1]).toEqual(
-      expect.objectContaining({ agentId: "other", search: "queued" }),
-    );
-    queuedList.resolve(queuedResult);
-    await queuedRefresh;
-    expect(sessions.state.agentId).toBe("other");
-    expect(sessions.state.result).toStrictEqual(queuedResult);
-    sessions.dispose();
+  bootstrap.resolve(roster);
+  await waitForFast(() => expect(listCallsOf(request)).toHaveLength(2));
+  expect(sessions.state.result).toBeNull();
+  expect(request.mock.calls.at(-1)?.[1]).toEqual(
+    expect.objectContaining({ agentId: "other", search: "queued" }),
+  );
+  queuedList.resolve(queuedResult);
+  await queuedRefresh;
+  expect(sessions.state.agentId).toBe("other");
+  expect(sessions.state.result).toStrictEqual(queuedResult);
+});
+
+it("uses the selected agent before a session key is available", async () => {
+  const result = sessionsResult(
+    [{ key: "agent:roboclaw:dashboard:one", kind: "direct", updatedAt: 1 }],
+    1,
+  );
+  const request = requestFor(
+    () => ({ subscribed: true }),
+    () => result,
+  );
+  const h = connection(request as unknown as GatewayBrowserClient["request"], "roboclaw", {
+    sessionKey: "",
+    assistantAgentId: "roboclaw",
   });
+  const { sessions, client } = h;
+  h.update({ client, phase: "connected" });
 
-  it("uses the selected agent before a session key is available", async () => {
-    const result = sessionsResult(
-      [{ key: "agent:roboclaw:dashboard:one", kind: "direct", updatedAt: 1 }],
-      1,
-    );
+  await waitForFast(() =>
+    expect(request).toHaveBeenCalledWith(
+      "sessions.list",
+      expect.objectContaining({ agentId: "roboclaw", includeDerivedTitles: true }),
+    ),
+  );
+  await waitForFast(() => expect(sessions.state.agentId).toBe("roboclaw"));
+  expect(sessions.state.result).toStrictEqual(result);
+});
+
+it.each(["main", "work"])(
+  "rehydrates the current %s roster when identity arrives on the same connection",
+  async (agentId) => {
+    const pendingList = createDeferred<SessionsListResult>();
+    let listCalls = 0;
+    const result = sessionsResult([], 1);
     const request = requestFor(
       () => ({ subscribed: true }),
-      () => result,
+      () => (++listCalls === 1 ? pendingList.promise : result),
     );
 
-    const h = connection(request as unknown as GatewayBrowserClient["request"], "roboclaw", {
-      sessionKey: "",
-      assistantAgentId: "roboclaw",
-    });
+    const h = connection(request as unknown as GatewayBrowserClient["request"]);
     const { sessions, client } = h;
     h.update({ client, phase: "connected" });
+    await waitForFast(() => expect(listCallsOf(request)).toHaveLength(1));
 
-    await waitForFast(() =>
-      expect(request).toHaveBeenCalledWith(
-        "sessions.list",
-        expect.objectContaining({ agentId: "roboclaw", includeDerivedTitles: true }),
-      ),
-    );
-    await waitForFast(() => expect(sessions.state.agentId).toBe("roboclaw"));
-    expect(sessions.state.result).toStrictEqual(result);
-    sessions.dispose();
-  });
+    h.update({ canvasPluginSurfaceUrl: "https://gateway.example.test/canvas" });
+    await Promise.resolve();
+    expect(listCallsOf(request)).toHaveLength(1);
 
-  it.each(["main", "work"])(
-    "rehydrates the current %s roster when identity arrives on the same connection",
-    async (agentId) => {
-      const pendingList = createDeferred<SessionsListResult>();
-      let listCalls = 0;
-      const result = sessionsResult([], 1);
-      const request = vi.fn(async (method: string, _params?: Record<string, unknown>) => {
-        if (method === "sessions.subscribe") {
-          return { subscribed: true };
-        }
-        if (method === "sessions.list") {
-          listCalls += 1;
-          return listCalls === 1 ? await pendingList.promise : result;
-        }
-        throw new Error(`Unexpected request: ${method}`);
-      });
-
-      const h = connection(request as unknown as GatewayBrowserClient["request"]);
-      const { sessions, client } = h;
-      h.update({ client, phase: "connected" });
-      await waitForFast(() => expect(listCalls).toBe(1));
-
-      h.update({ canvasPluginSurfaceUrl: "https://gateway.example.test/canvas" });
-      await Promise.resolve();
-      expect(listCalls).toBe(1);
-
-      if (agentId === "work") {
-        pendingList.resolve(result);
-        await waitForFast(() => expect(sessions.state.result).toStrictEqual(result));
-        // A foreground query can select a roster independently of the current route.
-        h.update({ sessionKey: "global" }, false);
-        await sessions.refresh({ agentId, search: "selected", force: true });
-        expect(sessions.state.agentId).toBe(agentId);
-      }
-      vi.useFakeTimers();
-      try {
-        h.update({ selfUser: { id: "operator", name: "Operator" } });
-        pendingList.resolve(result);
-        await vi.advanceTimersByTimeAsync(5_000);
-        expect(listCalls).toBe(agentId === "work" ? 3 : 2);
-      } finally {
-        vi.useRealTimers();
-      }
-
-      expect(
-        request.mock.calls
-          .filter(([method]) => method === "sessions.list")
-          .map(([, params]) => params),
-      ).toEqual([
-        expect.not.objectContaining({ ownerFirst: expect.anything() }),
-        ...(agentId === "work" ? [expect.objectContaining({ agentId, search: "selected" })] : []),
-        expect.objectContaining({
-          agentId,
-          limit: SIDEBAR_SESSION_ROSTER_LIMIT,
-          ...(agentId === "work" ? { search: "selected" } : { ownerFirst: true }),
-        }),
-      ]);
-      await waitForFast(() => expect(sessions.state.agentId).toBe(agentId));
-      expect(sessions.state.result?.sessions).toEqual([]);
-
-      // A new connection returns to the application's selected agent.
-      h.update({ phase: "reconnecting" });
-      h.update({ phase: "connected", sessionKey: "agent:main:main" });
-      await waitForFast(() => expect(sessions.state.agentId).toBe("main"));
-      sessions.dispose();
-    },
-  );
-
-  it("recovers primary and managed lists after retrying the current session observer", async () => {
-    vi.useFakeTimers();
-    const result = sessionsResult([], 1);
-    const recoveredResult = sessionsResult(
-      [{ key: "agent:main:recovered", kind: "direct", updatedAt: 2 }],
-      1,
-    );
-    let subscriptionCalls = 0;
-    let listCalls = 0;
-    const request = requestFor(
-      () => {
-        subscriptionCalls += 1;
-        if (subscriptionCalls === 1) {
-          throw retryError("session observer temporarily unavailable");
-        }
-        return { subscribed: true };
-      },
-      (params) => {
-        if (params?.agentId === "writer") {
-          const done = subscriptionCalls > 1;
-          return {
-            ...result,
-            count: 1,
-            sessions: [
-              {
-                key: "agent:writer:linked",
-                kind: "direct",
-                updatedAt: done ? 2 : 1,
-                hasActiveRun: !done,
-                status: done ? "done" : "running",
-              },
-            ],
-          } satisfies SessionsListResult;
-        }
-        listCalls += 1;
-        return listCalls === 1 ? result : recoveredResult;
-      },
-    );
-
-    const { sessions, connect } = hydration(request as unknown as GatewayBrowserClient["request"]);
-    const writerQuery = { agentId: "writer", archivedFilter: "all" as const, limit: 2 };
-    const stopWriter = sessions.subscribeList(writerQuery, () => undefined);
-
-    try {
-      connect();
-      await vi.advanceTimersByTimeAsync(0);
-
-      expect(sessions.state.result).toStrictEqual(result);
-      expect(sessions.state.error).toBe("session observer temporarily unavailable");
-      expect(subscriptionCalls).toBe(1);
-      expect(sessions.listSnapshot(writerQuery).result?.sessions[0]).toMatchObject({
-        key: "agent:writer:linked",
-        hasActiveRun: true,
-        status: "running",
-      });
-
-      await vi.advanceTimersByTimeAsync(99);
-      expect(subscriptionCalls).toBe(1);
-      await vi.advanceTimersByTimeAsync(1);
-
-      expect(subscriptionCalls).toBe(2);
-      expect(sessions.state.error).toBeNull();
-      expect(sessions.state.result).toStrictEqual(recoveredResult);
-      expect(listCalls).toBe(2);
-      await vi.advanceTimersByTimeAsync(5_000);
-      expect(sessions.listSnapshot(writerQuery).result?.sessions[0]).toMatchObject({
-        key: "agent:writer:linked",
-        hasActiveRun: false,
-        status: "done",
-      });
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      stopWriter();
-      sessions.dispose();
-      vi.useRealTimers();
+    if (agentId === "work") {
+      pendingList.resolve(result);
+      await waitForFast(() => expect(sessions.state.result).toStrictEqual(result));
+      h.update({ sessionKey: "global" }, false);
+      await sessions.refresh({ agentId, search: "selected", force: true });
+      expect(sessions.state.agentId).toBe(agentId);
     }
-  });
-
-  it("recovers the roster after a subscription deadline without admitting late replies", async () => {
     vi.useFakeTimers();
-    const initialResult = sessionsResult([], 1);
-    const recoveredResult = sessionsResult(
-      [{ key: "agent:main:recovered", kind: "direct", updatedAt: 2 }],
-      1,
-    );
-    const sent: Array<{ id: string; method: string }> = [];
-    let handlers: GatewayProtocolSocketHandlers | undefined;
-    const protocol = new GatewayProtocolClient<Record<string, never>>({
-      createSocket: (nextHandlers) => {
-        handlers = nextHandlers;
-        return {
-          isOpen: () => true,
-          send: (data) => {
-            const frame = JSON.parse(data) as { id: string; method: string };
-            sent.push({ id: frame.id, method: frame.method });
+    h.update({ selfUser: { id: "operator", name: "Operator" } });
+    pendingList.resolve(result);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(listCallsOf(request)).toHaveLength(agentId === "work" ? 3 : 2);
+    vi.useRealTimers();
+
+    expect(listCallsOf(request).map(([, params]) => params)).toEqual([
+      expect.not.objectContaining({ ownerFirst: expect.anything() }),
+      ...(agentId === "work" ? [expect.objectContaining({ agentId, search: "selected" })] : []),
+      expect.objectContaining({
+        agentId,
+        limit: SIDEBAR_SESSION_ROSTER_LIMIT,
+        ...(agentId === "work" ? { search: "selected" } : { ownerFirst: true }),
+      }),
+    ]);
+    await waitForFast(() => expect(sessions.state.agentId).toBe(agentId));
+    expect(sessions.state.result?.sessions).toEqual([]);
+
+    h.update({ phase: "reconnecting" });
+    h.update({ phase: "connected", sessionKey: "agent:main:main" });
+    await waitForFast(() => expect(sessions.state.agentId).toBe("main"));
+  },
+);
+
+it("recovers primary and managed lists after retrying the current session observer", async () => {
+  vi.useFakeTimers();
+  const result = sessionsResult([], 1);
+  const recoveredResult = sessionsResult(
+    [{ key: "agent:main:recovered", kind: "direct", updatedAt: 2 }],
+    1,
+  );
+  let listCalls = 0;
+  const h = observer(retryOnce("session observer temporarily unavailable"), (params) => {
+    if (params?.agentId === "writer") {
+      const done = h.subscriptionCalls > 1;
+      return {
+        ...result,
+        count: 1,
+        sessions: [
+          {
+            key: "agent:writer:linked",
+            kind: "direct",
+            updatedAt: done ? 2 : 1,
+            hasActiveRun: !done,
+            status: done ? "done" : "running",
           },
-          close: () => undefined,
-        };
-      },
-      createRequestId: () => "request",
-      buildConnectPlan: () => ({}),
-      buildConnectParams: (plan) => plan,
-      resolveClose: () => ({ retry: false, notify: false }),
-      handshake: { mode: "require-challenge", timeoutMs: 100 },
-      reconnect: { initialMs: 10, multiplier: 2, maxMs: 100 },
-    });
-    protocol.start();
-    const request = protocol.request.bind(protocol) as GatewayBrowserClient["request"];
-    const { sessions, connect } = hydration(request);
-    const recoveredStates: SessionsListResult[] = [];
-    const unsubscribe = sessions.subscribe((next) => {
-      if (next.result?.sessions.some((row) => row.key === "agent:main:recovered")) {
-        recoveredStates.push(next.result);
-      }
-    });
-    const respond = (id: string, payload: unknown) => {
-      handlers?.message(JSON.stringify({ type: "res", id, ok: true, payload }));
-    };
+        ],
+      } satisfies SessionsListResult;
+    }
+    listCalls += 1;
+    return listCalls === 1 ? result : recoveredResult;
+  });
 
-    try {
-      connect();
-      await vi.advanceTimersByTimeAsync(0);
-      expect(sent).toEqual([
-        { id: "1:request", method: "sessions.subscribe" },
-        { id: "2:request", method: "sessions.list" },
-      ]);
-      respond("2:request", initialResult);
-      await vi.advanceTimersByTimeAsync(0);
-      expect(sessions.state.result).toEqual(initialResult);
+  const { sessions, connect } = h;
+  const writerQuery = { agentId: "writer", archivedFilter: "all" as const, limit: 2 };
+  const stopWriter = sessions.subscribeList(writerQuery, () => undefined);
 
-      await vi.advanceTimersByTimeAsync(DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS);
-      expect(sessions.state.error).not.toBeNull();
-      await vi.advanceTimersByTimeAsync(500);
-      expect(sent).toContainEqual({ id: "3:request", method: "sessions.subscribe" });
+  connect();
+  await vi.advanceTimersByTimeAsync(0);
 
-      respond("1:request", { status: "accepted" });
-      respond("1:request", { subscribed: true });
-      await vi.advanceTimersByTimeAsync(0);
-      expect(sessions.state.error).not.toBeNull();
-      expect(sent.filter(({ method }) => method === "sessions.list")).toHaveLength(1);
+  expect(sessions.state.result).toStrictEqual(result);
+  expect(sessions.state.error).toBe("session observer temporarily unavailable");
+  expect(h.subscriptionCalls).toBe(1);
+  expect(sessions.listSnapshot(writerQuery).result?.sessions[0]).toMatchObject({
+    key: "agent:writer:linked",
+    hasActiveRun: true,
+    status: "running",
+  });
 
-      respond("3:request", { subscribed: true });
-      await vi.advanceTimersByTimeAsync(0);
-      expect(sent).toContainEqual({ id: "4:request", method: "sessions.list" });
-      respond("4:request", recoveredResult);
-      await vi.advanceTimersByTimeAsync(0);
+  await vi.advanceTimersByTimeAsync(99);
+  expect(h.subscriptionCalls).toBe(1);
+  await vi.advanceTimersByTimeAsync(1);
 
-      respond("1:request", { status: "accepted" });
-      respond("1:request", { subscribed: true });
-      await vi.advanceTimersByTimeAsync(0);
+  expect(h.subscriptionCalls).toBe(2);
+  expect(sessions.state.error).toBeNull();
+  expect(sessions.state.result).toStrictEqual(recoveredResult);
+  expect(listCalls).toBe(2);
+  await vi.advanceTimersByTimeAsync(5_000);
+  expect(sessions.listSnapshot(writerQuery).result?.sessions[0]).toMatchObject({
+    key: "agent:writer:linked",
+    hasActiveRun: false,
+    status: "done",
+  });
+  expect(vi.getTimerCount()).toBe(0);
+  stopWriter();
+});
 
-      expect(sessions.state.error).toBeNull();
-      expect(sessions.state.result).toEqual(recoveredResult);
-      expect(recoveredStates).toEqual([recoveredResult]);
-      expect(sent.filter(({ method }) => method === "sessions.subscribe")).toHaveLength(2);
-      expect(sent.filter(({ method }) => method === "sessions.list")).toHaveLength(2);
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      unsubscribe();
+it("recovers the roster after a subscription deadline without admitting late replies", async () => {
+  vi.useFakeTimers();
+  const initialResult = sessionsResult([], 1);
+  const recoveredResult = sessionsResult(
+    [{ key: "agent:main:recovered", kind: "direct", updatedAt: 2 }],
+    1,
+  );
+  const sent: Array<{ id: string; method: string }> = [];
+  let handlers: GatewayProtocolSocketHandlers | undefined;
+  const protocol = new GatewayProtocolClient<Record<string, never>>({
+    createSocket: (nextHandlers) => {
+      handlers = nextHandlers;
+      return {
+        isOpen: () => true,
+        send: (data) => {
+          const frame = JSON.parse(data) as { id: string; method: string };
+          sent.push({ id: frame.id, method: frame.method });
+        },
+        close: () => undefined,
+      };
+    },
+    createRequestId: () => "request",
+    buildConnectPlan: () => ({}),
+    buildConnectParams: (plan) => plan,
+    resolveClose: () => ({ retry: false, notify: false }),
+    handshake: { mode: "require-challenge", timeoutMs: 100 },
+    reconnect: { initialMs: 10, multiplier: 2, maxMs: 100 },
+  });
+  protocol.start();
+  const request = protocol.request.bind(protocol) as GatewayBrowserClient["request"];
+  const { sessions, connect } = hydration(request);
+  const recoveredStates: SessionsListResult[] = [];
+  const unsubscribe = sessions.subscribe((next) => {
+    if (next.result?.sessions.some((row) => row.key === "agent:main:recovered")) {
+      recoveredStates.push(next.result);
+    }
+  });
+  const respond = (id: string, payload: unknown) => {
+    handlers?.message(JSON.stringify({ type: "res", id, ok: true, payload }));
+  };
+
+  try {
+    connect();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toEqual([
+      { id: "1:request", method: "sessions.subscribe" },
+      { id: "2:request", method: "sessions.list" },
+    ]);
+    respond("2:request", initialResult);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessions.state.result).toEqual(initialResult);
+
+    await vi.advanceTimersByTimeAsync(DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS);
+    expect(sessions.state.error).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(sent).toContainEqual({ id: "3:request", method: "sessions.subscribe" });
+
+    respond("1:request", { status: "accepted" });
+    respond("1:request", { subscribed: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessions.state.error).not.toBeNull();
+    expect(sent.filter(({ method }) => method === "sessions.list")).toHaveLength(1);
+
+    respond("3:request", { subscribed: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sent).toContainEqual({ id: "4:request", method: "sessions.list" });
+    respond("4:request", recoveredResult);
+    await vi.advanceTimersByTimeAsync(0);
+
+    respond("1:request", { status: "accepted" });
+    respond("1:request", { subscribed: true });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(sessions.state.error).toBeNull();
+    expect(sessions.state.result).toEqual(recoveredResult);
+    expect(recoveredStates).toEqual([recoveredResult]);
+    expect(sent.filter(({ method }) => method === "sessions.subscribe")).toHaveLength(2);
+    expect(sent.filter(({ method }) => method === "sessions.list")).toHaveLength(2);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    unsubscribe();
+    sessions.dispose();
+    protocol.stop();
+    vi.useRealTimers();
+  }
+});
+
+it("rejects an unacknowledged session observer and retries until acknowledged", async () => {
+  vi.useFakeTimers();
+  const h = observer((attempt) => (attempt === 1 ? {} : { subscribed: true }));
+  const { sessions, connect, request } = h;
+
+  connect();
+  await vi.advanceTimersByTimeAsync(0);
+
+  expect(h.subscriptionCalls).toBe(1);
+  expect(sessions.state.result).not.toBeNull();
+  expect(sessions.state.error).toContain("did not activate the session event subscription");
+
+  await vi.advanceTimersByTimeAsync(500);
+
+  expect(h.subscriptionCalls).toBe(2);
+  expect(sessions.state.error).toBeNull();
+  expect(listCallsOf(request)).toHaveLength(2);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it("retires observer retries on disconnect before the same client reconnects", async () => {
+  vi.useFakeTimers();
+  const h = observer(retryOnce("session observer temporarily unavailable"));
+  const { sessions, connect, disconnect, request } = h;
+
+  connect();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(h.subscriptionCalls).toBe(1);
+  expect(vi.getTimerCount()).toBe(1);
+
+  disconnect();
+  expect(sessions.state.error).toBeNull();
+  expect(vi.getTimerCount()).toBe(0);
+  await vi.advanceTimersByTimeAsync(1_000);
+  expect(h.subscriptionCalls).toBe(1);
+
+  connect();
+  await vi.advanceTimersByTimeAsync(0);
+
+  expect(h.subscriptionCalls).toBe(2);
+  expect(sessions.state.error).toBeNull();
+  expect(listCallsOf(request)).toHaveLength(2);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it("does not recreate a retry timer when an observer-error listener disposes its owner", async () => {
+  vi.useFakeTimers();
+  const h = observer(() => {
+    throw retryError("observer unavailable during teardown");
+  });
+  const { sessions, connect } = h;
+  sessions.subscribe((next) => {
+    if (next.error) {
       sessions.dispose();
-      protocol.stop();
-      vi.useRealTimers();
     }
   });
 
-  it.each([{ description: "an unacknowledged", response: {} }])(
-    "rejects $description session observer and retries until acknowledged",
-    async ({ response }) => {
-      vi.useFakeTimers();
-      let subscriptionCalls = 0;
-      const request = requestFor(
-        () => {
-          subscriptionCalls += 1;
-          return subscriptionCalls === 1 ? response : { subscribed: true };
-        },
-        () => sessionsResult([], 1),
-      );
+  connect();
+  await vi.advanceTimersByTimeAsync(0);
 
-      const { sessions, connect } = hydration(
-        request as unknown as GatewayBrowserClient["request"],
-      );
+  expect(h.subscriptionCalls).toBe(1);
+  expect(vi.getTimerCount()).toBe(0);
+  await vi.advanceTimersByTimeAsync(500);
+  expect(h.subscriptionCalls).toBe(1);
+});
 
-      connect();
-      await vi.advanceTimersByTimeAsync(0);
-
-      expect(subscriptionCalls).toBe(1);
-      expect(sessions.state.result).not.toBeNull();
-      expect(sessions.state.error).toContain("did not activate the session event subscription");
-
-      await vi.advanceTimersByTimeAsync(500);
-
-      expect(subscriptionCalls).toBe(2);
-      expect(sessions.state.error).toBeNull();
-      expect(listCallsOf(request)).toHaveLength(2);
-      expect(vi.getTimerCount()).toBe(0);
-    },
-  );
-
-  it("retires observer retries on disconnect before the same client reconnects", async () => {
+it.each([
+  { ...targetedSessionReconciliationCases[0], operationFails: false },
+  { ...targetedSessionReconciliationCases[1], operationFails: false },
+  { ...targetedSessionReconciliationCases[0], operationFails: true },
+  { ...targetedSessionReconciliationCases[1], operationFails: true },
+])(
+  "preserves failure across $description (newer operation: $operationFails)",
+  async ({ reconcile, operationFails }) => {
     vi.useFakeTimers();
-    let subscriptionCalls = 0;
-    const request = requestFor(
-      () => {
-        subscriptionCalls += 1;
-        if (subscriptionCalls === 1) {
-          throw retryError("session observer temporarily unavailable");
-        }
-        return { subscribed: true };
-      },
-      () => sessionsResult([], 1),
-    );
-
-    const { sessions, connect, disconnect } = hydration(
-      request as unknown as GatewayBrowserClient["request"],
-    );
-
-    connect();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(subscriptionCalls).toBe(1);
-    expect(vi.getTimerCount()).toBe(1);
-
-    disconnect();
-    expect(sessions.state.error).toBeNull();
-    expect(vi.getTimerCount()).toBe(0);
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(subscriptionCalls).toBe(1);
-
-    connect();
-    await vi.advanceTimersByTimeAsync(0);
-
-    expect(subscriptionCalls).toBe(2);
-    expect(sessions.state.error).toBeNull();
-    expect(listCallsOf(request)).toHaveLength(2);
-    expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("does not recreate a retry timer when an observer-error listener disposes its owner", async () => {
-    vi.useFakeTimers();
-    let subscriptionCalls = 0;
-    const request = requestFor(
-      () => {
-        subscriptionCalls += 1;
-        throw retryError("observer unavailable during teardown");
-      },
-      () => sessionsResult([], 1),
-    );
-
-    const { sessions, connect } = hydration(request as unknown as GatewayBrowserClient["request"]);
-    sessions.subscribe((next) => {
-      if (next.error) {
-        sessions.dispose();
+    const result = runningSessionsResult();
+    const h = observer(retryOnce("broad session observer unavailable"), (_params, attempt) => {
+      if (operationFails && attempt === 2) {
+        throw new Error("newer session list failure");
       }
+      return result;
     });
 
+    const { sessions, connect, emitEvent } = h;
+
     connect();
     await vi.advanceTimersByTimeAsync(0);
-
-    expect(subscriptionCalls).toBe(1);
-    expect(vi.getTimerCount()).toBe(0);
-    await vi.advanceTimersByTimeAsync(500);
-    expect(subscriptionCalls).toBe(1);
-  });
-
-  it.each(targetedSessionReconciliationCases)(
-    "preserves an active observer failure across $description",
-    async ({ reconcile }) => {
-      vi.useFakeTimers();
-      let subscriptionCalls = 0;
-      const result = runningSessionsResult();
-      const request = requestFor(
-        () => {
-          subscriptionCalls += 1;
-          if (subscriptionCalls === 1) {
-            throw retryError("broad session observer unavailable");
-          }
-          return { subscribed: true };
-        },
-        () => result,
-      );
-
-      const { sessions, connect, emitEvent } = hydration(
-        request as unknown as GatewayBrowserClient["request"],
-      );
-
-      connect();
-      await vi.advanceTimersByTimeAsync(0);
-      const observerError = "broad session observer unavailable";
-      expect(sessions.state.error).toBe(observerError);
-
-      reconcile(sessions, emitEvent);
-      expect(sessions.state.error).toBe(observerError);
-
-      await vi.advanceTimersByTimeAsync(100);
-      expect(subscriptionCalls).toBe(2);
-      expect(sessions.state.error).toBeNull();
-    },
-  );
-
-  it.each(targetedSessionReconciliationCases)(
-    "preserves a newer operation failure across $description",
-    async ({ reconcile }) => {
-      vi.useFakeTimers();
-      let subscriptionCalls = 0;
-      let listCalls = 0;
-      const result = runningSessionsResult();
-      const request = requestFor(
-        () => {
-          subscriptionCalls += 1;
-          if (subscriptionCalls === 1) {
-            throw retryError("broad session observer unavailable");
-          }
-          return { subscribed: true };
-        },
-        () => {
-          listCalls += 1;
-          if (listCalls === 2) {
-            throw new Error("newer session list failure");
-          }
-          return result;
-        },
-      );
-
-      const { sessions, connect, emitEvent } = hydration(
-        request as unknown as GatewayBrowserClient["request"],
-      );
-
-      connect();
-      await vi.advanceTimersByTimeAsync(0);
+    if (operationFails) {
       await sessions.refresh({ force: true });
-      const operationError = "newer session list failure";
-      expect(sessions.state.error).toBe(operationError);
+    }
+    const error = operationFails
+      ? "newer session list failure"
+      : "broad session observer unavailable";
+    expect(sessions.state.error).toBe(error);
 
-      reconcile(sessions, emitEvent);
-      expect(sessions.state.error).toBe(operationError);
-
-      await vi.advanceTimersByTimeAsync(100);
-      expect(subscriptionCalls).toBe(2);
-      expect(sessions.state.error).toBeNull();
-    },
-  );
-
-  it("keeps newer session-list failures visible across repeated observer retry failures", async () => {
-    vi.useFakeTimers();
-    let subscriptionCalls = 0;
-    let listCalls = 0;
-    const request = requestFor(
-      () => {
-        subscriptionCalls += 1;
-        throw retryError(`observer unavailable ${subscriptionCalls}`);
-      },
-      () => {
-        listCalls += 1;
-        if (listCalls > 1) {
-          throw new Error("newer session list failure");
-        }
-        return sessionsResult([], 1);
-      },
-    );
-
-    const { sessions, connect } = hydration(request as unknown as GatewayBrowserClient["request"]);
-
-    connect();
-    await vi.advanceTimersByTimeAsync(0);
-    await sessions.refresh({ force: true });
-    expect(sessions.state.error).toBe("newer session list failure");
+    reconcile(sessions, emitEvent);
+    expect(sessions.state.error).toBe(error);
 
     await vi.advanceTimersByTimeAsync(100);
+    expect(h.subscriptionCalls).toBe(2);
+    expect(sessions.state.error).toBeNull();
+  },
+);
 
-    expect(subscriptionCalls).toBe(2);
-    expect(sessions.state.error).toBe("newer session list failure");
-  });
-
-  it("does not clear an unrelated list error with the same observer error message", async () => {
-    vi.useFakeTimers();
-    const pendingCatchUpList = createDeferred<SessionsListResult>();
-    const sharedError = retryError("same failure message");
-    let subscriptionCalls = 0;
-    let listCalls = 0;
-    const request = vi.fn(async (method: string) => {
-      if (method === "sessions.subscribe") {
-        subscriptionCalls += 1;
-        if (subscriptionCalls === 1) {
-          throw sharedError;
-        }
-        return { subscribed: true };
+it("keeps newer session-list failures visible across repeated observer retry failures", async () => {
+  vi.useFakeTimers();
+  const h = observer(
+    (attempt) => {
+      throw retryError(`observer unavailable ${attempt}`);
+    },
+    (_params, attempt) => {
+      if (attempt > 1) {
+        throw new Error("newer session list failure");
       }
-      if (method === "sessions.list") {
-        listCalls += 1;
-        if (listCalls === 2) {
-          throw sharedError;
-        }
-        return listCalls === 3 ? await pendingCatchUpList.promise : sessionsResult([], 1);
+      return sessionsResult([], 1);
+    },
+  );
+
+  const { sessions, connect } = h;
+
+  connect();
+  await vi.advanceTimersByTimeAsync(0);
+  await sessions.refresh({ force: true });
+  expect(sessions.state.error).toBe("newer session list failure");
+
+  await vi.advanceTimersByTimeAsync(100);
+
+  expect(h.subscriptionCalls).toBe(2);
+  expect(sessions.state.error).toBe("newer session list failure");
+});
+
+it("does not clear an unrelated list error with the same observer error message", async () => {
+  vi.useFakeTimers();
+  const pendingCatchUpList = createDeferred<SessionsListResult>();
+  const sharedError = retryError("same failure message");
+  const h = observer(
+    (attempt) => {
+      if (attempt === 1) {
+        throw sharedError;
       }
-      throw new Error(`Unexpected request: ${method}`);
-    });
-
-    const { sessions, connect } = hydration(request as unknown as GatewayBrowserClient["request"]);
-
-    try {
-      connect();
-      await vi.advanceTimersByTimeAsync(0);
-      await sessions.refresh({ force: true });
-      expect(sessions.state.error).toBe("same failure message");
-
-      await vi.advanceTimersByTimeAsync(100);
-
-      expect(subscriptionCalls).toBe(2);
-      expect(listCalls).toBe(3);
-      expect(sessions.state.error).toBe("same failure message");
-      pendingCatchUpList.resolve(sessionsResult([], 1));
-      await vi.advanceTimersByTimeAsync(0);
-      expect(sessions.state.error).toBeNull();
-    } finally {
-      pendingCatchUpList.resolve(sessionsResult([], 1));
-      sessions.dispose();
-      vi.useRealTimers();
-    }
-  });
-
-  it("ignores an outdated observer refusal after the same client reconnects", async () => {
-    vi.useFakeTimers();
-    const retiredSubscription = createDeferred<{ subscribed: boolean }>();
-    let subscriptionCalls = 0;
-    const request = vi.fn(async (method: string) => {
-      if (method === "sessions.subscribe") {
-        subscriptionCalls += 1;
-        return subscriptionCalls === 1 ? await retiredSubscription.promise : { subscribed: true };
+      return { subscribed: true };
+    },
+    (_params, attempt) => {
+      if (attempt === 2) {
+        throw sharedError;
       }
-      if (method === "sessions.list") {
-        return sessionsResult([], 1);
-      }
-      throw new Error(`Unexpected request: ${method}`);
-    });
+      return attempt === 3 ? pendingCatchUpList.promise : sessionsResult([], 1);
+    },
+  );
+  const { sessions, connect } = h;
+  cleanup.push(() => pendingCatchUpList.resolve(sessionsResult([], 1)));
+  connect();
+  await vi.advanceTimersByTimeAsync(0);
+  await sessions.refresh({ force: true });
+  expect(sessions.state.error).toBe("same failure message");
 
-    const { sessions, connect, disconnect } = hydration(
-      request as unknown as GatewayBrowserClient["request"],
-    );
+  await vi.advanceTimersByTimeAsync(100);
 
-    try {
-      connect();
-      await vi.advanceTimersByTimeAsync(0);
-      expect(subscriptionCalls).toBe(1);
+  expect(h.subscriptionCalls).toBe(2);
+  expect(listCallsOf(h.request)).toHaveLength(3);
+  expect(sessions.state.error).toBe("same failure message");
+  pendingCatchUpList.resolve(sessionsResult([], 1));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(sessions.state.error).toBeNull();
+});
 
-      disconnect();
-      connect();
-      await vi.advanceTimersByTimeAsync(0);
-      expect(subscriptionCalls).toBe(2);
-      expect(sessions.state.result).not.toBeNull();
+it("ignores an outdated observer refusal after the same client reconnects", async () => {
+  vi.useFakeTimers();
+  const retiredSubscription = createDeferred<{ subscribed: boolean }>();
+  const h = observer((attempt) =>
+    attempt === 1 ? retiredSubscription.promise : { subscribed: true },
+  );
+  const { sessions, connect, disconnect, request } = h;
+  cleanup.push(() => retiredSubscription.resolve({ subscribed: false }));
+  connect();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(h.subscriptionCalls).toBe(1);
 
-      retiredSubscription.resolve({ subscribed: false });
-      await vi.advanceTimersByTimeAsync(0);
+  disconnect();
+  connect();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(h.subscriptionCalls).toBe(2);
+  expect(sessions.state.result).not.toBeNull();
 
-      expect(sessions.state.error).toBeNull();
-      expect(subscriptionCalls).toBe(2);
-      expect(listCallsOf(request)).toHaveLength(2);
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      retiredSubscription.resolve({ subscribed: false });
-      sessions.dispose();
-      vi.useRealTimers();
-    }
-  });
+  retiredSubscription.resolve({ subscribed: false });
+  await vi.advanceTimersByTimeAsync(0);
+
+  expect(sessions.state.error).toBeNull();
+  expect(h.subscriptionCalls).toBe(2);
+  expect(listCallsOf(request)).toHaveLength(2);
+  expect(vi.getTimerCount()).toBe(0);
 });
