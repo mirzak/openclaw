@@ -27,10 +27,12 @@ type Fixture = Awaited<ReturnType<typeof createGatewayMetadataCloseFixture>>;
 
 async function writeCatalog(
   fixture: Fixture,
-  bridgeKey: string,
+  acquisition: ReturnType<typeof holdAcquisition>,
   models: string[],
   phase = "static catalog",
 ) {
+  const bridgeKey = `__model_close_${path.basename(fixture.state.root)}`;
+  Object.defineProperty(globalThis, bridgeKey, { configurable: true, value: acquisition.run });
   const invoke = `await globalThis[${JSON.stringify(bridgeKey)}](ctx.signal);`;
   await fs.writeFile(
     path.join(fixture.rootDir, "openclaw.plugin.json"),
@@ -53,6 +55,7 @@ async function writeCatalog(
       ${phase === "synthetic auth" ? `async prepareSyntheticAuth(ctx) { ${invoke} return { apiKey: "synthetic-fixture-key" }; },` : ""}
     };`,
   );
+  return bridgeKey;
 }
 
 function beforeCompletion(entered: Promise<unknown>, completing: Promise<unknown>) {
@@ -112,12 +115,7 @@ it("joins managed reload acquisition during Gateway close", async () => {
     });
   });
   let restoreStop = () => {};
-  const bridgeKey = `__managed_model_close_${path.basename(fixture.state.root)}`;
-  Object.defineProperty(globalThis, bridgeKey, {
-    configurable: true,
-    value: acquisition.run,
-  });
-  await writeCatalog(fixture, bridgeKey, ["before", "after"]);
+  const bridgeKey = await writeCatalog(fixture, acquisition, ["before", "after"]);
   try {
     const port = await fixture.reservePort();
     const server = await fixture.start(port);
@@ -131,16 +129,9 @@ it("joins managed reload acquisition during Gateway close", async () => {
     restoreStop = () => observedStop.mockRestore();
     const snapshot = await readConfigFileSnapshot();
     armed = true;
-    await fixture.state.writeConfig({
-      ...snapshot.sourceConfig,
-      agents: {
-        ...snapshot.sourceConfig.agents,
-        defaults: {
-          ...snapshot.sourceConfig.agents?.defaults,
-          model: `${fixture.pluginId}/after`,
-        },
-      },
-    });
+    const nextConfig = structuredClone(snapshot.sourceConfig);
+    nextConfig.agents!.defaults!.model = `${fixture.pluginId}/after`;
+    await fixture.state.writeConfig(nextConfig);
     await acquisition.entered.promise;
     expect(acquisition.signal?.aborted).toBe(false);
     vi.doMock("../agents/prepared-model-runtime.js", missingModelChunk);
@@ -167,12 +158,10 @@ it("joins managed reload acquisition during Gateway close", async () => {
     acquisition.finish.resolve();
     await Promise.allSettled([closing]);
     vi.doUnmock("../agents/prepared-model-runtime.js");
-    try {
-      await fixture.cleanup();
-    } finally {
+    await fixture.cleanup().finally(() => {
       restoreStop();
       Reflect.deleteProperty(globalThis, bridgeKey);
-    }
+    });
   }
 });
 
@@ -186,9 +175,9 @@ vi.mock("../audit/audit-event-writer.js", async (importOriginal) => {
       return gate
         ? {
             ...writer,
-            ready: writer.ready.then(async () => {
+            ready: writer.ready.then(() => {
               gate.entered();
-              await gate.release;
+              return gate.release;
             }),
           }
         : writer;
@@ -211,7 +200,6 @@ it.each(["static catalog", "synthetic auth"] as const)(
     const timers = new Set<ReturnType<typeof setInterval>>();
     let acquisitions = 0;
     let completePublications = 0;
-    const bridgeKey = `__degraded_model_close_${path.basename(fixture.state.root)}`;
     const acquisition = holdAcquisition(
       () => ++acquisitions === 2,
       () => {
@@ -226,8 +214,7 @@ it.each(["static catalog", "synthetic auth"] as const)(
         };
       },
     );
-    Object.defineProperty(globalThis, bridgeKey, { configurable: true, value: acquisition.run });
-    await writeCatalog(fixture, bridgeKey, ["model"], phase);
+    const bridgeKey = await writeCatalog(fixture, acquisition, ["model"], phase);
     fixture.config.agents = {
       ownership: "explicit",
       defaults: {

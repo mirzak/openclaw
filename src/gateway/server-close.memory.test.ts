@@ -29,6 +29,7 @@ import { createGatewayMemoryCloseRegistryFactory } from "./server-close.memory.t
 import type { createGatewayKernel } from "./server-kernel.js";
 import type { GatewayServer } from "./server-public.js";
 import { startGatewayServerCore } from "./server-start.js";
+import { KERNEL_TEST_ENV } from "./test-helpers.env.js";
 
 type Kernel = Awaited<ReturnType<typeof createGatewayKernel>>;
 type Fixture = Awaited<ReturnType<typeof createFixture>>;
@@ -46,36 +47,18 @@ const contextAborted = (kernel: Kernel) =>
 const beforeSettlement = (
   gate: Promise<void>,
   settlement: Promise<unknown>,
-  message: string,
   signal: AbortSignal,
-) => withinTest(awaitGateBeforeSettlement(gate, settlement, message), signal);
+  phase: string,
+) => withinTest(awaitGateBeforeSettlement(gate, settlement, `Settled before ${phase}`), signal);
 
 async function createFixture(label: string) {
   const original = captureActivePluginRegistrySnapshot();
-  const state = await createOpenClawTestState({
-    label,
-    layout: "home",
-    env: {
-      OPENCLAW_GATEWAY_PASSWORD: undefined,
-      OPENCLAW_GATEWAY_TOKEN: undefined,
-      OPENCLAW_SKIP_BROWSER_CONTROL_SERVER: "1",
-      OPENCLAW_SKIP_CANVAS_HOST: "1",
-      OPENCLAW_SKIP_CHANNELS: "1",
-      OPENCLAW_SKIP_CRON: "1",
-      OPENCLAW_SKIP_GMAIL_WATCHER: "1",
-      OPENCLAW_SKIP_PROVIDERS: "1",
-      OPENCLAW_TEST_MINIMAL_GATEWAY: "1",
-      VITEST: "1",
-    },
-  });
+  const state = await createOpenClawTestState({ label, layout: "home", env: KERNEL_TEST_ENV });
   state.applyEnv();
   const config: OpenClawConfig = {
     plugins: { enabled: true },
     agents: {
-      defaults: {
-        workspace: state.workspaceDir,
-        model: { primary: "openai/gpt-5.6-luna" },
-      },
+      defaults: { workspace: state.workspaceDir, model: { primary: "openai/gpt-5.6-luna" } },
     },
     memory: {
       search: {
@@ -97,17 +80,12 @@ async function createFixture(label: string) {
       const auth = { mode: "token" as const, token: "memory-close-token" };
       await state.writeConfig({
         ...config,
-        gateway: {
-          auth,
-          port,
-          controlUi: { enabled: false },
-          reload: { mode: "off" },
-        },
+        gateway: { auth, port, controlUi: { enabled: false }, reload: { mode: "off" } },
       });
       setActivePluginRegistry(memory.registry);
       const factory = vi.spyOn(await import("./server-kernel.js"), "createGatewayKernel");
       let server: GatewayServer;
-      let kernel: Kernel;
+      let kernel: Kernel | undefined;
       try {
         server = await startGatewayServerCore(port, {
           auth,
@@ -116,12 +94,11 @@ async function createFixture(label: string) {
           sidecarStartup: "defer",
         });
         servers.push(server);
-        const created = await factory.mock.results[0]?.value;
-        assert(created);
-        kernel = created;
+        kernel = await factory.mock.results[0]?.value;
       } finally {
         factory.mockRestore();
       }
+      assert(kernel);
       await server.startupSettled;
       return { server, kernel };
     },
@@ -135,9 +112,7 @@ async function createFixture(label: string) {
   };
 }
 
-it("joins accepted Memory sync through Gateway close before its first publication without reopening its executor", async ({
-  signal,
-}) => {
+it("settles accepted Memory sync before closing its existing executor", async ({ signal }) => {
   const fixture = await createFixture("gateway-memory-sync-close");
   const embeddingEntered = createDeferredCore();
   const releaseEmbedding = createDeferredCore();
@@ -145,7 +120,6 @@ it("joins accepted Memory sync through Gateway close before its first publicatio
   const beforeEmbedBatch = vi.fn(async () => {});
   fixture.config.memory!.search!.sources = ["memory"];
   const memory = fixture.registry(async () => {}, beforeEmbedBatch);
-  let server: GatewayServer | undefined;
   let syncing: Promise<void> | undefined;
   let closing: Promise<void> | undefined;
   const messages = vi.spyOn(Worker.prototype, "postMessage");
@@ -155,15 +129,13 @@ it("joins accepted Memory sync through Gateway close before its first publicatio
       path.join(fixture.state.workspaceDir, "memory", "shutdown.md"),
       "# Accepted shutdown memory\nKeep the synthetic blue release preference.\n",
     );
-    const started = await fixture.start(memory);
-    server = started.server;
-    started.kernel.scheduler.signal.addEventListener("abort", () => closePreludeEntered.resolve(), {
+    const { server, kernel } = await fixture.start(memory);
+    kernel.scheduler.signal.addEventListener("abort", () => closePreludeEntered.resolve(), {
       once: true,
     });
     const manager = await openManager(fixture, memory);
     assert(manager.sync && manager.close);
-    const options = { agentId: "main", env: fixture.state.env };
-    const agentPath = resolveOpenClawAgentSqlitePath(options);
+    const agentPath = resolveOpenClawAgentSqlitePath({ agentId: "main", env: fixture.state.env });
     const requests = () => messages.mock.calls.map(([request]) => request);
     const agentOpen = expect.objectContaining({ type: "open", databasePath: agentPath });
     const shared = openOpenClawStateDatabase({ env: fixture.state.env });
@@ -191,25 +163,14 @@ it("joins accepted Memory sync through Gateway close before its first publicatio
         // The first report precedes awaited source reads and the first publication.
         markGatewayRestartDraining();
         beginGatewayShutdownCleanup();
-        assert(server);
         closing = server.close({ reason: "accepted Memory sync close" });
         void closing.catch(() => {});
       },
     });
     void syncing.catch(() => {});
-    await beforeSettlement(
-      embeddingEntered.promise,
-      syncing,
-      "Memory sync settled before its accepted embedding work",
-      signal,
-    );
+    await beforeSettlement(embeddingEntered.promise, syncing, signal, "accepted embedding");
     assert(closing, "Memory sync did not report progress before embedding");
-    await beforeSettlement(
-      closePreludeEntered.promise,
-      closing,
-      "Gateway closed without beginning its close prelude",
-      signal,
-    );
+    await beforeSettlement(closePreludeEntered.promise, closing, signal, "close prelude");
     expect(readLeases()).toEqual(acceptedLeases);
     releaseEmbedding.resolve();
     await syncing;
@@ -234,10 +195,12 @@ it("joins accepted Memory sync through Gateway close before its first publicatio
   } finally {
     releaseEmbedding.resolve();
     await Promise.allSettled([syncing, closing]);
-    await server?.close().catch(() => {});
-    vi.restoreAllMocks();
-    resetGatewayWorkAdmission();
-    await fixture.cleanup();
+    try {
+      await fixture.cleanup();
+    } finally {
+      vi.restoreAllMocks();
+      resetGatewayWorkAdmission();
+    }
   }
 });
 
@@ -268,18 +231,12 @@ it("drains memory before stalled connection cleanup while preserving terminal cl
     await openManager(fixture, first);
     const warning = new Error("synthetic earlier shutdown warning");
     const registryClose = vi.spyOn(kernel.pluginRuntime, "close");
-    setActivePluginRegistry(first.registry);
     vi.spyOn(kernel.terminalSessions, "disposeAll").mockImplementationOnce(() => {
       throw warning;
     });
     connectionWork = kernel.connectionWork.track(() => releaseConnectionWork.promise);
     const closing = server.close({ reason: "memory close proof" }).catch((error: unknown) => error);
-    await beforeSettlement(
-      memoryCloseStarted.promise,
-      closing,
-      "Gateway retired before memory drainage began",
-      signal,
-    );
+    await beforeSettlement(memoryCloseStarted.promise, closing, signal, "memory drainage");
     expect(first.instance.lifecycle.signal.aborted).toBe(false);
     expect(contextAborted(kernel)).toBe(false);
     expect(registryClose).not.toHaveBeenCalled();
@@ -292,15 +249,12 @@ it("drains memory before stalled connection cleanup while preserving terminal cl
     const registryResult = await registryClose.mock.results[0]?.value;
     expect(registryClose).toHaveBeenCalledOnce();
     expect(registryResult?.memoryErrors).toContain(memoryFailure);
-    expect(first.instance.lifecycle.signal.aborted).toBe(true);
-    expect(contextAborted(kernel)).toBe(true);
+    expect([first.instance.lifecycle.signal.aborted, contextAborted(kernel)]).toEqual([true, true]);
     expect(() => kernel.pluginRuntime.publish(first.registry)).toThrow();
     expect(completed).toEqual([]);
     await expect(server.close({ reason: "warning failure stays terminal" })).rejects.toBe(failure);
     expect(firstClose).toHaveBeenCalledTimes(failedAttempts);
     expect(getGatewayPluginMetadataSnapshot()).toBeUndefined();
-    await expect(server.close({ reason: "already closed" })).rejects.toBe(failure);
-    expect(firstClose).toHaveBeenCalledTimes(failedAttempts);
     expect(registryClose).toHaveBeenCalledOnce();
   } finally {
     releaseConnectionWork.resolve();

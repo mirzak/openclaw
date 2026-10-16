@@ -44,6 +44,7 @@ let stop: (() => Promise<void>) | undefined;
 const modelIds = (entries: ModelCatalogSnapshot["entries"]) =>
   entries.map(({ id }) => id).toSorted();
 const buildCounts = () => [buildCommands.mock.calls.length, buildProjection.mock.calls.length];
+const clearBuilds = () => [buildCommands, buildProjection].forEach((mock) => mock.mockClear());
 const publication = (changed: boolean) => ({
   phase: "catalog-published",
   modelFactsChanged: changed,
@@ -60,7 +61,6 @@ vi.mock("./server-methods/chat-metadata-runtime.js", async (importOriginal) => {
       actual.createGatewayChatMetadataRuntime({
         ...params,
         deps: {
-          getPreparedOwner: getPublishedPreparedModelCatalogOwnerSnapshot,
           getSkillsVersion: () => 0,
           getPluginRegistryVersion: () => 0,
           buildCommands,
@@ -73,8 +73,7 @@ vi.mock("./server-methods/chat-metadata-runtime.js", async (importOriginal) => {
 beforeEach(async () => {
   state = await createOpenClawTestState({ label: "catalog-renewal-metadata" });
   await resetPreparedModelRuntimeHarness(state);
-  buildCommands.mockClear();
-  buildProjection.mockClear();
+  clearBuilds();
 });
 
 afterEach(async ({ task }) => {
@@ -100,10 +99,7 @@ async function createRenewalLifecycle() {
       { provider: "sibling", id: "other", name: "Other" },
     ],
     routeVariants: [],
-    providerOutcomes: [
-      { provider: "custom", status: "ready" },
-      { provider: "sibling", status: "ready" },
-    ],
+    providerOutcomes: ["custom", "sibling"].map((provider) => ({ provider, status: "ready" })),
   };
   mocks.runPreparedModelCatalogWorker.mockImplementation(async () => structuredClone(inventory));
   await refreshPreparedModelRuntimeSnapshots(config, {
@@ -141,8 +137,7 @@ async function createRenewalLifecycle() {
   await lifecycle.read({ agentId: "main" });
   broadcast.mockClear();
   observedCatalogs.length = 0;
-  buildCommands.mockClear();
-  buildProjection.mockClear();
+  clearBuilds();
   return { inventory, broadcast, observedCatalogs, lifecycle };
 }
 
@@ -222,8 +217,7 @@ it.for(["usage", "removed", "failed"] as const)(
       // An unrelated refresh during discovery must not turn progress into a metadata change.
       await harness.lifecycle.refresh();
       await harness.lifecycle.read({ agentId: "main" });
-      expect.soft(harness.broadcast.mock.calls.length).toBe(0);
-      expect.soft(buildCounts()).toEqual([0, 0]);
+      expect.soft([harness.broadcast.mock.calls.length, ...buildCounts()]).toEqual([0, 0, 0]);
       release.resolve();
       expect(await withinTest(renewal.promise, signal)).toBe(
         change === "failed" ? "catalog-failed" : "catalog-published",

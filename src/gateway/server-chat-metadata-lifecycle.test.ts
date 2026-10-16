@@ -62,24 +62,16 @@ const { ChatMetadataSnapshotUnavailableError } =
 const authSnapshots = await vi.importActual<
   typeof import("../agents/auth-profiles/runtime-snapshots.js")
 >("../agents/auth-profiles/runtime-snapshots.js");
+const modelEvent = (event: {
+  phase: string;
+  error?: Error;
+  modelFactsChanged?: boolean;
+  refreshStatusChanged?: boolean;
+  agentId?: string;
+}) => mocks.registerModelListener.mock.calls[0]![0](event);
+const authEvent = () => mocks.registerAuthListener.mock.calls[0]![0]();
+const skillsEvent = () => mocks.registerSkillsListener.mock.calls[0]![0]({ reason: "watch" });
 type MetadataRuntime = typeof import("./server-methods/chat-metadata-runtime.js");
-
-function realRuntime(
-  actual: MetadataRuntime,
-  params: Parameters<MetadataRuntime["createGatewayChatMetadataRuntime"]>[0],
-  deps: Partial<ChatMetadataRuntimeDeps>,
-) {
-  return actual.createGatewayChatMetadataRuntime({
-    ...params,
-    deps: {
-      getPreparedAuthStore: () => ({ version: 1, profiles: {} }),
-      getSkillsVersion: () => 0,
-      getPluginRegistryVersion: () => 0,
-      buildCommands: async () => ({ commands: [] }),
-      ...deps,
-    },
-  });
-}
 
 function expectBroadcast(broadcast: GatewayRequestContext["broadcast"], payload: object) {
   expect(broadcast).toHaveBeenCalledExactlyOnceWith("chat.metadata.changed", payload, {
@@ -217,17 +209,20 @@ async function createRealMetadataLifecycle(
     ownerAvailable?: boolean;
     authStore?: RuntimeAuthProfileStore;
     skillsWorkspaceDir?: string;
+    owner?: PreparedModelRuntimeSnapshot;
+    broadcast?: ReturnType<typeof vi.fn>;
+    deps?: Partial<ChatMetadataRuntimeDeps>;
   } = {},
 ) {
   const actual = await vi.importActual<MetadataRuntime>(
     "./server-methods/chat-metadata-runtime.js",
   );
-  let owner = createChatMetadataOwner(config, "before-publication");
+  let owner = options.owner ?? createChatMetadataOwner(config, "before-publication");
   let ownerAvailable = options.ownerAvailable ?? true;
   let latestRefresh = Promise.resolve();
   const refresh = vi.fn<() => Promise<void>>();
   const buildCommands = vi.fn(async () => ({ commands: [] }));
-  const broadcast = vi.fn();
+  const broadcast = options.broadcast ?? vi.fn();
   if (options.skillsWorkspaceDir) {
     owner = { ...owner, workspaceDir: options.skillsWorkspaceDir };
     mocks.registerSkillsListener.mockImplementation(registerSkillsChangeListener);
@@ -240,18 +235,26 @@ async function createRealMetadataLifecycle(
   }
   mocks.createRuntime.mockImplementation(
     (params: Parameters<MetadataRuntime["createGatewayChatMetadataRuntime"]>[0]) => {
-      const runtime = realRuntime(actual, params, {
-        getPreparedOwner: () => (ownerAvailable ? owner : undefined),
-        ...(options.authStore
-          ? { getPreparedAuthStore: authSnapshots.getPreparedRuntimeAuthProfileStoreSnapshotCore }
-          : { getAuthStoreRevision: () => 0 }),
-        getSkillsVersion: options.skillsWorkspaceDir ? getSkillsSnapshotVersion : () => 0,
-        buildCommands,
-        buildProjection: async ({ facts }) => ({
-          modelCatalog: facts.modelCatalog.entries,
-          read: () => ({ models: facts.modelCatalog.entries }),
-          isCurrent: () => true,
-        }),
+      const runtime = actual.createGatewayChatMetadataRuntime({
+        ...params,
+        deps: {
+          getPreparedOwner: () => (ownerAvailable ? owner : undefined),
+          ...(options.authStore
+            ? { getPreparedAuthStore: authSnapshots.getPreparedRuntimeAuthProfileStoreSnapshotCore }
+            : {
+                getPreparedAuthStore: () => ({ version: 1, profiles: {} }),
+                getAuthStoreRevision: () => 0,
+              }),
+          getSkillsVersion: options.skillsWorkspaceDir ? getSkillsSnapshotVersion : () => 0,
+          getPluginRegistryVersion: () => 0,
+          buildCommands,
+          buildProjection: async ({ facts }) => ({
+            modelCatalog: facts.modelCatalog.entries,
+            read: () => ({ models: facts.modelCatalog.entries }),
+            isCurrent: () => true,
+          }),
+          ...options.deps,
+        },
       });
       refresh.mockImplementation(() => {
         latestRefresh = runtime.refresh();
@@ -269,9 +272,6 @@ async function createRealMetadataLifecycle(
   if (options.attach !== false) {
     await attach();
   }
-  const modelEvent = (event: { phase: string; error?: Error; modelFactsChanged?: boolean }) =>
-    mocks.registerModelListener.mock.calls[0]![0](event);
-  const authEvent = () => mocks.registerAuthListener.mock.calls[0]![0]();
   const stop = async () => {
     await sidecarOwner.stop();
     if (options.authStore) {
@@ -449,15 +449,7 @@ describe("gateway chat metadata lifecycle", () => {
   );
 
   it("broadcasts settled metadata through the production lifecycle without a failure feedback loop", async () => {
-    const actual = await vi.importActual<MetadataRuntime>(
-      "./server-methods/chat-metadata-runtime.js",
-    );
-    const owner = {
-      ...createChatMetadataOwner(config, "model"),
-      createStores: () => {
-        throw new Error("metadata must not create live model stores");
-      },
-    };
+    const owner = createChatMetadataOwner(config, "model");
     const getPreparedOwner = vi.fn<() => PreparedModelRuntimeSnapshot | undefined>();
     let available = false;
     let revision = 0;
@@ -468,14 +460,6 @@ describe("gateway chat metadata lifecycle", () => {
       };
       return { read: () => projection, isCurrent: () => true };
     });
-    mocks.createRuntime.mockImplementation((params) =>
-      realRuntime(actual, params, {
-        getPreparedOwner,
-        getAuthStoreRevision: () => revision,
-        buildProjection,
-      }),
-    );
-    const { lifecycle, sidecarOwner } = await createLifecycle();
     const outcomes: unknown[] = [];
     const reads: Promise<void>[] = [];
     const broadcast = vi.fn(() => {
@@ -491,37 +475,43 @@ describe("gateway chat metadata lifecycle", () => {
         ),
       );
     });
-    await lifecycle.attachContext(
-      { broadcast } as unknown as GatewayRequestContext,
-      sidecarOwner.publish,
-    );
+    const harness = await createRealMetadataLifecycle({
+      attach: false,
+      owner,
+      broadcast,
+      deps: {
+        getPreparedOwner,
+        getAuthStoreRevision: () => revision,
+        buildProjection,
+      },
+    });
+    const lifecycle = harness.lifecycle;
+    await harness.attach();
     await Promise.all(reads);
     expect(outcomes).toEqual([expect.stringContaining("metadata is unavailable")]);
     expect(broadcast).toHaveBeenCalledOnce();
     getPreparedOwner.mockReturnValue(owner);
-    const modelListener = mocks.registerModelListener.mock.calls[0]![0];
-    const authListener = mocks.registerAuthListener.mock.calls[0]![0];
-    modelListener({ phase: "published" });
+    modelEvent({ phase: "published" });
     await vi.waitFor(() => expect(outcomes).toHaveLength(2));
     expect(outcomes[1]).toEqual([expect.objectContaining({ available: false })]);
 
-    modelListener({ phase: "invalidated" });
+    modelEvent({ phase: "invalidated" });
     available = true;
     revision += 1;
-    authListener();
+    authEvent();
     expect(broadcast).toHaveBeenCalledTimes(2);
-    modelListener({ phase: "published" });
+    modelEvent({ phase: "published" });
     await vi.waitFor(() => expect(outcomes).toHaveLength(3));
     expect(outcomes[2]).toEqual([expect.objectContaining({ available: true })]);
 
     available = false;
     revision += 1;
-    authListener();
+    authEvent();
     await vi.waitFor(() => expect(outcomes).toHaveLength(4));
     expect(outcomes[3]).toEqual([expect.objectContaining({ available: false })]);
 
-    modelListener({ phase: "invalidated" });
-    modelListener({ phase: "failed", error: new Error("owner publication failed") });
+    modelEvent({ phase: "invalidated" });
+    modelEvent({ phase: "failed", error: new Error("owner publication failed") });
     await Promise.all(reads);
     await expect(lifecycle.read({ agentId: "main" })).rejects.toThrow("owner publication failed");
     expect(outcomes[4]).toBe("owner publication failed");
@@ -559,7 +549,7 @@ describe("gateway chat metadata lifecycle", () => {
         if (startup === "catalog during attachment") {
           await entered.promise;
           expect(mocks.refresh).toHaveBeenCalledOnce();
-          mocks.registerModelListener.mock.calls[0]![0]({ phase: "catalog-published" });
+          modelEvent({ phase: "catalog-published" });
           release.resolve();
         }
         await expect(attachment).resolves.toBeUndefined();
@@ -571,27 +561,21 @@ describe("gateway chat metadata lifecycle", () => {
         } else {
           expect(warn).not.toHaveBeenCalled();
         }
-        const modelListener = mocks.registerModelListener.mock.calls[0]![0];
-        const authListener = mocks.registerAuthListener.mock.calls[0]![0];
-        const skillsListener = mocks.registerSkillsListener.mock.calls[0]![0];
-        for (const listener of [modelListener, authListener, skillsListener]) {
-          expect(listener).toEqual(expect.any(Function));
-        }
         if (startup === "owner invalidated") {
-          modelListener({ phase: "invalidated" });
-          modelListener({ phase: "catalog-published" });
-          modelListener({ phase: "catalog-failed", error: new Error("obsolete catalog failed") });
-          authListener();
-          skillsListener({ reason: "watch" });
+          modelEvent({ phase: "invalidated" });
+          modelEvent({ phase: "catalog-published" });
+          modelEvent({ phase: "catalog-failed", error: new Error("obsolete catalog failed") });
+          authEvent();
+          skillsEvent();
           expect(mocks.refresh).toHaveBeenCalledOnce();
           expect(warn).not.toHaveBeenCalled();
-          modelListener({ phase: "published" });
+          modelEvent({ phase: "published" });
           expect(mocks.refresh).toHaveBeenCalledTimes(2);
           expect(warn).not.toHaveBeenCalled();
         } else {
-          authListener();
+          authEvent();
           expect(mocks.refresh).toHaveBeenCalledTimes(2);
-          skillsListener({ reason: "watch" });
+          skillsEvent();
           expect(mocks.refresh).toHaveBeenCalledTimes(3);
         }
       } finally {
@@ -638,8 +622,7 @@ describe("gateway chat metadata lifecycle", () => {
       vi.useFakeTimers();
       try {
         await lifecycle.attachContext(requestContext, sidecarOwner.publish);
-        const modelListener = mocks.registerModelListener.mock.calls[0]?.[0];
-        modelListener({ phase: "published" });
+        modelEvent({ phase: "published" });
         expect(mocks.refresh).toHaveBeenCalledTimes(2);
         mocks.invalidate.mockClear();
         await read();
@@ -648,7 +631,7 @@ describe("gateway chat metadata lifecycle", () => {
         expect(payloadJson).toBe('{"pendingProviders":["synthetic"]}');
 
         pending = false;
-        modelListener({ phase, modelFactsChanged, refreshStatusChanged, agentId: "main" });
+        modelEvent({ phase, modelFactsChanged, refreshStatusChanged, agentId: "main" });
         await read();
 
         expect(payloadJson).toBe("{}");

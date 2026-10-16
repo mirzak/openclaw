@@ -156,21 +156,6 @@ function readOwner(activeConfig = config) {
   });
 }
 
-function preparedRequest(
-  activeContext: GatewayRequestContext,
-  owner: NonNullable<ReturnType<typeof readOwner>>,
-  projector: ReturnType<typeof createModelCatalogDecisions>,
-) {
-  return {
-    source: { kind: "gateway" as const, context: activeContext },
-    agentId: "main",
-    params: { view: "configured" as const, preparedOnly: true },
-    preloadedOnly: true,
-    preloadedCatalog: { ...main, config: owner.config, snapshot: owner.modelCatalog },
-    catalogProjector: projector,
-  };
-}
-
 function installNativeHarness(
   methods: Pick<AgentHarnessV2, "loadModelCatalog" | "readModelCatalogReadiness">,
 ) {
@@ -191,31 +176,6 @@ function installNativeHarness(
   const authStore = { version: 1, profiles: {} };
   mocks.preparedAuthStore = authStore;
   return { previousRegistry, authStore };
-}
-
-function reportAuthBinding(
-  binding: Pick<
-    Parameters<typeof reportEmbeddedRunSuccessfulAuthBinding>[0],
-    "apiKeyInfo" | "attempt" | "modelApi" | "modelBaseUrl"
-  > &
-    Partial<
-      Pick<Parameters<typeof reportEmbeddedRunSuccessfulAuthBinding>[0], "profileId" | "config">
-    >,
-) {
-  const profileStore = mocks.preparedAuthStore;
-  assert(profileStore, "expected unresolved prepared auth store");
-  reportEmbeddedRunSuccessfulAuthBinding({
-    profileStore,
-    provider: "openai",
-    agentDir: state.agentDir("main"),
-    modelId: "gpt-5.4",
-    requestTransportOverrides: "none",
-    config,
-    agentHarnessId: "codex",
-    pluginHarnessOwnsTransport: true,
-    pluginHarnessOwnsAuthBootstrap: true,
-    ...binding,
-  });
 }
 
 async function publishOwner(ownerConfig: OpenClawConfig = config): Promise<void> {
@@ -375,11 +335,17 @@ describe("gateway chat metadata lifecycle composition", () => {
             return evaluateEntry(entry, variants);
           });
         const builds = mocks.buildPreparedModelCatalogSnapshot.mock.calls.length;
-        const request = preparedRequest(
-          { ...context, getRuntimeConfig: () => nativeCfg },
-          owner,
-          projector,
-        );
+        const request = {
+          source: {
+            kind: "gateway" as const,
+            context: { ...context, getRuntimeConfig: () => nativeCfg },
+          },
+          agentId: "main",
+          params: configured,
+          preloadedOnly: true,
+          preloadedCatalog: { ...main, config: owner.config, snapshot: owner.modelCatalog },
+          catalogProjector: projector,
+        };
         result = buildModelsListResult(request);
         const models = (await result).models;
         expect(models.map(({ id }) => id).toSorted()).toEqual(
@@ -827,7 +793,17 @@ describe("gateway chat metadata lifecycle composition", () => {
       const modelBaseUrl = apiKey
         ? "https://api.openai.com/v1"
         : "https://chatgpt.com/backend-api/codex";
-      reportAuthBinding({
+      const profileStore = mocks.preparedAuthStore;
+      assert(profileStore, "expected unresolved prepared auth store");
+      reportEmbeddedRunSuccessfulAuthBinding({
+        profileStore,
+        provider: "openai",
+        agentDir: state.agentDir("main"),
+        modelId: "gpt-5.4",
+        requestTransportOverrides: "none",
+        agentHarnessId: "codex",
+        pluginHarnessOwnsTransport: true,
+        pluginHarnessOwnsAuthBootstrap: true,
         ...(apiKey ? { profileId: "openai:default" } : {}),
         apiKeyInfo: apiKey
           ? {
