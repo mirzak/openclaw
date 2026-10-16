@@ -1,13 +1,12 @@
+import assert from "node:assert/strict";
 import { copyFileSync, renameSync } from "node:fs";
 import path from "node:path";
-import type { DatabaseSync } from "node:sqlite";
 import { expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { buildAcpDatabaseSessionKey } from "../acp/runtime/session-meta-keys.js";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { observeMainThreadSql } from "../test-utils/main-thread-sql-spies.test-support.js";
 import { useStateDatabaseTempDirs } from "../test-utils/state-database-temp-dirs.js";
-import { recordBackupRunInDatabase } from "./backup-run-records.kernel.js";
 import * as reads from "./openclaw-state-db-readonly.js";
 import { withExistingOpenClawStateSchema } from "./openclaw-state-db-schema-policy.js";
 import * as state from "./openclaw-state-db.js";
@@ -26,17 +25,11 @@ async function fixture() {
     kind: "archive",
   } as const;
   const database = state.openOpenClawStateDatabase({ env });
-  state.runOpenClawStateWriteTransaction(
-    ({ db }) =>
-      recordBackupRunInDatabase(db, {
-        id: record.id,
-        created_at: record.createdAt,
-        archive_path: record.archivePath,
-        status: record.status,
-        manifest_json: JSON.stringify({ kind: record.kind }),
-      }),
-    { database, env },
-  );
+  database.db
+    .prepare(`INSERT INTO backup_runs
+    (id, created_at, archive_path, status, manifest_json)
+    VALUES ('alpha', 1, ?, 'ok', '{"kind":"archive"}')`)
+    .run(record.archivePath);
   database.db
     .prepare("UPDATE schema_meta SET app_version = ? WHERE meta_key = 'primary'")
     .run("synthetic-installed-runtime");
@@ -44,7 +37,6 @@ async function fixture() {
   await state.closeOpenClawStateDatabaseAsync();
   replaceFile(options.path, "seed");
   return {
-    env,
     options,
     record,
     read: async () => reads.executeExistingOpenClawStateRead({ env }, { type: "backup.runs" }),
@@ -55,21 +47,10 @@ function backupReply(record: Awaited<ReturnType<typeof fixture>>["record"]) {
   return { ok: true, type: "backup.runs", sourceAdmitted: true, runs: [record] };
 }
 
-async function withSqlite<T>(
-  file: string,
-  run: (db: DatabaseSync) => T | Promise<T>,
-  readOnly = false,
-): Promise<T> {
-  const db = new (requireNodeSqlite().DatabaseSync)(file, { readOnly });
-  try {
-    return await run(db);
-  } finally {
-    db.close();
-  }
+function dropListingIndex(file: string) {
+  using db = new (requireNodeSqlite().DatabaseSync)(file);
+  db.exec("DROP INDEX idx_plugin_state_listing");
 }
-
-const dropListingIndex = (file: string) =>
-  withSqlite(file, (db) => db.exec("DROP INDEX idx_plugin_state_listing"));
 function replaceFile(file: string, suffix: string) {
   renameSync(file, `${file}.${suffix}`);
   copyFileSync(`${file}.${suffix}`, file);
@@ -77,15 +58,10 @@ function replaceFile(file: string, suffix: string) {
 async function withoutHostSql<T>(run: () => Promise<T>) {
   requireNodeSqlite();
   const sql = observeMainThreadSql();
-  try {
-    return await run();
-  } finally {
-    try {
-      sql.expectIdle();
-    } finally {
-      vi.restoreAllMocks();
-    }
-  }
+  using cleanup = new DisposableStack();
+  cleanup.defer(() => vi.restoreAllMocks());
+  cleanup.defer(() => sql.expectIdle());
+  return await run();
 }
 
 it("prepares ACP and workspace facets together and observes foreign changes at each new phase", async () => {
@@ -118,29 +94,26 @@ it("prepares ACP and workspace facets together and observes foreign changes at e
     const result = await withoutHostSql(() =>
       reads.executeExistingOpenClawStateRead({ env, path: database.path }, command),
     );
-    if (!result?.ok || result.type !== command.type) {
-      throw new Error("Expected the row shared-state cohort");
-    }
+    assert(result?.ok && result.type === command.type, "Expected the row shared-state cohort");
     return result.rows;
   };
   expect(await read()).toEqual([{ acp: null, repositoryWorkspace: workspace }]);
-  await withSqlite(database.path, async (foreign) => {
-    foreign
-      .prepare(`INSERT INTO acp_sessions
+  using foreign = new (requireNodeSqlite().DatabaseSync)(database.path);
+  foreign
+    .prepare(`INSERT INTO acp_sessions
       (session_key, session_id, backend, agent, runtime_session_name, mode, state, last_activity_at, updated_at)
       VALUES (?, 'generation', 'fixture', 'main', 'foreign', 'persistent', 'idle', 2, 2)`)
-      .run(command.entries[0]!.acp.keys[0]!);
-    foreign.prepare("UPDATE session_repository_workspaces SET branch = 'foreign'").run();
-    expect(await read()).toEqual([
-      {
-        acp: expect.objectContaining({ runtime_session_name: "foreign" }),
-        repositoryWorkspace: { ...workspace, branch: "foreign" },
-      },
-    ]);
-    foreign.prepare("DELETE FROM acp_sessions").run();
-    foreign.prepare("DELETE FROM session_repository_workspaces").run();
-    expect(await read()).toEqual([{ acp: null, repositoryWorkspace: null }]);
-  });
+    .run(command.entries[0]!.acp.keys[0]!);
+  foreign.prepare("UPDATE session_repository_workspaces SET branch = 'foreign'").run();
+  expect(await read()).toEqual([
+    {
+      acp: expect.objectContaining({ runtime_session_name: "foreign" }),
+      repositoryWorkspace: { ...workspace, branch: "foreign" },
+    },
+  ]);
+  foreign.prepare("DELETE FROM acp_sessions").run();
+  foreign.prepare("DELETE FROM session_repository_workspaces").run();
+  expect(await read()).toEqual([{ acp: null, repositoryWorkspace: null }]);
 });
 
 it.each(["fresh", "cached", "artifact"] as const)(
@@ -158,23 +131,18 @@ it.each(["fresh", "cached", "artifact"] as const)(
       expect(await read()).toEqual(backupReply(record));
       await state.closeOpenClawStateDatabaseAsync();
       replaceFile(options.path, "previous");
-      await dropListingIndex(options.path);
+      dropListingIndex(options.path);
       await expect(read()).rejects.toThrow(/idx_plugin_state_listing|schema/i);
     });
     await state.closeOpenClawStateDatabaseAsync();
-    await withSqlite(
-      options.path,
-      (persisted) => {
-        const get = (sql: string) => persisted.prepare(sql).get();
-        expect(get("SELECT app_version FROM schema_meta WHERE meta_key = 'primary'")).toEqual({
-          app_version: "synthetic-installed-runtime",
-        });
-        expect(
-          get("SELECT name FROM sqlite_schema WHERE name = 'idx_plugin_state_listing'"),
-        ).toBeUndefined();
-      },
-      true,
-    );
+    using persisted = new (requireNodeSqlite().DatabaseSync)(options.path, { readOnly: true });
+    expect(
+      persisted
+        .prepare(`SELECT app_version,
+        (SELECT name FROM sqlite_schema WHERE name = 'idx_plugin_state_listing') AS listing_index
+        FROM schema_meta WHERE meta_key = 'primary'`)
+        .get(),
+    ).toEqual({ app_version: "synthetic-installed-runtime", listing_index: null });
   },
 );
 
@@ -209,7 +177,7 @@ it("rejects detached fixed reads after their existing-schema scope ends", async 
 it("validates existing runtime shape before a fresh native read callback", async () => {
   const { options } = await fixture();
   await withExistingOpenClawStateSchema(options, async () => {
-    await dropListingIndex(options.path);
+    dropListingIndex(options.path);
     const read = vi.fn(() => "must not run");
     expect(() => reads.withExistingOpenClawStateDatabaseReadOnly(read, options)).toThrow(
       /idx_plugin_state_listing|schema/i,

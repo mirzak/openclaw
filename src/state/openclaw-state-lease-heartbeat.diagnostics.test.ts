@@ -12,30 +12,22 @@ const fixture = vi.hoisted(() => ({
   data: undefined as LeaseHeartbeatWorkerData | undefined,
   renew: vi.fn<() => number | undefined>(),
   readExpiry: vi.fn<() => number | undefined>(),
-  receive: undefined as ((message: LeaseHeartbeatParentMessage) => void) | undefined,
 }));
 
 vi.mock("node:worker_threads", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:worker_threads")>();
   const { EventEmitter } = await import("node:events");
+  const parentPort = Object.assign(new EventEmitter(), {
+    postMessage: (message: unknown) => fixture.worker?.emit("message", structuredClone(message)),
+    close: () => queueMicrotask(() => fixture.worker?.emit("exit", 0)),
+  });
   return {
     ...actual,
     isMainThread: false,
     get workerData() {
       return fixture.data;
     },
-    parentPort: {
-      on(_event: "message", listener: (message: LeaseHeartbeatParentMessage) => void) {
-        fixture.receive = listener;
-      },
-      off(_event: "message", listener: (message: LeaseHeartbeatParentMessage) => void) {
-        if (fixture.receive === listener) {
-          fixture.receive = undefined;
-        }
-      },
-      postMessage: (message: unknown) => fixture.worker?.emit("message", structuredClone(message)),
-      close: () => queueMicrotask(() => fixture.worker?.emit("exit", 0)),
-    },
+    parentPort,
     Worker: class extends EventEmitter {
       stdout = { resume() {} };
       stderr = { resume() {} };
@@ -45,7 +37,7 @@ vi.mock("node:worker_threads", async (importOriginal) => {
         fixture.worker = this;
       }
       postMessage(message: LeaseHeartbeatParentMessage) {
-        queueMicrotask(() => fixture.receive?.(structuredClone(message)));
+        queueMicrotask(() => parentPort.emit("message", structuredClone(message)));
       }
       async terminate() {
         this.emit("exit", 0);
@@ -89,20 +81,16 @@ vi.mock("./openclaw-state-lease-renewal.worker.js", () => ({
     return {
       schedule(entry: StateLeaseRenewal, expiresAt: number) {
         clearTimeout(pending.get(entry));
-        pending.set(
-          entry,
-          setTimeout(
-            () => {
-              pending.delete(entry);
-              try {
-                entry.complete({ expiresAt: fixture.renew() });
-              } catch (error) {
-                entry.complete({ error });
-              }
-            },
-            expiresAt - entry.leaseMs + entry.intervalMs - Date.now(),
-          ),
-        );
+        const complete = () => {
+          pending.delete(entry);
+          try {
+            entry.complete({ expiresAt: fixture.renew() });
+          } catch (error) {
+            entry.complete({ error });
+          }
+        };
+        const delay = expiresAt - entry.leaseMs + entry.intervalMs - Date.now();
+        pending.set(entry, setTimeout(complete, delay));
       },
       cancel(entry: StateLeaseRenewal) {
         clearTimeout(pending.get(entry));
@@ -119,7 +107,6 @@ beforeEach(() => {
   vi.setSystemTime(acquiredAt + 100);
   fixture.renew.mockReset().mockImplementation(() => Date.now() + 60_000);
   fixture.readExpiry.mockReset().mockReturnValue(acquiredAt + 60_000);
-  fixture.receive = undefined;
 });
 afterEach(() => vi.useRealTimers());
 

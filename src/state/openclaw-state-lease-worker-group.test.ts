@@ -11,7 +11,6 @@ import {
   createOpenClawStateLeaseWorkerOwner,
   withOpenClawStateLeaseWorkerAdmission as withSingle,
   withOpenClawStateLeasesWorkerAdmission as withGroup,
-  type OpenClawStateLeaseWorkerAuthority,
 } from "./openclaw-state-lease-worker-owner.js";
 import type { OpenClawStateLeaseIdentity } from "./openclaw-state-lease.types.js";
 import type { OpenClawStateWorkerContext } from "./openclaw-state-worker-context.types.js";
@@ -87,8 +86,8 @@ function job(createAdmission: SqliteWorkerAdmissionFactory) {
 function facts(identities: readonly OpenClawStateLeaseIdentity[], expiresAt = Date.now() + 30_000) {
   return identities.map((identity) => ({ identity, expiresAt }));
 }
+type LeaseFacts = ReturnType<typeof facts>;
 
-type GroupScope = Parameters<Parameters<typeof withGroup>[2]>[0];
 function group(context = sourceContext()) {
   const members = [fixture(context), fixture(context, "target")] as const;
   const leases = members.map(({ lease }) => lease);
@@ -96,12 +95,7 @@ function group(context = sourceContext()) {
     context,
     members,
     leases,
-    run<T>(
-      operation: (scope: GroupScope) => Promise<T>,
-      authority?: OpenClawStateLeaseWorkerAuthority,
-    ) {
-      return withGroup(leases, context, operation, authority);
-    },
+    run: withGroup.bind(null, leases, context),
     expectReleasable(value: boolean) {
       expect(members.map(({ owner }) => owner.canRelease())).toEqual([value, value]);
     },
@@ -110,28 +104,31 @@ function group(context = sourceContext()) {
 
 describe("state lease group admission", () => {
   it.each([
-    "admission",
-    "maintenance",
-    "effect",
-    "transaction-replacement",
-    "commit",
-    "member-0",
-    "member-1",
-    "caller",
-    "expiry",
-    "async",
-  ] as const)("refuses grants after %s authority changes", async (kind) => {
+    ["admission", "source"],
+    ["maintenance", "source"],
+    ["effect", "caller"],
+    ["transaction-replacement", "caller"],
+    ["commit", "caller"],
+    ["member-0", "member"],
+    ["member-1", "member"],
+    ["caller", "caller"],
+    ["expiry", "expiry"],
+    ["async", "async"],
+  ] as const)("refuses grants after %s authority changes", async (kind, failure) => {
     const context = sourceContext();
     let now = 1_000;
-    let sourceCurrent = true;
-    let currentCaller = true;
+    const current = { source: true, caller: true };
     vi.spyOn(Date, "now").mockImplementation(() => now);
-    const sourceError = new Error("original source retired");
-    const callerError = new Error(kind === "caller" ? "caller retired" : "original caller retired");
-    const revoked = new Error("lease retired during host commit preparation");
+    const failures = {
+      source: new Error("original source retired"),
+      caller: new Error(kind === "caller" ? "caller retired" : "original caller retired"),
+      member: new Error("lease retired during host commit preparation"),
+      expiry: "State lease worker ownership was refused",
+      async: "State lease worker authority must complete synchronously",
+    };
     const assertSourceCurrent = () => {
-      if (!sourceCurrent) {
-        throw sourceError;
+      if (!current.source) {
+        throw failures.source;
       }
     };
     const maintenance = createOpenClawDatabaseMaintenanceScope({
@@ -148,20 +145,20 @@ describe("state lease group admission", () => {
         if (kind === "transaction-replacement") {
           authority.beforeTransaction = noop;
         }
-        if (!currentCaller) {
-          throw callerError;
+        if (!current.caller) {
+          throw failures.caller;
         }
       },
       beforeTransaction() {
         if (kind === "transaction-replacement") {
-          throw callerError;
+          throw failures.caller;
         }
       },
       beforeCommit() {
         if (kind === "member-0" || kind === "member-1") {
-          members[kind === "member-0" ? 0 : 1].controller.abort(revoked);
+          members[kind === "member-0" ? 0 : 1].controller.abort(failures.member);
         } else if (kind === "caller" || kind === "commit") {
-          currentCaller = false;
+          current.caller = false;
         } else if (kind === "expiry") {
           now = 2_000;
         }
@@ -173,47 +170,36 @@ describe("state lease group admission", () => {
     }
     try {
       await run(async (scope) => {
-        const current = job(scope.createAdmission);
+        const task = job(scope.createAdmission);
         const held = facts(scope.identities, 2_000);
-        if (kind === "transaction-replacement") {
-          expect(current.request("transaction", held)).toBe(2);
-          expect(current.admission.failure).toBe(callerError);
-          current.settled.resolve({ kind: "completed" });
-          return;
+        expect(task.request("transaction", held)).toBe(kind === "transaction-replacement" ? 2 : 1);
+        if (kind !== "transaction-replacement") {
+          if (kind === "admission") {
+            context.admission.assertCurrent = noop;
+          }
+          if (kind === "maintenance") {
+            maintenance.assertAdmission = noop;
+          }
+          if (kind === "effect") {
+            authority.assertCurrent = noop;
+            current.caller = false;
+          }
+          if (kind === "commit") {
+            authority.beforeCommit = noop;
+          }
+          current.source = false;
+          expect(task.request("commit", held)).toBe(2);
         }
-        expect(current.request("transaction", held)).toBe(1);
-        if (kind === "admission") {
-          context.admission.assertCurrent = noop;
-        } else if (kind === "maintenance") {
-          maintenance.assertAdmission = noop;
-        } else if (kind === "effect") {
-          authority.assertCurrent = noop;
-          currentCaller = false;
-        } else if (kind === "commit") {
-          authority.beforeCommit = noop;
-        }
-        sourceCurrent = false;
-        expect(current.request("commit", held)).toBe(2);
-        const expected = {
-          effect: callerError,
-          commit: callerError,
-          "member-0": revoked,
-          "member-1": revoked,
-          caller: callerError,
-          admission: sourceError,
-          maintenance: sourceError,
-          expiry: "State lease worker ownership was refused",
-          async: "State lease worker authority must complete synchronously",
-        }[kind];
+        const expected = failures[failure];
         if (typeof expected === "string") {
-          expect(current.admission.failure).toMatchObject({ message: expected });
+          expect(task.admission.failure).toMatchObject({ message: expected });
         } else {
-          expect(current.admission.failure).toBe(expected);
+          expect(task.admission.failure).toBe(expected);
         }
-        current.settled.resolve({ kind: "completed" });
+        task.settled.resolve({ kind: "completed" });
       }, authority);
     } finally {
-      sourceCurrent = true;
+      current.source = true;
       await maintenance.close();
     }
   });
@@ -291,33 +277,30 @@ describe("state lease group admission", () => {
     expectReleasable(true);
   });
 
-  it.each(["missing", "extra", "reordered", "wrong-owner", "expired"] as const)(
-    "refuses invalid %s grant requests",
-    async (kind) => {
-      await group().run(async (scope) => {
-        const current = job(scope.createAdmission);
-        const held = facts(scope.identities);
-        if (kind === "missing") {
-          held.pop();
-        }
-        if (kind === "extra") {
-          held.push(expectDefined(held[0], "first lease facts"));
-        }
-        if (kind === "reordered") {
-          held.reverse();
-        }
-        if (kind === "wrong-owner") {
-          expectDefined(held[1], "second lease facts").identity.owner = "unrelated";
-        }
-        if (kind === "expired") {
-          expectDefined(held[1], "second lease facts").expiresAt = Date.now();
-        }
-        expect(current.request("transaction", held)).toBe(2);
-        expect(current.admission.failure).toMatchObject({ code: "OPENCLAW_STATE_LEASE_LOST" });
-        current.settled.resolve({ kind: "not-entered", error: current.admission.failure });
-      });
-    },
-  );
+  it.each<[string, (held: LeaseFacts) => LeaseFacts]>([
+    ["missing", (held) => held.slice(0, 1)],
+    ["extra", (held) => [...held, expectDefined(held[0], "first lease facts")]],
+    ["reordered", (held) => held.toReversed()],
+    [
+      "wrong-owner",
+      (held) =>
+        held.map((entry, index) =>
+          index === 1 ? { ...entry, identity: { ...entry.identity, owner: "unrelated" } } : entry,
+        ),
+    ],
+    [
+      "expired",
+      (held) =>
+        held.map((entry, index) => (index === 1 ? { ...entry, expiresAt: Date.now() } : entry)),
+    ],
+  ])("refuses invalid %s grant requests", async (_kind, invalidate) => {
+    await group().run(async (scope) => {
+      const current = job(scope.createAdmission);
+      expect(current.request("transaction", invalidate(facts(scope.identities)))).toBe(2);
+      expect(current.admission.failure).toMatchObject({ code: "OPENCLAW_STATE_LEASE_LOST" });
+      current.settled.resolve({ kind: "not-entered", error: current.admission.failure });
+    });
+  });
 
   it.each([
     "empty",
