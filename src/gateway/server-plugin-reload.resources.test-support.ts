@@ -9,6 +9,7 @@ import { getPluginInstance } from "../plugins/plugin-instance-scope.js";
 import type { PluginInstanceConsumer } from "../plugins/plugin-instance.types.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import type { GatewayRequestHandlerOptions } from "./server-methods/types.js";
+import { observeSettlement } from "./server-plugin-reload.fixture-tools.test-support.js";
 import {
   expectSiblingUnchanged,
   observeRetainedWork,
@@ -35,12 +36,7 @@ async function readResource(fixture: RecoveryFixture) {
 }
 
 function resourceConfig(mode: string): OpenClawConfig {
-  return {
-    plugins: {
-      allow: ["first", "sibling"],
-      entries: { first: { config: { mode } } },
-    },
-  };
+  return { plugins: { allow: ["first", "sibling"], entries: { first: { config: { mode } } } } };
 }
 
 export async function verifySharedResourceReplacement(
@@ -52,10 +48,7 @@ export async function verifySharedResourceReplacement(
   const fixture = await createFixture({
     config: resourceConfig("old"),
     abortOnCandidateStart: false,
-    register(api, owner) {
-      if (owner !== "first") {
-        return;
-      }
+    registerFirst(api) {
       const mode = api.config.plugins?.entries?.first?.config?.mode;
       assert(typeof mode === "string");
       events.push(`register:${mode}`);
@@ -112,10 +105,7 @@ export async function verifyCandidateResourceCleanup(createFixture: RecoveryFixt
     beforePublish: async () => {
       throw new Error("candidate publication refused");
     },
-    register(api, owner) {
-      if (owner !== "first") {
-        return;
-      }
+    registerFirst(api) {
       const resource = { closed: false, flushed: false };
       resources.push(resource);
       api.registerService({
@@ -174,10 +164,7 @@ async function verifySelfConsumerReload(
     },
   });
   const pluginIds = caller === "later replacement target" ? ["first", "sibling"] : ["first"];
-  const record = fixture.previousRegistry.plugins.find((plugin) => plugin.id === pluginIds.at(-1));
-  assert(record);
-  const instance = getPluginInstance(record);
-  assert(instance);
+  const instance = fixture.instance(pluginIds.at(-1));
   const observation = observeRetainedWork(instance);
   if (caller !== "final checkpoint") {
     consumer = instance.retainConsumer();
@@ -198,8 +185,7 @@ async function verifySelfConsumerReload(
       details: { phase: caller === "own invocation" ? "prepare" : "drain", committed: false },
     });
     expect(prepareConfigEffects).toHaveBeenCalledTimes(caller === "own invocation" ? 0 : 1);
-    expect(fixture.firstStop).not.toHaveBeenCalled();
-    expect(fixture.siblingStop).not.toHaveBeenCalled();
+    fixture.expectServices({ firstStop: 0, siblingStop: 0 });
     expect(fixture.candidates).toHaveLength(0);
     expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
     expect(instance.run(() => "still serving")).toBe("still serving");
@@ -233,22 +219,13 @@ async function verifyOverlappingRetainedWork(createRecoveryFixture: RecoveryFixt
       reserved.resolve();
       return { retire: () => {}, rollback: async () => {} };
     },
-    register(api, owner) {
-      if (owner !== "first") {
-        return;
-      }
+    registerFirst(api) {
       const generation = ++registrations;
       api.lifecycle.onDispose?.(() => void disposed.push(generation));
-      api.registerGatewayMethod("first.generation", ({ respond }) => {
-        respond(true, { generation });
-      });
     },
   });
   const old = fixture.previousRegistry;
-  const record = old.plugins.find((entry) => entry.id === "first");
-  assert(record);
-  const instance = getPluginInstance(record);
-  assert(instance);
+  const instance = fixture.instance();
   const consumer = instance.retainConsumer();
   const observation = observeRetainedWork(instance, true);
   const first = retainRuntimePluginWork([old]);
@@ -298,8 +275,7 @@ async function verifyExplicitDrainWait(
     waitForDrain: true,
     drainSignal: controller.signal,
   });
-  const instance = getPluginInstance(fixture.previousRegistry.plugins[0]!);
-  assert(instance);
+  const instance = fixture.instance();
   const released = createDeferredCore();
   const consumer = kind === "retained consumer" ? instance.retainConsumer() : undefined;
   const release =
@@ -310,27 +286,21 @@ async function verifyExplicitDrainWait(
         : () => released.resolve();
   const call = kind === "active call" ? instance.run(() => released.promise) : undefined;
   const observation = observeRetainedWork(instance);
-  let settled = false;
   vi.useFakeTimers();
-  const reloading = fixture
-    .reload()
-    .catch((error: unknown) => error)
-    .then((result) => {
-      settled = true;
-      return result;
-    });
+  const operation = observeSettlement(fixture.reload().catch((error: unknown) => error));
+  const reloading = operation.result;
   try {
     await Promise.race([observation.entered, reloading]);
     expect(fixture.owner.getReloadStatus()?.reason).toBeTruthy();
     await vi.advanceTimersByTimeAsync(70_000);
-    expect(settled).toBe(false);
+    expect(operation.state.settled).toBe(false);
     expect(fixture.candidates).toHaveLength(0);
     expect(fixture.firstStop).not.toHaveBeenCalled();
     expect(instance.disposing).toBe(false);
     if (outcome === "cancel") {
       controller.abort(new Error("operator cancelled reload"));
       await vi.advanceTimersByTimeAsync(0);
-      expect(settled).toBe(true);
+      expect(operation.state.settled).toBe(true);
       expect(await reloading).toMatchObject({ details: { phase: "drain", committed: false } });
       expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
       expect(instance.run(() => "still serving")).toBe("still serving");
@@ -375,8 +345,7 @@ export function registerPluginRetainedWorkReloadTests(
       prepareConfigEffects,
     });
     const registry = fixture.previousRegistry;
-    const instance = getPluginInstance(registry.plugins.find((record) => record.id === "first")!);
-    assert(instance);
+    const instance = fixture.instance();
     const snapshot = createModelRuntimeChoiceOwnerFixture({}, () => true, {
       pluginRegistry: registry,
     });
@@ -397,8 +366,7 @@ export function registerPluginRetainedWorkReloadTests(
       expect(runInTurn(() => instance.hasActiveCall)).toBe(false);
       await expect(runInTurn(() => fixture.reload())).rejects.toThrow("own active turn");
       expect(prepareConfigEffects).not.toHaveBeenCalled();
-      expect(fixture.firstStop).not.toHaveBeenCalled();
-      expect(fixture.siblingStop).not.toHaveBeenCalled();
+      fixture.expectServices({ firstStop: 0, siblingStop: 0 });
       expect(fixture.registryOwner.registry).toBe(registry);
       expect(instance.run(() => "still serving")).toBe("still serving");
 

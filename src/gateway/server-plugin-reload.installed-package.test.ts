@@ -40,6 +40,7 @@ import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js
 import { withEnvAsync } from "../test-utils/env.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import type { GatewayRequestHandlerOptions } from "./server-methods/types.js";
+import { heldWork, pluginInstance } from "./server-plugin-reload.fixture-tools.test-support.js";
 import { reloadGatewayPlugins } from "./server-plugin-reload.js";
 import { observeRetainedWork } from "./server-plugin-reload.recovery.test-support.js";
 import { createGatewayPluginRuntimeGeneration } from "./server-plugin-runtime-generation.js";
@@ -49,6 +50,10 @@ import { createGatewaySidecarStopOwner } from "./server-sidecar-owners.js";
 const cleanups: Array<() => Promise<void>> = [];
 const tempDirs: string[] = [];
 const logs = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+
+function writeJson(file: string, data: unknown) {
+  fs.writeFileSync(file, JSON.stringify(data));
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -115,31 +120,25 @@ async function verifyInstalledPackageRetention(
     }),
   ) => {
     fs.mkdirSync(path.join(packageDir, "dist"), { recursive: true });
-    fs.writeFileSync(
-      path.join(packageDir, "package.json"),
-      JSON.stringify({
-        name: id,
-        version: "1.0.0",
-        openclaw: { extensions: ["./index.ts"], runtimeExtensions: ["./dist/index.js"] },
-      }),
-    );
+    writeJson(path.join(packageDir, "package.json"), {
+      name: id,
+      version: "1.0.0",
+      openclaw: { extensions: ["./index.ts"], runtimeExtensions: ["./dist/index.js"] },
+    });
     fs.writeFileSync(path.join(packageDir, "index.ts"), "throw new Error('unselected source');");
-    fs.writeFileSync(
-      path.join(packageDir, "openclaw.plugin.json"),
-      JSON.stringify({
-        id,
-        activation: { onStartup: true },
-        configSchema:
-          id === "sibling"
-            ? {
-                type: "object",
-                additionalProperties: false,
-                properties:
-                  settings === "defaulted" ? { mode: { type: "string", default: "auto" } } : {},
-              }
-            : { type: "object" },
-      }),
-    );
+    writeJson(path.join(packageDir, "openclaw.plugin.json"), {
+      id,
+      activation: { onStartup: true },
+      configSchema:
+        id === "sibling"
+          ? {
+              type: "object",
+              additionalProperties: false,
+              properties:
+                settings === "defaulted" ? { mode: { type: "string", default: "auto" } } : {},
+            }
+          : { type: "object" },
+    });
     fs.writeFileSync(path.join(packageDir, "dist", "helper.cjs"), 'module.exports = "A";');
     fs.writeFileSync(
       path.join(packageDir, "dist", "index.js"),
@@ -185,13 +184,10 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       fs.writeFileSync(path.join(siblingDir, assetDir, "index.css"), ":root { color: blue; }\n");
       const manifestPath = path.join(siblingDir, "openclaw.plugin.json");
       const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
-      fs.writeFileSync(
-        manifestPath,
-        JSON.stringify({
-          ...manifest,
-          controlUi: { entry: `${assetDir}/index.js`, styles: [`${assetDir}/index.css`] },
-        }),
-      );
+      writeJson(manifestPath, {
+        ...manifest,
+        controlUi: { entry: `${assetDir}/index.js`, styles: [`${assetDir}/index.css`] },
+      });
     };
     writeSiblingControlUi("build-a");
     const bundledDir =
@@ -210,6 +206,12 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         path.join(secondaryWorkspace, ".openclaw", "extensions", "workspace-probe"),
       );
     }
+    const initialIds = [
+      "sibling",
+      ...(bundledDir ? ["bundled-probe"] : []),
+      ...(healthyDir ? ["healthy"] : []),
+      ...(hasWorkspacePlugin ? ["workspace-probe"] : []),
+    ];
     const initialConfig: OpenClawConfig = {
       agents: {
         ownership: "explicit",
@@ -219,18 +221,8 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         },
       },
       plugins: {
-        allow: [
-          "sibling",
-          ...(bundledDir ? ["bundled-probe"] : []),
-          ...(healthyDir ? ["healthy"] : []),
-          ...(hasWorkspacePlugin ? ["workspace-probe"] : []),
-        ],
-        entries: {
-          sibling: { enabled: true },
-          ...(bundledDir ? { "bundled-probe": { enabled: true } } : {}),
-          ...(healthyDir ? { healthy: { enabled: true } } : {}),
-          ...(hasWorkspacePlugin ? { "workspace-probe": { enabled: true } } : {}),
-        },
+        allow: initialIds,
+        entries: Object.fromEntries(initialIds.map((id) => [id, { enabled: true }])),
         load: { paths: healthyDir ? [siblingDir, healthyDir] : [siblingDir] },
         slots: { memory: "none" },
       },
@@ -242,12 +234,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       env,
     });
     expect(initialMetadata.manifestRegistry.plugins.map((plugin) => plugin.id).toSorted()).toEqual(
-      [
-        "sibling",
-        ...(bundledDir ? ["bundled-probe"] : []),
-        ...(healthyDir ? ["healthy"] : []),
-        ...(hasWorkspacePlugin ? ["workspace-probe"] : []),
-      ].toSorted(),
+      initialIds.toSorted(),
     );
     const initial = await bootstrap.prepareGatewayPluginLoad({
       pluginMetadataSnapshot: initialMetadata,
@@ -287,10 +274,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
     let beforeAttachment: ((candidate: (typeof loaded)[number]) => void) | undefined;
     cleanups.push(async () => {
       try {
-        await currentServices?.stop({
-          strict: true,
-          deadlineAtMs: Date.now() + 5_000,
-        });
+        await currentServices?.stop({ strict: true, deadlineAtMs: Date.now() + 5_000 });
       } finally {
         for (const generation of loaded) {
           generation.retireGatewayRuntimeBindings?.();
@@ -399,7 +383,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         { env },
       );
     await writeInstall();
-    fs.writeFileSync(path.join(stateDir, "openclaw.json"), JSON.stringify(config));
+    writeJson(path.join(stateDir, "openclaw.json"), config);
     const reload = async (
       nextConfig = config,
       pluginIds = ["installed-probe"],
@@ -438,11 +422,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
           changedPaths: [],
           prepareConfigEffects: () => ({ retire: () => {}, rollback: async () => {} }),
           assertInvokerOwned,
-          pluginLifecycle: {
-            reason,
-            operationId: "installed-package-reload",
-            pluginIds,
-          },
+          pluginLifecycle: { reason, operationId: "installed-package-reload", pluginIds },
           commitRuntime: async (publication) => {
             publication?.publish();
             setRuntimeConfigSnapshot(nextConfig);
@@ -548,12 +528,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
     }
     if (cleanupRetry) {
       const retiredRegistry = runtime.pluginRuntime.registry;
-      const retiredRecord = retiredRegistry.plugins.find(
-        (record) => record.id === "installed-probe",
-      );
-      assert.ok(retiredRecord);
-      const retiredInstance = getPluginInstance(retiredRecord);
-      assert.ok(retiredInstance);
+      const retiredInstance = pluginInstance(retiredRegistry, "installed-probe");
       if (cleanupRetry === "active-call") {
         const release = createDeferredCore();
         const effectsPath = path.join(root, "completed-call.txt");
@@ -634,8 +609,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         }
         return;
       }
-      const entered = createDeferredCore();
-      const release = createDeferredCore();
+      const disposal = heldWork();
       let blockedInstance = retiredInstance;
       let capturedEntry: string | undefined;
       let capturedBytes: string | undefined;
@@ -645,10 +619,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         expect(capturedEntry).not.toBe(path.join(packageDir, "dist", "index.js"));
         capturedBytes = fs.readFileSync(capturedEntry, "utf8");
         // Physical source cleanup remains owned after the caller's observation budget expires.
-        blockedInstance.onModuleDispose(async () => {
-          entered.resolve();
-          await release.promise;
-        });
+        blockedInstance.onModuleDispose(disposal.run);
       };
       let rejectedConfig = config;
       const rejectedRuntime =
@@ -667,13 +638,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
           if (attachments !== (cleanupRetry === "candidate-disposal" ? 1 : 2)) {
             return;
           }
-          const record = candidate.pluginRegistry.plugins.find(
-            (entry) => entry.id === "installed-probe",
-          );
-          assert.ok(record);
-          const instance = getPluginInstance(record);
-          assert.ok(instance);
-          blockedInstance = instance;
+          blockedInstance = pluginInstance(candidate.pluginRegistry, "installed-probe");
           gateDisposal();
           if (cleanupRetry === "recovery-disposal") {
             throw new Error("synthetic recovery attachment failed");
@@ -685,7 +650,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       let retry: Promise<Awaited<ReturnType<typeof reload>>> | undefined;
       try {
         if (cleanupRetry !== "gateway-stop") {
-          await entered.promise;
+          await disposal.entered;
           await vi.advanceTimersByTimeAsync(rejectedRuntime ? 10_000 : 5_000);
         }
         expect(await failed).toMatchObject({
@@ -719,7 +684,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
           expect(registrations).toEqual(failedRegistrations);
           expect(fs.existsSync(resourcePath)).toBe(false);
           expect(fs.readFileSync(capturedEntry, "utf8")).toBe(capturedBytes);
-          release.resolve();
+          disposal.release();
           const { errors } = await blockedInstance.dispose();
           expect(errors).toHaveLength(1);
           const timeout = errors[0];
@@ -750,7 +715,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         expect(await probe("sibling")).toEqual(sibling);
       } finally {
         fs.rmSync(stopFailurePath, { force: true });
-        release.resolve();
+        disposal.release();
         await Promise.allSettled([
           failed,
           retry,
@@ -860,21 +825,13 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         ).plugins.find((plugin) => plugin.id === "installed-probe")?.version;
       expect(await listedVersion()).toBe("1.0.0");
       const previousRegistry = runtime.pluginRuntime.registry;
-      const previousRecord = previousRegistry.plugins.find(
-        (record) => record.id === "installed-probe",
-      );
-      assert.ok(previousRecord);
-      const previousInstance = getPluginInstance(previousRecord);
-      assert.ok(previousInstance);
+      const previousInstance = pluginInstance(previousRegistry, "installed-probe");
       const finishFirstRun = retainRuntimePluginWork([previousRegistry]);
       expect(await probe("installed-probe")).toEqual(configured);
       const finishSecondRun = retainRuntimePluginWork([previousRegistry]);
       const packageManifestPath = path.join(packageDir, "package.json");
       const packageManifest = JSON.parse(fs.readFileSync(packageManifestPath, "utf8"));
-      fs.writeFileSync(
-        packageManifestPath,
-        JSON.stringify({ ...packageManifest, version: "1.1.0" }),
-      );
+      writeJson(packageManifestPath, { ...packageManifest, version: "1.1.0" });
       await writeInstall("2026-09-08T00:00:00.000Z", "1.1.0");
       const observation = observeRetainedWork(previousInstance);
       const replacing = reload(changedSettings);

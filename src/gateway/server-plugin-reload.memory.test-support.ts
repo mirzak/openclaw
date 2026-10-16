@@ -31,6 +31,11 @@ import type { OpenClawPluginApi } from "../plugins/types.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { resolveRelativeBundledPluginPublicModuleId } from "../test-utils/bundled-plugin-public-surface.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import {
+  rejectWith,
+  heldWork,
+  observeSettlement,
+} from "./server-plugin-reload.fixture-tools.test-support.js";
 import type { RecoveryFixtureFactory } from "./server-plugin-reload.recovery.test-support.js";
 
 const { createMemoryRuntime, configureMemoryCoreDreamingState } = await vi.importActual<{
@@ -95,8 +100,7 @@ export async function verifyGatewayMemoryReplacement(
   });
   const providerId = "gateway-memory-probe";
   const config = memoryReloadConfig(state.workspaceDir, "synthetic-embedding");
-  const entered = createDeferredCore();
-  const release = createDeferredCore();
+  const closeGate = heldWork();
   const events: string[] = [];
   let refuseClose = mode === "failed-close";
   let generations = 0;
@@ -113,12 +117,12 @@ export async function verifyGatewayMemoryReplacement(
     expect(instance?.lifecycle.signal.aborted).toBe(false);
     expect(getPluginRuntimeGatewayRequestScope()?.pluginId).toBe("first");
     events.push("close:start");
-    entered.resolve();
+    closeGate.enter();
     if (refuseClose) {
       throw new Error("memory provider cleanup refused");
     }
     if (mode === "held-close") {
-      await release.promise;
+      await closeGate.wait;
     }
     events.push("close:end");
   });
@@ -168,8 +172,7 @@ export async function verifyGatewayMemoryReplacement(
   assert(otherRuntime);
   let reloading: Promise<unknown> | undefined;
   try {
-    const memoryInstance = getPluginInstance(fixture.previousRegistry.plugins[1]!);
-    assert(memoryInstance);
+    const memoryInstance = fixture.instance("sibling");
     expect(memoryInstance.run(() => getMemoryEmbeddingProvider(providerId, config))).toBe(
       fixture.previousRegistry.embeddingProviders[0]?.provider,
     );
@@ -184,7 +187,7 @@ export async function verifyGatewayMemoryReplacement(
     // The pre-fix Gateway can finish without entering memory cleanup; race that
     // outcome so its missing owner produces an assertion rather than a deadlock.
     await Promise.race([
-      entered.promise,
+      closeGate.entered,
       reloading.then(() => expect(close).toHaveBeenCalledOnce()),
     ]);
     expect(otherClose).not.toHaveBeenCalled();
@@ -201,7 +204,7 @@ export async function verifyGatewayMemoryReplacement(
       expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
       expect(fixture.firstStop).not.toHaveBeenCalled();
       expect(events).toEqual(["close:start"]);
-      release.resolve();
+      closeGate.release();
     }
     expect(await reloading).toMatchObject({ runtime: { pluginIds: ["first"] } });
     if (mode === "held-close") {
@@ -219,11 +222,10 @@ export async function verifyGatewayMemoryReplacement(
     expect(created).toEqual([1, generations]);
     await expect(other.manager.probeEmbeddingAvailability()).resolves.toMatchObject({ ok: true });
     expect(otherClose).not.toHaveBeenCalled();
-    expect(fixture.siblingStop).toHaveBeenCalledTimes(generations - 1);
-    expect(fixture.siblingStart).toHaveBeenCalledTimes(generations);
+    fixture.expectServices({ siblingStop: generations - 1, siblingStart: generations });
   } finally {
     refuseClose = false;
-    release.resolve();
+    closeGate.release();
     await Promise.allSettled([reloading]);
     const closeCalls = close.mock.calls.length;
     try {
@@ -296,8 +298,7 @@ export async function verifyGatewayMemoryWatcherRestart(
   const embeddings: number[] = [];
   let generation = 0;
   let memory: MemoryPluginRuntime | undefined;
-  const restarted = createDeferredCore();
-  const releaseStartup = createDeferredCore();
+  const startupGate = heldWork();
   let reloading: Promise<unknown> | undefined;
   let independent: ReturnType<typeof createPluginRegistry> | undefined;
   const recoveryFailure = new Error("memory reload checkpoint failed");
@@ -360,8 +361,7 @@ export async function verifyGatewayMemoryWatcherRestart(
             assert(opened.manager, opened.error ?? "Expected a memory manager");
             managers.push(opened.manager);
             if (managers.length > 1) {
-              restarted.resolve();
-              await releaseStartup.promise;
+              await startupGate.run();
               if (recovery?.failure === "restart") {
                 throw new Error("memory indexing restart failed");
               }
@@ -376,9 +376,7 @@ export async function verifyGatewayMemoryWatcherRestart(
       fixture.lifetime.publish({
         stop: async () => {},
         preparePluginReload: () => ({
-          drain: async () => {
-            throw recoveryFailure;
-          },
+          drain: rejectWith(recoveryFailure),
           resume() {},
         }),
       });
@@ -407,8 +405,7 @@ export async function verifyGatewayMemoryWatcherRestart(
       providerState === "pending" ? [] : [providerState === "separate-registry" ? 0 : 1],
     );
     embeddings.length = 0;
-    const instance = getPluginInstance(fixture.previousRegistry.plugins[1]!);
-    assert(instance);
+    const instance = fixture.instance("sibling");
     const original = getPluginOriginalValue(first, instance) ?? first;
     const prototype = Object.getPrototypeOf(original) as RegisteredMemorySearchManager;
     const sync = prototype.sync;
@@ -428,27 +425,24 @@ export async function verifyGatewayMemoryWatcherRestart(
       .reload(config, [recovery?.owner === "replaced" ? "sibling" : "first"])
       .catch((error: unknown) => error);
     if (recovery?.failure === "before-drain") {
-      releaseStartup.resolve();
+      startupGate.release();
     } else {
       await withinTest(
         awaitGateBeforeSettlement(
-          restarted.promise,
+          startupGate.entered,
           reloading,
           "Plugin reload completed without restarting drained memory indexing",
         ),
         signal,
       );
       expect(subscriptions[0]!.signal.aborted).toBe(true);
-      let settled = false;
-      void reloading.then(() => {
-        settled = true;
-      });
+      const completion = observeSettlement(reloading);
       await Promise.resolve();
-      expect(settled, "Reload must join memory service startup").toBe(false);
+      expect(completion.state.settled, "Reload must join memory service startup").toBe(false);
       expect(fixture.owner.getReloadStatus()).toMatchObject({
         phase: providerState === "rollback" ? "recovering" : "reloading",
       });
-      releaseStartup.resolve();
+      startupGate.release();
     }
     expect(fixture.registryOwner.registry.memoryCapabilities[0]?.capability.runtime).toBe(
       fixture.previousRegistry.memoryCapabilities[0]?.capability.runtime,
@@ -500,7 +494,7 @@ export async function verifyGatewayMemoryWatcherRestart(
     expect(await withinTest(indexed.promise, signal)).toBeGreaterThan(0);
     expect(embeddings).toEqual([generation]);
   } finally {
-    releaseStartup.resolve();
+    startupGate.release();
     await Promise.allSettled([reloading]);
     await memory?.closeAllMemorySearchManagers?.();
     if (independent) {

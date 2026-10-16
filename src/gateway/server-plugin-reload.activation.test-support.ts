@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
-import { IncomingMessage, ServerResponse } from "node:http";
-import { Socket } from "node:net";
 import { expect, vi } from "vitest";
 import { registerPluginHttpRoute } from "../plugins/http-registry.js";
 import { getPluginInstance } from "../plugins/plugin-instance-scope.js";
 import { createDeferredCore } from "../shared/deferred.js";
+import { heldWork, probeHttpRoute } from "./server-plugin-reload.fixture-tools.test-support.js";
 import {
   createRecoveryChannelManager,
   registerReloadChannel,
@@ -89,11 +88,7 @@ export async function verifyPreparedSidecarRecovery(
     expect(signals[0]?.aborted).toBe(mode === "aborted-predecessor");
     expect(
       manager.getRuntimeSnapshot({ channelId, inspectAccounts: false }).channels[channelId],
-    ).toMatchObject({
-      running: true,
-      connected: true,
-      lifecycle: "ready",
-    });
+    ).toMatchObject({ running: true, connected: true, lifecycle: "ready" });
     if (mode === "live") {
       expect(result).toMatchObject({ cause: preparationError });
     } else {
@@ -306,23 +301,15 @@ export async function verifyIndependentPostCommitActivation(
     expect(fixture.registryOwner.registry).not.toBe(fixture.previousRegistry);
     expect(starts).toContain("healthy-channel:2");
     expect(resumed).toHaveBeenCalledWith(1);
-    expect(fixture.siblingStart).toHaveBeenCalledOnce();
-    expect(fixture.siblingStop).toHaveBeenCalledTimes(boundary === "memory" ? 1 : 0);
+    fixture.expectServices({ siblingStart: 1, siblingStop: boundary === "memory" ? 1 : 0 });
     const routes = fixture.registryOwner.registry.httpRoutes;
     expect(routes.some((route) => route.handoff)).toBe(false);
     expect(routes.some((route) => route.path === "/removed-channel")).toBe(false);
     const route = routes.find((entry) => entry.path === "/healthy-channel");
     assert(route);
-    const request = new IncomingMessage(new Socket());
-    const response = new ServerResponse(request);
-    const end = vi.spyOn(response, "end").mockReturnValue(response);
-    try {
-      await route.handler(request, response);
+    await probeHttpRoute(route.handler, (_response, end) => {
       expect(end).toHaveBeenCalledWith("generation 2");
-    } finally {
-      request.destroy();
-      response.destroy();
-    }
+    });
     expect(getPluginInstance(fixture.previousRegistry.plugins[0]!)?.lifecycle.signal.aborted).toBe(
       true,
     );
@@ -337,27 +324,20 @@ export async function verifyLifecycleHookSettlement(
   createFixture: RecoveryFixtureFactory,
   phase: "start" | "stop",
 ) {
-  const entered = createDeferredCore();
-  const release = createDeferredCore();
+  const hookGate = heldWork();
   const failure = new Error("lifecycle hook refused");
   const starts: number[] = [];
   let generation = 0;
   const fixture = await createFixture({
     abortOnCandidateStart: false,
-    register(api, owner) {
-      if (owner !== "first") {
-        return;
-      }
+    registerFirst(api) {
       const current = ++generation;
       if ((phase === "start" && current > 1) || (phase === "stop" && current === 1)) {
         const hook = phase === "start" ? "gateway_start" : "gateway_stop";
         api.on(hook, () => {
           throw failure;
         });
-        api.on(hook, async () => {
-          entered.resolve();
-          await release.promise;
-        });
+        api.on(hook, hookGate.run);
       }
       registerReloadChannel(api, {
         id: "hook-dependent",
@@ -374,7 +354,7 @@ export async function verifyLifecycleHookSettlement(
   const reloading = fixture.reload().catch((error: unknown) => error);
   try {
     await Promise.race([
-      entered.promise,
+      hookGate.entered,
       reloading.then(() => {
         throw new Error("hook never entered");
       }),
@@ -386,7 +366,7 @@ export async function verifyLifecycleHookSettlement(
     if (phase === "stop") {
       expect(fixture.firstStop).toHaveBeenCalledOnce();
     }
-    release.resolve();
+    hookGate.release();
     const result = await reloading;
     if (phase === "start") {
       expect(result).toMatchObject({ details: { committed: true }, cause: { cause: failure } });
@@ -401,7 +381,7 @@ export async function verifyLifecycleHookSettlement(
     }
     expect(starts).toEqual(phase === "start" ? [1, 2] : [1]);
   } finally {
-    release.resolve();
+    hookGate.release();
     await reloading;
     await manager.stopChannel("hook-dependent");
   }
@@ -423,10 +403,7 @@ export async function verifyIndependentRollbackRestoration(
         throw failure;
       }
     },
-    register(api, owner) {
-      if (owner !== "first") {
-        return;
-      }
+    registerFirst(api) {
       for (const id of ["first-restore", "healthy-restore"]) {
         registerReloadChannel(api, {
           id,
@@ -478,14 +455,7 @@ export async function verifyIndependentRollbackRestoration(
     expect(resumed).toEqual([0, 1]);
     if (boundary === "services") {
       expect(result).toMatchObject({
-        cause: {
-          errors: [
-            expect.any(Error),
-            {
-              errors: [{ errors: [failure] }, sidecarFailure],
-            },
-          ],
-        },
+        cause: { errors: [expect.any(Error), { errors: [{ errors: [failure] }, sidecarFailure] }] },
       });
       expect(
         manager

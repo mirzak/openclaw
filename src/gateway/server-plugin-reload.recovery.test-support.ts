@@ -1,6 +1,4 @@
 import assert from "node:assert/strict";
-import { IncomingMessage, ServerResponse } from "node:http";
-import { Socket } from "node:net";
 import { collectNestedErrorCandidates } from "@openclaw/normalization-core/error-coercion";
 import { expect, vi } from "vitest";
 import type { ChannelPlugin } from "../channels/plugins/types.public.js";
@@ -39,6 +37,12 @@ import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { createChannelTestPluginBase } from "../test-utils/channel-plugins.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { createChannelManager } from "./server-channels.js";
+import {
+  rejectWith,
+  heldWork,
+  pluginInstance,
+  probeHttpRoute,
+} from "./server-plugin-reload.fixture-tools.test-support.js";
 import { reloadGatewayPlugins } from "./server-plugin-reload.js";
 import { createGatewayPluginRuntimeGeneration } from "./server-plugin-runtime-generation.js";
 import { GatewayRequestEntryLifetime } from "./server-request-entry.js";
@@ -61,6 +65,7 @@ export async function createPluginReloadRecoveryFixture(
       pluginOwner: "first" | "sibling",
       record: ReturnType<typeof createPluginRecord>,
     ) => void;
+    registerFirst?: (api: OpenClawPluginApi, record: ReturnType<typeof createPluginRecord>) => void;
     abortOnCandidateStart?: boolean;
     waitForDrain?: boolean;
     drainSignal?: AbortSignal;
@@ -78,9 +83,7 @@ export async function createPluginReloadRecoveryFixture(
     expectedMetadataCloseError?: Error;
   } = {},
 ) {
-  let config: OpenClawConfig = options.config ?? {
-    plugins: { allow: ["first", "sibling"] },
-  };
+  let config: OpenClawConfig = options.config ?? { plugins: { allow: ["first", "sibling"] } };
   setRuntimeConfigSnapshot(config);
   const log = { ...createSubsystemLogger("gateway/plugins"), ...logMocks };
   const createBuilder = () =>
@@ -111,11 +114,21 @@ export async function createPluginReloadRecoveryFixture(
     first: { id: "first", start: firstStart, stop: firstStop },
     sibling: { id: "sibling", start: siblingStart, stop: siblingStop },
   };
+  const register = (
+    api: OpenClawPluginApi,
+    id: "first" | "sibling",
+    record: ReturnType<typeof createPluginRecord>,
+  ) => {
+    options.register?.(api, id, record);
+    if (id === "first") {
+      options.registerFirst?.(api, record);
+    }
+  };
   for (const id of ["first", "sibling"] as const) {
     const record = createPluginRecord({ id });
     previous.registry.plugins.push(record);
     const api = previous.createApi(record, { config });
-    options.register?.(api, id, record);
+    register(api, id, record);
     api.registerService({ ...services[id] });
   }
   setActivePluginRegistry(previous.registry);
@@ -130,6 +143,7 @@ export async function createPluginReloadRecoveryFixture(
   });
   const candidateStop = vi.fn(async () => await options.candidateStop?.());
   const rollbackConfigEffects = vi.fn(async () => {});
+  const serviceMocks = { firstStart, firstStop, siblingStart, siblingStop };
   const candidates: ReturnType<typeof createBuilder>[] = [];
   const recoveries: ReturnType<typeof createBuilder>[] = [];
   const preparePlugins = async ({
@@ -163,7 +177,7 @@ export async function createPluginReloadRecoveryFixture(
       if (loadModules) {
         const api = candidate.createApi(record, { config: cfg });
         try {
-          options.register?.(api, id, record);
+          register(api, id, record);
         } catch (error) {
           record.status = "error";
           record.error = error instanceof Error ? error.message : String(error);
@@ -343,6 +357,15 @@ export async function createPluginReloadRecoveryFixture(
     rollbackConfigEffects,
     candidates,
     lifetime,
+    instance: (id = "first") => pluginInstance(previous.registry, id),
+    expectServices(counts: Partial<Record<keyof typeof serviceMocks, number>>) {
+      for (const key of ["firstStart", "firstStop", "siblingStart", "siblingStop"] as const) {
+        const count = counts[key];
+        if (count !== undefined) {
+          expect(serviceMocks[key]).toHaveBeenCalledTimes(count);
+        }
+      }
+    },
   };
 }
 
@@ -353,8 +376,7 @@ export type RecoveryFixtureFactory = (
 type RecoveryFixture = Awaited<ReturnType<RecoveryFixtureFactory>>;
 
 export function expectSiblingUnchanged(fixture: RecoveryFixture) {
-  expect(fixture.siblingStart).toHaveBeenCalledOnce();
-  expect(fixture.siblingStop).not.toHaveBeenCalled();
+  fixture.expectServices({ siblingStart: 1, siblingStop: 0 });
 }
 
 export function observeRetainedWork(
@@ -406,6 +428,36 @@ export function createRecoveryChannelManager(fixture: Awaited<ReturnType<Recover
   });
 }
 
+export async function createCleanupChannels(
+  createFixture: RecoveryFixtureFactory,
+  firstHooks: (api: OpenClawPluginApi) => void,
+  stopAccount?: NonNullable<ChannelPlugin["gateway"]>["stopAccount"],
+) {
+  const signals: Record<"first" | "sibling", AbortSignal[]> = { first: [], sibling: [] };
+  const fixture = await createFixture({
+    abortOnCandidateStart: false,
+    register(api, owner) {
+      if (owner === "first") {
+        firstHooks(api);
+      }
+      registerReloadChannel(api, {
+        id: `cleanup-${owner}`,
+        startAccount: async ({ abortSignal }) => {
+          signals[owner].push(abortSignal);
+          await waitForChannelAbort(abortSignal, stopAccount !== undefined);
+        },
+        ...(owner === "first" && stopAccount ? { stopAccount } : {}),
+      });
+    },
+  });
+  const manager = createRecoveryChannelManager(fixture);
+  fixture.runtime.channelManager = manager;
+  await manager.startChannel("cleanup-first");
+  await manager.startChannel("cleanup-sibling");
+  await vi.waitFor(() => expect([signals.first.length, signals.sibling.length]).toEqual([1, 1]));
+  return { fixture, manager, signals };
+}
+
 export async function verifyMalformedReloadFailureReceipt(
   createRecoveryFixture: RecoveryFixtureFactory,
   boundary: "prepare" | "committed",
@@ -417,9 +469,7 @@ export async function verifyMalformedReloadFailureReceipt(
       throw new Error("message getter must not replace the operation failure");
     },
   });
-  const reject = async () => {
-    throw failure;
-  };
+  const reject = rejectWith(failure);
   const fixture = await createRecoveryFixture({
     abortOnCandidateStart: false,
     ...(boundary === "prepare" ? { checkpoint: reject } : { afterPublish: reject }),
@@ -453,25 +503,14 @@ export async function verifyChannelReplacementContracts(
     beforePublish: async () => {
       const route = fixture.previousRegistry.httpRoutes[0];
       assert(route);
-      const request = new IncomingMessage(new Socket());
-      const response = new ServerResponse(request);
-      const end = vi.spyOn(response, "end").mockReturnValue(response);
-      try {
-        await route.handler(request, response);
+      await probeHttpRoute(route.handler, (response, end) => {
         expect(response.statusCode).toBe(503);
         expect(response.getHeader("Retry-After")).toBe("1");
         expect(end).toHaveBeenCalledWith("plugin route is restarting; retry");
-        expect(starts).toEqual([1]);
-        expect(stops).toEqual([1]);
-      } finally {
-        request.destroy();
-        response.destroy();
-      }
+        expect({ starts, stops }).toEqual({ starts: [1], stops: [1] });
+      });
     },
-    register(api, owner) {
-      if (owner !== "first") {
-        return;
-      }
+    registerFirst(api) {
       const generation = ++registrations;
       const handler = vi.fn(async () => ({ text: `generation ${generation}` }));
       commands.push(handler);
@@ -547,10 +586,7 @@ export async function verifyColdAccountReplacement(createRecoveryFixture: Recove
   const starts: string[] = [];
   const fixture = await createRecoveryFixture({
     abortOnCandidateStart: false,
-    register(api, owner) {
-      if (owner !== "first") {
-        return;
-      }
+    registerFirst(api) {
       registerReloadChannel(api, {
         id: channelId,
         config: { listAccountIds: () => ["healthy", "cold"] },
@@ -596,57 +632,36 @@ export async function verifyChannelCleanupFailureFence(
   createRecoveryFixture: RecoveryFixtureFactory,
   failure: "rejection" | "timeout",
 ) {
-  const stopEntered = createDeferredCore();
-  const releaseStop = createDeferredCore();
+  const stopGate = heldWork();
   const gatewayStart = vi.fn();
-  const signals = { first: [] as AbortSignal[], sibling: [] as AbortSignal[] };
   let cleanupAllowed = false;
   const stopAccount = vi.fn(async () => {
-    stopEntered.resolve();
+    stopGate.enter();
     if (!cleanupAllowed) {
       if (failure === "rejection") {
         throw new Error("channel cleanup refused");
       }
-      await releaseStop.promise;
+      await stopGate.wait;
     }
   });
-  const fixture = await createRecoveryFixture({
-    abortOnCandidateStart: false,
-    register(api, owner) {
-      if (owner === "first") {
-        api.on("gateway_start", gatewayStart);
-      }
-      registerReloadChannel(api, {
-        id: `cleanup-${owner}`,
-        startAccount: async ({ abortSignal }) => {
-          signals[owner].push(abortSignal);
-          await waitForChannelAbort(abortSignal, true);
-        },
-        ...(owner === "first" ? { stopAccount } : {}),
-      });
-    },
-  });
-  const manager = createRecoveryChannelManager(fixture);
-  fixture.runtime.channelManager = manager;
-  await manager.startChannel("cleanup-first");
-  await manager.startChannel("cleanup-sibling");
-  await vi.waitFor(() => {
-    expect(signals.first).toHaveLength(1);
-    expect(signals.sibling).toHaveLength(1);
-  });
+  const { fixture, manager, signals } = await createCleanupChannels(
+    createRecoveryFixture,
+    (api) => api.on("gateway_start", gatewayStart),
+    stopAccount,
+  );
   const first = getPluginInstance(fixture.previousRegistry.plugins[0]!);
   const sibling = getPluginInstance(fixture.previousRegistry.plugins[1]!);
   assert(first && sibling);
   vi.useFakeTimers();
   const reloading = fixture.reload().catch((error: unknown) => error);
   try {
-    await stopEntered.promise;
+    await stopGate.entered;
     await vi.advanceTimersByTimeAsync(5_000);
     if (failure === "timeout") {
       // A timed-out stop still owns its resources. Let it finish while automatic
       // recovery waits, before the fresh old registration can acquire them.
       cleanupAllowed = true;
-      releaseStop.resolve();
+      stopGate.release();
       await vi.advanceTimersByTimeAsync(0);
     }
     expect(await reloading).toMatchObject({
@@ -665,7 +680,7 @@ export async function verifyChannelCleanupFailureFence(
     expect(signals.sibling[0]?.aborted).toBe(false);
 
     cleanupAllowed = true;
-    releaseStop.resolve();
+    stopGate.release();
     await vi.advanceTimersByTimeAsync(0);
     expect(signals.first).toHaveLength(1);
     expect(gatewayStart).not.toHaveBeenCalled();
@@ -674,7 +689,7 @@ export async function verifyChannelCleanupFailureFence(
     expect(() => first.run(() => "still retired")).toThrow("reloaded or disabled");
   } finally {
     cleanupAllowed = true;
-    releaseStop.resolve();
+    stopGate.release();
     await reloading;
     await manager.stopChannel("cleanup-first");
     await manager.stopChannel("cleanup-sibling");
