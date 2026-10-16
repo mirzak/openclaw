@@ -15,8 +15,19 @@ const describePosix = process.platform === "win32" ? describe.skip : describe;
 let signingKey: string;
 let allowedSigners: string;
 
+function reviewFor(head: string, ready = false) {
+  const review = validReview(head);
+  review.pr.number = 4242;
+  review.issueValidation.status = "valid";
+  review.recommendation = ready ? "READY FOR /prepare-pr" : review.recommendation;
+  return review;
+}
+
 function fixture(transport: "auto" | "graphql" = "graphql") {
   const f = makePublisherRepo();
+  const read = (name: string) => readFileSync(join(f.local, name), "utf8");
+  const write = (name: string, value: string | Buffer) => writeFileSync(join(f.local, name), value);
+  const writeJson = (name: string, value: unknown) => write(name, JSON.stringify(value));
   // Metadata is native fixture state, never part of the reviewed candidate.
   appendFileSync(join(f.repoDir, ".git/info/exclude"), "\n.local/\n");
   f.env.OPENCLAW_ALLOW_UNSIGNED_GIT_PUSH = "";
@@ -30,11 +41,9 @@ function fixture(transport: "auto" | "graphql" = "graphql") {
     f.git("verify-commit", f.candidate);
   }
   const metadata = { ...f.observation, baseRefOid: f.base, files: [{ path: "reviewed.txt" }] };
-  writeFileSync(join(f.local, "pr-meta.json"), JSON.stringify(metadata));
-  writeFileSync(join(f.local, "remote-observation.json"), JSON.stringify(metadata));
-  const incoming = validReview(f.source);
-  incoming.pr.number = 4242;
-  incoming.issueValidation.status = "valid";
+  writeJson("pr-meta.json", metadata);
+  writeJson("remote-observation.json", metadata);
+  const incoming = reviewFor(f.source);
   incoming.findings.push({
     id: "I1",
     severity: "IMPORTANT",
@@ -43,36 +52,30 @@ function fixture(transport: "auto" | "graphql" = "graphql") {
     fix: "Preserve publication authority",
   });
   const incomingBytes = JSON.stringify(incoming);
-  writeFileSync(join(f.local, "review.json"), incomingBytes);
-  writeFileSync(join(f.local, "correction-incoming-review.json"), incomingBytes);
+  write("review.json", incomingBytes);
+  write("correction-incoming-review.json", incomingBytes);
   const incomingOid = f.git("hash-object", "--no-filters", ".local/review.json");
   appendFileSync(
     join(f.local, "prep-context.env"),
     `PREP_REVIEW_MODE=correction\nPREP_INCOMING_JSON_OID=${incomingOid}\n`,
   );
-  const reviewed = validReview(f.candidate);
-  reviewed.pr.number = 4242;
-  reviewed.recommendation = "READY FOR /prepare-pr";
-  reviewed.issueValidation.status = "valid";
-  writeFileSync(
-    join(f.local, "correction-review.json"),
-    JSON.stringify({
-      ...reviewed,
-      correction: {
-        incomingHeadSha: f.source,
-        incomingReviewJsonOid: incomingOid,
-        resolvedFindings: [{ id: "I1", resolution: "The publication fix is reviewed." }],
-      },
-    }),
-  );
-  writeFileSync(
-    join(f.local, "gates.env"),
+  writeJson("correction-review.json", {
+    ...reviewFor(f.candidate, true),
+    correction: {
+      incomingHeadSha: f.source,
+      incomingReviewJsonOid: incomingOid,
+      resolvedFindings: [{ id: "I1", resolution: "The publication fix is reviewed." }],
+    },
+  });
+  write(
+    "gates.env",
     `PR_NUMBER=4242\nGATES_MODE=remote_crabbox_aws_pending\nLAST_VERIFIED_HEAD_SHA=${f.candidate}\nREMOTE_GATES_PROVIDER=aws\n`,
   );
   return {
     ...f,
-    read: (name: string) => readFileSync(join(f.local, name), "utf8"),
-    write: (name: string, value: string | Buffer) => writeFileSync(join(f.local, name), value),
+    read,
+    write,
+    writeJson,
     has: (name: string) => existsSync(join(f.local, name)),
     hosted: () => f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic"),
   };
@@ -190,10 +193,9 @@ describePosix("correction publication authority handoff", () => {
         `PR_NUMBER=${fault === "foreign-pr" ? 42 : 4242}\nGATES_MODE=github_pending\nHOSTED_GATES_TARGET_HEAD_SHA=${fault === "missing" ? "" : fault === "stale" ? f.source : f.candidate}\n`,
       );
       if (fault === "changed-review") {
-        const path = join(f.local, "correction-review.json");
-        const review = JSON.parse(readFileSync(path, "utf8"));
+        const review = JSON.parse(f.read("correction-review.json"));
         review.pr.headSha = f.source;
-        writeFileSync(path, JSON.stringify(review));
+        f.writeJson("correction-review.json", review);
       }
       const result = runCorrection(f);
       expect(result.status, result.stdout + result.stderr).not.toBe(0);
@@ -228,12 +230,11 @@ describePosix("correction publication authority handoff", () => {
   it("publishes a signed baseline refresh only after fresh exact-candidate review and gates", () => {
     const f = fixture("auto");
     f.git("branch", "-m", "pr-4242-prep");
-    const contextPath = join(f.local, "prep-context.env");
-    writeFileSync(
-      contextPath,
-      readFileSync(contextPath, "utf8").replace("PREP_BRANCH=prep", "PREP_BRANCH=pr-4242-prep"),
+    f.write(
+      "prep-context.env",
+      f.read("prep-context.env").replace("PREP_BRANCH=prep", "PREP_BRANCH=pr-4242-prep"),
     );
-    const oldGates = readFileSync(join(f.local, "gates.env"));
+    const oldGates = f.read("gates.env");
     f.git("checkout", "-q", "-b", "baseline", f.base);
     writeFileSync(join(f.repoDir, "upstream.txt"), "upstream baseline repair\n");
     f.git("add", "upstream.txt");
@@ -255,14 +256,10 @@ describePosix("correction publication authority handoff", () => {
     const head = f.git("rev-parse", "HEAD");
     const initialized = runCorrection(f, { command: "prepare_correction_review_init 4242" });
     expect(initialized.status, initialized.stdout + initialized.stderr).toBe(0);
-    const reviewPath = join(f.local, "correction-review.json");
-    const review = JSON.parse(readFileSync(reviewPath, "utf8"));
-    Object.assign(review, validReview(head));
-    review.pr.number = 4242;
-    review.recommendation = "READY FOR /prepare-pr";
-    review.issueValidation.status = "valid";
+    const review = JSON.parse(f.read("correction-review.json"));
+    Object.assign(review, reviewFor(head, true));
     review.correction.resolvedFindings[0].resolution = "Reviewed the full refreshed product delta.";
-    writeFileSync(reviewPath, JSON.stringify(review));
+    f.writeJson("correction-review.json", review);
     f.write("gates.env", oldGates);
     const stale = runCorrection(f);
     expect(stale.status).not.toBe(0);
@@ -352,8 +349,7 @@ describePosix("correction publication authority handoff", () => {
     const published = runCorrection(f);
     expect(published.status, published.stdout + published.stderr).toBe(0);
     const hosted = f.hosted();
-    const resultPath = join(f.local, "prepare-push-result.env");
-    const receipt = readFileSync(resultPath, "utf8");
+    const receipt = f.read("prepare-push-result.env");
     const result = runCorrection(f, {
       command: [
         "source .local/prep-context.env",
@@ -368,7 +364,7 @@ describePosix("correction publication authority handoff", () => {
       ].join("\n"),
     });
     expect(result.status, result.stdout + result.stderr).toBe(0);
-    expect(readFileSync(resultPath, "utf8")).toBe(receipt);
+    expect(f.read("prepare-push-result.env")).toBe(receipt);
     expect(f.read("events")).toBe("graphql\nproof\n");
   });
 
