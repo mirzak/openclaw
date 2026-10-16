@@ -16,7 +16,6 @@ const oauth = {
   startAuthorization: vi.fn(),
   pollAuthorization: vi.fn(),
   cancelAuthorizationAsync: vi.fn(),
-  refreshEffectiveIdentity: vi.fn(),
   retireProfileAsync: vi.fn(),
 };
 
@@ -42,26 +41,15 @@ vi.mock("../../agents/agent-scope.js", async (importOriginal) => ({
 const agentScope = { scope: "agent", agentId: "main" } as const;
 const systemScope = { scope: "system", agentId: "main" } as const;
 // Status is an opaque owner result here; identity resolution has its own suite.
-const status = {
-  agentId: "main",
-  selectedScope: "agent",
-  effective: { account: { login: "managed-user" } },
-} as const;
+const status = { agentId: "main", selectedScope: "agent" } as const;
 
 async function invoke(
-  method:
-    | "tools.github.status"
-    | "tools.github.configure"
-    | "tools.github.authorize.start"
-    | "tools.github.authorize.poll"
-    | "tools.github.authorize.cancel",
+  method: `tools.github.${"status" | "configure" | "authorize.start" | "authorize.poll" | "authorize.cancel"}`,
   params: Record<string, unknown>,
 ) {
   const respond = vi.fn();
-  await expectDefined(
-    toolsGitHubHandlers[method],
-    `${method} handler`,
-  )({
+  const handler = expectDefined(toolsGitHubHandlers[method], `${method} handler`);
+  await handler({
     params,
     respond: respond as never,
     context: { getRuntimeConfig: () => ({}), githubOAuthService: oauth } as never,
@@ -81,22 +69,13 @@ function configure(secretDigit: string, params: Record<string, unknown> = {}) {
   });
 }
 
-function expectPrivateFieldsAbsent(respond: ReturnType<typeof vi.fn>) {
-  const output = JSON.stringify(respond.mock.calls);
-  expect(output).not.toContain("device_code");
-  expect(output).not.toContain("access_token");
-}
-
 describe("tools.github handlers", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     github.configured.mockReturnValue(undefined);
     github.status.mockResolvedValue(status);
     github.updateConfig.mockResolvedValue({ next: true });
-    for (const mock of Object.values(oauth)) {
-      mock.mockReset();
-    }
-    oauth.refreshEffectiveIdentity.mockResolvedValue(undefined);
+    Object.values(oauth).forEach((mock) => mock.mockReset());
   });
 
   it("returns selected-scope plus effective status without refreshing credentials", async () => {
@@ -143,12 +122,11 @@ describe("tools.github handlers", () => {
   it("keeps the one-use PAT fallback functional and returns fresh status", async () => {
     secrets.consumeHandoff.mockReturnValue("temporary-test-token");
     github.install.mockImplementation(
-      async (params: {
+      async ({
+        commitConfig,
+      }: {
         commitConfig: (account: { accountId: number; login: string }) => Promise<void>;
-      }) => {
-        await params.commitConfig({ accountId: 100, login: "managed-user" });
-        return { accountId: 100, login: "managed-user", avatarUrl: null };
-      },
+      }) => commitConfig({ accountId: 100, login: "managed-user" }),
     );
 
     const respond = await configure("1", {
@@ -206,15 +184,14 @@ describe("tools.github handlers", () => {
   });
 
   it("rejects blank author data without consuming the setup handoff", async () => {
-    const respond = await configure("4", {
-      ...agentScope,
-      gitAuthor: { name: "  \t" },
-    });
+    const respond = await configure("4", { ...agentScope, gitAuthor: { name: "  \t" } });
 
-    expect(secrets.consumeHandoff).not.toHaveBeenCalled();
-    expect(github.createProfileId).not.toHaveBeenCalled();
-    expect(github.install).not.toHaveBeenCalled();
-    expect(github.updateConfig).not.toHaveBeenCalled();
+    expect([
+      secrets.consumeHandoff.mock.calls,
+      github.createProfileId.mock.calls,
+      github.install.mock.calls,
+      github.updateConfig.mock.calls,
+    ]).toEqual([[], [], [], []]);
     expect(respond.mock.calls[0]?.[0]).toBe(false);
   });
 
@@ -238,10 +215,7 @@ describe("tools.github handlers", () => {
     const profileId = "ghp_12121212121212121212121212121212";
     github.configured.mockReturnValue({ profileId, kind: "oauth" });
 
-    await invoke("tools.github.configure", {
-      ...systemScope,
-      mode: "inherit",
-    });
+    await invoke("tools.github.configure", { ...systemScope, mode: "inherit" });
 
     expect(github.updateConfig).toHaveBeenCalledWith({
       ...systemScope,
@@ -273,33 +247,30 @@ describe("tools.github handlers", () => {
     expect(start.mock.calls[0]?.[1]).toEqual(authorization);
     expect(poll).toHaveBeenCalledWith(true, { status: "pending", retryAfterMs: 10_000 });
     expect(cancel).toHaveBeenCalledWith(true, { cancelled: true });
-    expectPrivateFieldsAbsent(start);
+    expect(JSON.stringify(start.mock.calls)).not.toMatch(/device_code|access_token/);
   });
 
-  it("returns bounded authorization failures without forwarding diagnostics", async () => {
-    oauth.pollAuthorization.mockRejectedValue(
-      new Error("network response contained device_code=private and access_token=private"),
-    );
-    const respond = await invoke("tools.github.authorize.poll", {
-      requestId: `github-device-${"2".repeat(32)}`,
-    });
-
-    expect(respond.mock.calls[0]?.[0]).toBe(false);
-    expect(JSON.stringify(respond.mock.calls)).toContain("GitHub authorization polling failed");
-    expectPrivateFieldsAbsent(respond);
-  });
-
-  it("returns installation guidance when the Gateway host has no GitHub CLI", async () => {
-    oauth.startAuthorization.mockRejectedValue(new GitHubCliUnavailableError());
-
-    const respond = await invoke("tools.github.authorize.start", systemScope);
-
-    expect(respond.mock.calls[0]?.[0]).toBe(false);
-    expect(JSON.stringify(respond.mock.calls)).toContain(
-      "GitHub CLI (`gh`) is required on the Gateway host. Install it and retry.",
-    );
-    expect(JSON.stringify(respond.mock.calls)).not.toContain("device_code");
-  });
+  it.each([
+    ["poll", "GitHub authorization polling failed"],
+    ["start", "GitHub CLI (`gh`) is required on the Gateway host. Install it and retry."],
+  ] as const)(
+    "bounds %s failures without exposing authorization fields",
+    async (action, message) => {
+      const polling = action === "poll";
+      (polling ? oauth.pollAuthorization : oauth.startAuthorization).mockRejectedValue(
+        polling
+          ? new Error("device_code=private access_token=private")
+          : new GitHubCliUnavailableError(),
+      );
+      const respond = await invoke(
+        `tools.github.authorize.${action}`,
+        polling ? { requestId: `github-device-${"2".repeat(32)}` } : systemScope,
+      );
+      expect(respond.mock.calls[0]?.[0]).toBe(false);
+      expect(JSON.stringify(respond.mock.calls)).toContain(message);
+      expect(JSON.stringify(respond.mock.calls)).not.toMatch(/device_code|access_token/);
+    },
+  );
 
   it("fails closed when the secrets owner rejects the handoff", async () => {
     secrets.consumeHandoff.mockReturnValue(undefined);

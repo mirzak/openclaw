@@ -14,11 +14,8 @@ import { makeFakePty } from "../terminal/session-manager.test-helpers.js";
 import { openTerminalSession, terminalHandlers, TERMINAL_OPEN_DEADLINE_MS } from "./terminal.js";
 import { makeTerminalSessionMocks } from "./terminal.test-helpers.js";
 
-function waitForFast<T>(
-  callback: () => T | Promise<T>,
-  options: { timeout?: number; interval?: number } = {},
-) {
-  return vi.waitFor(callback, { interval: 1, ...options });
+function waitForFast<T>(callback: () => T | Promise<T>) {
+  return vi.waitFor(callback, { interval: 1 });
 }
 
 const policyMocks = vi.hoisted(() => ({
@@ -64,19 +61,25 @@ vi.mock("../session-utils-store-worker.js", async (importOriginal) => ({
 }));
 
 function makeOpts(
-  params: unknown,
-  terminalConfig: { enabled?: boolean } | undefined = { enabled: true },
-  terminalPolicyConfig?: OpenClawConfig,
-  nodeRegistry: {
-    get: (nodeId: string) => unknown;
-    invoke?: (params: unknown) => Promise<unknown>;
-  } = { get: () => undefined },
+  params: Record<string, unknown> = { cols: 80, rows: 24 },
+  {
+    enabled = true,
+    preparedConfig,
+    nodeRegistry = { get: () => undefined },
+  }: {
+    enabled?: boolean;
+    preparedConfig?: OpenClawConfig;
+    nodeRegistry?: {
+      get: (nodeId: string) => unknown;
+      invoke?: (params: unknown) => Promise<unknown>;
+    };
+  } = {},
 ) {
   const sessions = makeTerminalSessionMocks();
-  const runtimeConfig = { gateway: { terminal: terminalConfig } } as OpenClawConfig;
+  const runtimeConfig: OpenClawConfig = { gateway: { terminal: { enabled } } };
   const policy = createTerminalLaunchPolicy(runtimeConfig);
-  if (terminalPolicyConfig) {
-    policy.prepareConfig(terminalPolicyConfig, { restartPending: true });
+  if (preparedConfig) {
+    policy.prepareConfig(preparedConfig, { restartPending: true });
   }
   const respond = vi.fn();
   const isConnectionActive = vi.fn(() => true);
@@ -92,7 +95,7 @@ function makeOpts(
     logGateway: { info: vi.fn() },
   } as unknown as Parameters<(typeof terminalHandlers)["terminal.input"]>[0]["context"];
   const opts = {
-    params: params as Record<string, unknown>,
+    params,
     respond,
     context,
     client: { connId: "conn-1", connect: {} },
@@ -135,6 +138,19 @@ function nodePlan(command: string) {
   };
 }
 
+function nodeSession(
+  command: string,
+  overrides: { connId?: string; pairingGeneration?: string } = {},
+) {
+  return {
+    nodeId: "node-1",
+    connId: "conn-node",
+    pairingGeneration: "generation-node",
+    commands: [command],
+    ...overrides,
+  };
+}
+
 function pendingCatalog() {
   const plan = createDeferred<ReturnType<typeof localPlan>>();
   const openTerminal = vi.fn(() => plan.promise);
@@ -152,15 +168,8 @@ function expectFailure(respond: ReturnType<typeof vi.fn>, error: Record<string, 
 
 const uploadFile = { name: "report.pdf", contentBase64: "dGVzdA==" };
 
-type OpenedTerminal = {
-  ok: true;
-  sessionId: string;
-  agentId: string;
-  shell: string;
-  cwd: string;
-};
-function openedTerminal(sessionId: string): OpenedTerminal {
-  return { ok: true, sessionId, agentId: "main", shell: "/bin/zsh", cwd: "/work" };
+function openedTerminal(sessionId: string) {
+  return { ok: true as const, sessionId, agentId: "main", shell: "/bin/zsh", cwd: "/work" };
 }
 
 afterEach(() => {
@@ -269,20 +278,32 @@ describe("terminal gateway policy", () => {
     });
   });
 
-  it("returns the attach snapshot offset to capable clients", async () => {
-    const { opts, respond } = makeOpts({ sessionId: "terminal-1" });
-    opts.client!.connect.caps = [
-      GATEWAY_CLIENT_CAPS.TERMINAL_OFFSET_SEQ,
-      GATEWAY_CLIENT_CAPS.TERMINAL_SESSION_METADATA,
-    ];
-
-    await runTerminal("terminal.attach", opts);
-
-    expect(respond).toHaveBeenCalledWith(
-      true,
-      expect.objectContaining({ buffer: "replay", seq: 6, title: "codex", owner: "conn" }),
-    );
-  });
+  it.each([false, true])(
+    "attaches within the advertised metadata schema (capable=%s)",
+    async (capable) => {
+      const { opts, respond } = makeOpts({ sessionId: "terminal-1" });
+      if (capable) {
+        opts.client!.connect.caps = [
+          GATEWAY_CLIENT_CAPS.TERMINAL_OFFSET_SEQ,
+          GATEWAY_CLIENT_CAPS.TERMINAL_SESSION_METADATA,
+        ];
+      }
+      await runTerminal("terminal.attach", opts);
+      expect(respond).toHaveBeenCalledWith(
+        true,
+        capable
+          ? expect.objectContaining({ buffer: "replay", seq: 6, title: "codex", owner: "conn" })
+          : {
+              sessionId: "terminal-1",
+              agentId: "main",
+              shell: "/bin/zsh",
+              cwd: "/work",
+              confined: false,
+              buffer: "replay",
+            },
+      );
+    },
+  );
 
   it("forwards terminal close to the session manager", async () => {
     const { opts, sessions, respond } = makeOpts({ sessionId: "terminal-1" });
@@ -293,37 +314,15 @@ describe("terminal gateway policy", () => {
     expect(respond).toHaveBeenCalledWith(true, { ok: true });
   });
 
-  it("keeps legacy protocol-4 attach replies within their closed schema", async () => {
-    const { opts, respond } = makeOpts({ sessionId: "terminal-1" });
-
-    await runTerminal("terminal.attach", opts);
-
-    expect(respond).toHaveBeenCalledWith(true, {
-      sessionId: "terminal-1",
-      agentId: "main",
-      shell: "/bin/zsh",
-      cwd: "/work",
-      confined: false,
-      buffer: "replay",
-    });
-  });
-
   it("rejects catalog opens for missing providers", async () => {
-    const { opts, sessions, respond } = makeOpts({
-      cols: 80,
-      rows: 24,
-      catalog: { catalogId: "missing", hostId: "gateway:local", threadId: "thread" },
-    });
+    const { opts, sessions, respond } = makeOpts(catalogParams("missing"));
     await runTerminal("terminal.open", opts);
     expect(sessions.open).not.toHaveBeenCalled();
     expect(respond).toHaveBeenCalledWith(false, undefined, expect.any(Object));
   });
 
   it("reports a missing explicit owner as invalid request", async () => {
-    const { opts, sessions, respond, resolveTerminalLaunchPolicy } = makeOpts({
-      cols: 80,
-      rows: 24,
-    });
+    const { opts, sessions, respond, resolveTerminalLaunchPolicy } = makeOpts();
     resolveTerminalLaunchPolicy.mockReturnValue({
       ok: false,
       block: { kind: "owner-required", message: "terminal requires an explicit owner" },
@@ -415,31 +414,14 @@ describe("terminal gateway policy", () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
     try {
-      installCatalog({
-        id: "codex",
-        label: "Codex",
-        list: async () => [],
-        read: async (request) => ({ ...request, items: [] }),
-        openTerminal: async () => {
-          // Jump the wall clock forward by 90s mid-open. Under the bug
-          // (Date.now seed) the deadline already expired at t=30s, so a
-          // forward jump to t=90s would falsely reject this healthy open.
-          // Under the fix (performance.now seed) the monotonic clock is
-          // still at 0, so the open stays within budget.
-          vi.setSystemTime(90_000);
-          return { kind: "local", argv: ["codex", "resume", "thread"] };
-        },
+      installTerminalCatalog(async () => {
+        // A wall-clock jump must not expire a healthy monotonic deadline.
+        vi.setSystemTime(90_000);
+        return localPlan();
       });
-      const { opts, sessions, respond } = makeOpts(
-        {
-          cols: 80,
-          rows: 24,
-          catalog: { catalogId: "codex", hostId: "gateway:local", threadId: "thread" },
-        },
-        { enabled: true },
-      );
+      const { opts, sessions, respond } = makeOpts(catalogParams());
 
-      await expectDefined(terminalHandlers["terminal.open"], "terminal.open")(opts);
+      await runTerminal("terminal.open", opts);
 
       expect(sessions.open).toHaveBeenCalled();
       expect(respond).toHaveBeenCalledWith(true, expect.any(Object));
@@ -448,22 +430,27 @@ describe("terminal gateway policy", () => {
     }
   });
 
-  it("does not create a terminal after the owning connection closes during catalog lookup", async () => {
-    const { plan, openTerminal, opts, sessions, respond, isConnectionActive } = pendingCatalog();
-
-    const opening = runTerminal("terminal.open", opts);
-    await waitForFast(() => expect(openTerminal).toHaveBeenCalledOnce());
-    isConnectionActive.mockReturnValue(false);
-    plan.resolve(localPlan());
-    await opening;
-
-    expect(sessions.open).not.toHaveBeenCalled();
-    expectFailure(respond, { message: "terminal connection closed" });
-  });
+  it.each([
+    ["isConnectionActive", "terminal connection closed"],
+    ["isTerminalEnabled", "terminal is disabled"],
+  ] as const)(
+    "does not create a terminal after %s changes during catalog lookup",
+    async (flag, message) => {
+      const fixture = pendingCatalog();
+      const { plan, openTerminal, opts, sessions, respond } = fixture;
+      const opening = runTerminal("terminal.open", opts);
+      await waitForFast(() => expect(openTerminal).toHaveBeenCalledOnce());
+      fixture[flag].mockReturnValue(false);
+      plan.resolve(localPlan());
+      await opening;
+      expect(sessions.open).not.toHaveBeenCalled();
+      expectFailure(respond, { message });
+    },
+  );
 
   it("closes a terminal whose owning connection disappears during PTY creation", async () => {
-    const created = createDeferred<OpenedTerminal>();
-    const { opts, sessions, respond, isConnectionActive } = makeOpts({ cols: 80, rows: 24 });
+    const created = createDeferred<ReturnType<typeof openedTerminal>>();
+    const { opts, sessions, respond, isConnectionActive } = makeOpts();
     sessions.open.mockImplementationOnce(async () => await created.promise);
 
     const opening = runTerminal("terminal.open", opts);
@@ -479,9 +466,9 @@ describe("terminal gateway policy", () => {
   it("times out one terminal open with request-scoped cancellation", async () => {
     vi.useFakeTimers();
     try {
-      const created = createDeferred<OpenedTerminal>();
+      const created = createDeferred<ReturnType<typeof openedTerminal>>();
       let openSignal: AbortSignal | undefined;
-      const { opts, sessions, respond } = makeOpts({ cols: 80, rows: 24 });
+      const { opts, sessions, respond } = makeOpts();
       sessions.open.mockImplementationOnce(async (request: unknown) => {
         openSignal = (request as { signal?: AbortSignal }).signal;
         return await created.promise;
@@ -501,19 +488,6 @@ describe("terminal gateway policy", () => {
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("does not create a terminal when disabled during catalog lookup", async () => {
-    const { plan, openTerminal, opts, sessions, respond, isTerminalEnabled } = pendingCatalog();
-
-    const opening = runTerminal("terminal.open", opts);
-    await waitForFast(() => expect(openTerminal).toHaveBeenCalledOnce());
-    isTerminalEnabled.mockReturnValue(false);
-    plan.resolve(localPlan());
-    await opening;
-
-    expect(sessions.open).not.toHaveBeenCalled();
-    expectFailure(respond, { message: "terminal is disabled" });
   });
 
   it("uses the refreshed launch plan after catalog lookup", async () => {
@@ -536,45 +510,35 @@ describe("terminal gateway policy", () => {
     );
   });
 
-  it("rejects a node plan when its owner node is disconnected", async () => {
-    installTerminalCatalog(async () => nodePlan("anthropic.claude.terminal.resume.v1"), "claude");
-    const { opts, sessions, respond } = makeOpts(catalogParams("claude", "node:node-1"));
-    await runTerminal("terminal.open", opts);
-    expect(sessions.open).not.toHaveBeenCalled();
-    expect(respond).toHaveBeenCalledWith(false, undefined, expect.any(Object));
-  });
-
-  it("rejects a node plan denied by the node command allowlist", async () => {
-    const command = "anthropic.claude.terminal.resume.v1";
-    installTerminalCatalog(async () => nodePlan(command), "claude");
-    policyMocks.isNodeCommandAllowed.mockReturnValue({
-      ok: false,
-      reason: "command not allowlisted",
+  it.each([
+    { stage: "disconnected", catalogId: "claude", message: "" },
+    { stage: "allowlist", catalogId: "claude", message: "command not allowlisted" },
+    { stage: "plugin", catalogId: "codex", message: "terminal resume denied" },
+  ])("rejects a node plan blocked by $stage", async ({ stage, catalogId, message }) => {
+    const command =
+      catalogId === "claude" ? "anthropic.claude.terminal.resume.v1" : "codex.terminal.resume.v1";
+    installTerminalCatalog(async () => nodePlan(command), catalogId);
+    if (stage === "allowlist") {
+      policyMocks.isNodeCommandAllowed.mockReturnValue({ ok: false, reason: message });
+    } else if (stage === "plugin") {
+      policyMocks.applyPluginNodeInvokePolicy.mockResolvedValue({ ok: false, message });
+    }
+    const { opts, sessions, respond } = makeOpts(catalogParams(catalogId, "node:node-1"), {
+      nodeRegistry: { get: () => (stage === "disconnected" ? undefined : nodeSession(command)) },
     });
-    const { opts, sessions, respond } = makeOpts(
-      catalogParams("claude", "node:node-1"),
-      { enabled: true },
-      undefined,
-      {
-        get: () => ({ nodeId: "node-1", connId: "conn-node", commands: [command] }),
-      },
-    );
-
     await runTerminal("terminal.open", opts);
-
     expect(sessions.open).not.toHaveBeenCalled();
-    expectFailure(respond, { message: "command not allowlisted" });
+    expect(respond).toHaveBeenCalledWith(
+      false,
+      undefined,
+      message ? expect.objectContaining({ message }) : expect.any(Object),
+    );
   });
 
   it("opens a normally approved node relay after generic invoke policy", async () => {
     const command = "anthropic.claude.terminal.resume.v1";
     installTerminalCatalog(async () => nodePlan(command), "claude");
-    const node = {
-      nodeId: "node-1",
-      connId: "conn-node",
-      pairingGeneration: "generation-node",
-      commands: [command],
-    };
+    const node = nodeSession(command);
     const invoke = vi.fn((rawParams: unknown) => {
       const params = rawParams as { onDispatchReady?: (id: string) => void };
       params.onDispatchReady?.("invoke-1");
@@ -582,14 +546,8 @@ describe("terminal gateway policy", () => {
     });
     const nodeRegistry = { get: () => node, invoke, sendInvokeInput: vi.fn() };
     const { opts, sessions } = makeOpts(
-      {
-        cols: 100,
-        rows: 30,
-        catalog: { catalogId: "claude", hostId: "node:node-1", threadId: "thread" },
-      },
-      { enabled: true },
-      undefined,
-      nodeRegistry,
+      { ...catalogParams("claude", "node:node-1"), cols: 100, rows: 30 },
+      { nodeRegistry },
     );
 
     await runTerminal("terminal.open", opts);
@@ -628,18 +586,10 @@ describe("terminal gateway policy", () => {
       const policy = createDeferred<null>();
       policyMocks.applyPluginNodeInvokePolicy.mockImplementationOnce(() => policy.promise);
       installTerminalCatalog(async () => nodePlan(command), "claude");
-      let node = {
-        nodeId: "node-1",
-        connId: "conn-old",
-        pairingGeneration: "generation-old",
-        commands: [command],
-      };
-      const { opts, sessions, respond } = makeOpts(
-        catalogParams("claude", "node:node-1"),
-        { enabled: true },
-        undefined,
-        { get: () => node },
-      );
+      let node = nodeSession(command, { connId: "conn-old", pairingGeneration: "generation-old" });
+      const { opts, sessions, respond } = makeOpts(catalogParams("claude", "node:node-1"), {
+        nodeRegistry: { get: () => node },
+      });
 
       const opening = runTerminal("terminal.open", opts);
       await waitForFast(() =>
@@ -667,54 +617,21 @@ describe("terminal gateway policy", () => {
     },
   );
 
-  it("reports plugin invoke policy denial as unavailable", async () => {
-    const command = "codex.terminal.resume.v1";
-    installTerminalCatalog(async () => nodePlan(command), "codex");
-    policyMocks.applyPluginNodeInvokePolicy.mockResolvedValue({
-      ok: false,
-      message: "terminal resume denied",
-    });
-    const { opts, sessions, respond } = makeOpts(
-      catalogParams("codex", "node:node-1"),
-      { enabled: true },
-      undefined,
-      { get: () => ({ nodeId: "node-1", connId: "conn-node", commands: [command] }) },
-    );
-
-    await runTerminal("terminal.open", opts);
-
-    expect(sessions.open).not.toHaveBeenCalled();
-    expectFailure(respond, { message: "terminal resume denied" });
-  });
-
-  it("rejects reopening after an accepted disable while restart is pending", async () => {
-    const { opts, sessions, respond } = makeOpts(
-      { cols: 80, rows: 24 },
-      { enabled: true },
-      { gateway: { terminal: { enabled: false } } },
-    );
-
-    await runTerminal("terminal.open", opts);
-
-    expect(sessions.open).not.toHaveBeenCalled();
-    expect(respond).toHaveBeenCalledWith(false, undefined, expect.any(Object));
-  });
-
-  it("rejects reopening after an accepted sandbox tightening", async () => {
-    const { opts, sessions, respond } = makeOpts(
-      { cols: 80, rows: 24 },
-      { enabled: true },
-      {
-        gateway: { terminal: { enabled: true } },
-        agents: { defaults: { sandbox: { mode: "all" } } },
-      },
-    );
-
-    await runTerminal("terminal.open", opts);
-
-    expect(sessions.open).not.toHaveBeenCalled();
-    expect(respond).toHaveBeenCalledWith(false, undefined, expect.any(Object));
-  });
+  it.each([
+    { gateway: { terminal: { enabled: false } } },
+    {
+      gateway: { terminal: { enabled: true } },
+      agents: { defaults: { sandbox: { mode: "all" } } },
+    },
+  ] satisfies OpenClawConfig[])(
+    "rejects reopening after an accepted policy tightening: %j",
+    async (preparedConfig) => {
+      const { opts, sessions, respond } = makeOpts(undefined, { preparedConfig });
+      await runTerminal("terminal.open", opts);
+      expect(sessions.open).not.toHaveBeenCalled();
+      expect(respond).toHaveBeenCalledWith(false, undefined, expect.any(Object));
+    },
+  );
 
   it("closes a live session and rejects input after disablement", async () => {
     const { opts, sessions, respond } = makeOpts(
@@ -729,18 +646,30 @@ describe("terminal gateway policy", () => {
     expect(respond).toHaveBeenCalledWith(true, { ok: false });
   });
 
-  it("uploads a file through the owned terminal session", async () => {
-    const { opts, sessions, respond } = makeOpts({ sessionId: "s1", ...uploadFile });
-
-    await runTerminal("terminal.upload", opts);
-
-    expect(sessions.upload).toHaveBeenCalledWith("conn-1", "s1", {
-      name: "report.pdf",
-      contentBase64: "dGVzdA==",
-      assertCommitAllowed: expect.any(Function),
-    });
-    expect(respond).toHaveBeenCalledWith(true, { path: "/tmp/upload/report.pdf", size: 4 });
-  });
+  it.each([false, true])(
+    "uploads through the owned session with advertised path style (capable=%s)",
+    async (capable) => {
+      const { opts, sessions, respond } = makeOpts({ sessionId: "s1", ...uploadFile });
+      const result = {
+        path: "/tmp/upload/report.pdf",
+        size: 4,
+        ...(capable ? { uploadPathStyle: "native" as const } : {}),
+      };
+      if (capable) {
+        expectDefined(opts.client, "authenticated upload client").connect.caps = [
+          GATEWAY_CLIENT_CAPS.TERMINAL_UPLOAD_PATH_STYLE,
+        ];
+        sessions.upload.mockResolvedValue(result);
+      }
+      await runTerminal("terminal.upload", opts);
+      expect(sessions.upload).toHaveBeenCalledWith("conn-1", "s1", {
+        name: "report.pdf",
+        contentBase64: "dGVzdA==",
+        assertCommitAllowed: expect.any(Function),
+      });
+      expect(respond).toHaveBeenCalledWith(true, result);
+    },
+  );
 
   it("rejects non-canonical base64 before staging", async () => {
     const { opts, sessions, respond } = makeOpts({
@@ -755,44 +684,14 @@ describe("terminal gateway policy", () => {
     expectFailure(respond, { code: ErrorCodes.INVALID_REQUEST });
   });
 
-  it("returns insertion metadata to clients advertising its capability", async () => {
-    const caps = [GATEWAY_CLIENT_CAPS.TERMINAL_UPLOAD_PATH_STYLE];
-    const { opts, sessions, respond } = makeOpts({ sessionId: "s1", ...uploadFile });
-    expectDefined(opts.client, "authenticated upload client").connect.caps = caps;
-    sessions.upload.mockResolvedValue({
-      path: "/tmp/upload/report.pdf",
-      size: 4,
-      uploadPathStyle: "native",
-    });
-
-    await runTerminal("terminal.upload", opts);
-
-    expect(respond).toHaveBeenCalledWith(true, {
-      path: "/tmp/upload/report.pdf",
-      size: 4,
-      uploadPathStyle: "native",
-    });
-  });
-
   it.each([undefined, "native"] as const)(
     "binds paired-node uploads and insertion style to the admitted plan: %s",
     async (uploadPathStyle) => {
       const command = "codex.terminal.resume.v1";
       const uploadCommand = "terminal.upload";
-      const plan = {
-        kind: "node" as const,
-        nodeId: "node-1",
-        command,
-        paramsJSON: JSON.stringify({ threadId: "thread" }),
-        uploadPathStyle,
-      };
+      const plan = { ...nodePlan(command), uploadPathStyle };
       installTerminalCatalog(async () => plan);
-      const node = {
-        nodeId: "node-1",
-        connId: "conn-node",
-        pairingGeneration: "generation-node",
-        commands: [command, uploadCommand],
-      };
+      const node = { ...nodeSession(command), commands: [command, uploadCommand] };
       const nodePayload = {
         path: "/tmp/node/report.pdf",
         size: 4,
@@ -800,12 +699,9 @@ describe("terminal gateway policy", () => {
         ...(uploadPathStyle === undefined ? { uploadPathStyle: "native" } : {}),
       };
       const invoke = vi.fn(async () => ({ ok: true, payloadJSON: JSON.stringify(nodePayload) }));
-      const { opts, sessions } = makeOpts(
-        catalogParams("codex", "node:node-1"),
-        { enabled: true },
-        undefined,
-        { get: () => node, invoke },
-      );
+      const { opts, sessions } = makeOpts(catalogParams("codex", "node:node-1"), {
+        nodeRegistry: { get: () => node, invoke },
+      });
 
       await runTerminal("terminal.open", opts);
       plan.nodeId = "node-2";

@@ -15,6 +15,7 @@ import type { GatewayClient } from "./client-types.js";
 import { terminalUploadHandlers } from "./terminal-upload.js";
 import { openTerminalSession } from "./terminal.js";
 
+const upload = expectDefined(terminalUploadHandlers["terminal.upload"], "terminal upload handler");
 beforeEach(() => setActivePluginRegistry(createEmptyPluginRegistry()));
 afterEach(() => resetPluginRuntimeStateForTest());
 
@@ -162,108 +163,98 @@ it.each([
   { disabled: false, trusted: false },
   { disabled: true, trusted: false },
   { disabled: true, trusted: true },
-])(
-  "checks remote terminal upload policy at transport handoff ($disabled, $trusted)",
-  async ({ disabled, trusted }) => {
-    const command = "codex.terminal.resume.v1";
-    const uploadCommand = "terminal.upload";
-    const entered = createDeferred();
-    const pairing = createDeferred<{ identity: string; generation: string }>();
-    let holdUpload = false;
-    const registry = new NodeRegistry({
-      resolveCurrentPairingState: async () => {
-        if (holdUpload) {
-          entered.resolve();
-          return pairing.promise;
-        }
-        return { identity: "identity-a", generation: "generation-a" };
-      },
-    });
-    const { frames, runtime, options, open, dispose } = terminalFixture(
-      registry,
-      [command, uploadCommand],
-      trusted,
-    );
-    const openRespond = vi.fn();
-    let uploading: Promise<void> | undefined;
-    const uploadFrames = () =>
-      frames.flatMap((frame) => {
-        const parsed: unknown = JSON.parse(frame);
-        return isRecord(parsed) &&
-          parsed.event === "node.invoke.request" &&
-          isRecord(parsed.payload) &&
-          parsed.payload.command === uploadCommand
-          ? [parsed.payload]
-          : [];
-      });
-    const dispatched = createDeferred();
-    const pushFrames = frames.push.bind(frames);
-    const frameWrites = vi.spyOn(frames, "push").mockImplementation((...values) => {
-      const count = pushFrames(...values);
-      if (uploadFrames().length > 0) {
-        dispatched.resolve();
+])("rechecks upload policy at dispatch ($disabled, $trusted)", async ({ disabled, trusted }) => {
+  const command = "codex.terminal.resume.v1";
+  const uploadCommand = "terminal.upload";
+  const entered = createDeferred();
+  const pairing = createDeferred<{ identity: string; generation: string }>();
+  let holdUpload = false;
+  const registry = new NodeRegistry({
+    resolveCurrentPairingState: async () => {
+      if (holdUpload) {
+        entered.resolve();
+        return pairing.promise;
       }
-      return count;
-    });
-    try {
-      await open(openRespond);
-      const opened: unknown = openRespond.mock.calls.at(-1)?.[1];
-      if (!isRecord(opened) || typeof opened.sessionId !== "string") {
-        throw new Error("Expected admitted node terminal");
-      }
-      holdUpload = true;
-      const respond = vi.fn();
-      const params = { sessionId: opened.sessionId, name: "proof.txt", contentBase64: "cHJvb2Y=" };
-      uploading = Promise.resolve(
-        expectDefined(
-          terminalUploadHandlers["terminal.upload"],
-          "terminal upload handler",
-        )(options("terminal.upload", respond, params)),
-      );
-      await Promise.race([
-        entered.promise,
-        uploading.then(() => {
-          throw new Error("Upload did not reach pairing preparation");
-        }),
-      ]);
-      const config = runtime.config;
-      runtime.config = {
-        ...config,
-        gateway: { ...config.gateway, uploads: { enabled: !disabled } },
-      };
-      pairing.resolve({ identity: "identity-a", generation: "generation-a" });
-      await Promise.race([dispatched.promise, uploading]);
-      const frame = uploadFrames()[0];
-      if (frame) {
-        if (typeof frame.id !== "string") {
-          throw new Error("Expected node upload request id");
-        }
-        registry.handleInvokeResult({
-          id: frame.id,
-          nodeId: "node-1",
-          connId: "conn-node",
-          ok: true,
-          payloadJSON: JSON.stringify({ path: "/node/proof.txt", size: 5 }),
-        });
-      }
-      await uploading;
-      if (disabled && !trusted) {
-        expect.soft(uploadFrames()).toEqual([]);
-        expect(respond).toHaveBeenCalledWith(
-          false,
-          undefined,
-          expect.objectContaining({ code: "FORBIDDEN", details: { code: "UPLOADS_DISABLED" } }),
-        );
-      } else {
-        expect(uploadFrames()).toHaveLength(1);
-        expect(JSON.stringify(frame)).not.toContain("assertCommitAllowed");
-        expect(respond).toHaveBeenCalledWith(true, { path: "/node/proof.txt", size: 5 });
-      }
-    } finally {
-      frameWrites.mockRestore();
-      pairing.resolve({ identity: "identity-a", generation: "generation-a" });
-      dispose();
-      await uploading;
+      return { identity: "identity-a", generation: "generation-a" };
+    },
+  });
+  const { frames, runtime, options, open, dispose } = terminalFixture(
+    registry,
+    [command, uploadCommand],
+    trusted,
+  );
+  const openRespond = vi.fn();
+  let uploading: Promise<void> | undefined;
+  const uploadFrames = () =>
+    frames
+      .map((frame): unknown => JSON.parse(frame))
+      .filter(isRecord)
+      .filter((frame) => frame.event === "node.invoke.request")
+      .map((frame) => frame.payload)
+      .filter(isRecord)
+      .filter((payload) => payload.command === uploadCommand);
+  const dispatched = createDeferred();
+  const pushFrames = frames.push.bind(frames);
+  const frameWrites = vi.spyOn(frames, "push").mockImplementation((...values) => {
+    const count = pushFrames(...values);
+    if (uploadFrames().length > 0) {
+      dispatched.resolve();
     }
-  },
-);
+    return count;
+  });
+  try {
+    await open(openRespond);
+    const opened: unknown = openRespond.mock.calls.at(-1)?.[1];
+    if (!isRecord(opened) || typeof opened.sessionId !== "string") {
+      throw new Error("Expected admitted node terminal");
+    }
+    holdUpload = true;
+    const respond = vi.fn();
+    const params = { sessionId: opened.sessionId, name: "proof.txt", contentBase64: "cHJvb2Y=" };
+    uploading = Promise.resolve(upload(options("terminal.upload", respond, params)));
+    await Promise.race([
+      entered.promise,
+      uploading.then(() => {
+        throw new Error("Upload did not reach pairing preparation");
+      }),
+    ]);
+    const config = runtime.config;
+    runtime.config = {
+      ...config,
+      gateway: { ...config.gateway, uploads: { enabled: !disabled } },
+    };
+    pairing.resolve({ identity: "identity-a", generation: "generation-a" });
+    await Promise.race([dispatched.promise, uploading]);
+    const frame = uploadFrames()[0];
+    if (frame) {
+      if (typeof frame.id !== "string") {
+        throw new Error("Expected node upload request id");
+      }
+      registry.handleInvokeResult({
+        id: frame.id,
+        nodeId: "node-1",
+        connId: "conn-node",
+        ok: true,
+        payloadJSON: JSON.stringify({ path: "/node/proof.txt", size: 5 }),
+      });
+    }
+    await uploading;
+    if (disabled && !trusted) {
+      expect.soft(uploadFrames()).toEqual([]);
+      expect(respond).toHaveBeenCalledWith(
+        false,
+        undefined,
+        expect.objectContaining({ code: "FORBIDDEN", details: { code: "UPLOADS_DISABLED" } }),
+      );
+    } else {
+      expect(uploadFrames()).toHaveLength(1);
+      expect(JSON.stringify(frame)).not.toContain("assertCommitAllowed");
+      expect(respond).toHaveBeenCalledWith(true, { path: "/node/proof.txt", size: 5 });
+    }
+  } finally {
+    frameWrites.mockRestore();
+    pairing.resolve({ identity: "identity-a", generation: "generation-a" });
+    dispose();
+    await uploading;
+  }
+});
