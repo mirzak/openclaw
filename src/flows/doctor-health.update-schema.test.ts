@@ -37,39 +37,32 @@ import { VERSION } from "../version.js";
 import { runDoctorHealthFlow } from "./doctor-health.js";
 
 const { mocks } = await import("./doctor-health.test-support.js");
+const repairOptions = { repair: true, nonInteractive: true };
 
 function setSchemaVersion(databasePath: string, version: number): void {
-  const db = new DatabaseSync(databasePath);
-  try {
-    db.exec(`PRAGMA user_version = ${version};`);
-    db.prepare("UPDATE schema_meta SET schema_version = ? WHERE meta_key = 'primary'").run(version);
-  } finally {
-    db.close();
-  }
+  using db = new DatabaseSync(databasePath);
+  db.exec(`PRAGMA user_version = ${version};`);
+  db.prepare("UPDATE schema_meta SET schema_version = ? WHERE meta_key = 'primary'").run(version);
 }
 
 function readDatabase(databasePath: string) {
-  const db = new DatabaseSync(databasePath, { readOnly: true });
-  try {
-    return {
-      version: db.prepare("PRAGMA user_version").get()?.user_version,
-      contentVersion: tableExists(db, "config_machine_state")
-        ? db
-            .prepare(
-              "SELECT value_json FROM config_machine_state WHERE state_key = 'state.schema.contentVersion'",
-            )
-            .get()?.value_json
-        : undefined,
-      ledger: tableExists(db, "update_runs")
-        ? db.prepare("SELECT * FROM update_runs ORDER BY run_id").all()
-        : [],
-      captureSessions: tableExists(db, "capture_sessions")
-        ? db.prepare("SELECT id, mode FROM capture_sessions ORDER BY id").all()
-        : [],
-    };
-  } finally {
-    db.close();
-  }
+  using db = new DatabaseSync(databasePath, { readOnly: true });
+  return {
+    version: db.prepare("PRAGMA user_version").get()?.user_version,
+    contentVersion: tableExists(db, "config_machine_state")
+      ? db
+          .prepare(
+            "SELECT value_json FROM config_machine_state WHERE state_key = 'state.schema.contentVersion'",
+          )
+          .get()?.value_json
+      : undefined,
+    ledger: tableExists(db, "update_runs")
+      ? db.prepare("SELECT * FROM update_runs ORDER BY run_id").all()
+      : [],
+    captureSessions: tableExists(db, "capture_sessions")
+      ? db.prepare("SELECT id, mode FROM capture_sessions ORDER BY id").all()
+      : [],
+  };
 }
 
 describe("Doctor schema bumps under an updating parent", () => {
@@ -135,7 +128,7 @@ describe("Doctor schema bumps under an updating parent", () => {
           original = readRows(db);
         }
         const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
-        const doctor = runDoctorHealthFlow(runtime, { repair: true, nonInteractive: true });
+        const doctor = runDoctorHealthFlow(runtime, repairOptions);
         if (damage === "orphan") {
           await doctor;
           expect(readDatabase(shared).version).toBe(OPENCLAW_STATE_SCHEMA_VERSION);
@@ -211,10 +204,9 @@ describe("Doctor schema bumps under an updating parent", () => {
         const bytes = files.map((file) => fs.readFileSync(file));
         const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
 
-        const failure = await runDoctorHealthFlow(runtime, {
-          repair: true,
-          nonInteractive: true,
-        }).catch((error: unknown) => error);
+        const failure = await runDoctorHealthFlow(runtime, repairOptions).catch(
+          (error: unknown) => error,
+        );
         expect(failure).toMatchObject({
           code: "update-schema-bump-unfenced",
           updaterVersion,
@@ -258,10 +250,7 @@ describe("Doctor schema bumps under an updating parent", () => {
         });
         const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
         try {
-          await runDoctorHealthFlow(runtime, {
-            repair: true,
-            nonInteractive: true,
-          });
+          await runDoctorHealthFlow(runtime, repairOptions);
         } finally {
           await finalizeActiveDebugProxyCaptures();
           await closeOpenClawStateDatabaseAsync();
@@ -352,8 +341,8 @@ describe("Doctor schema bumps under an updating parent", () => {
         await closeOpenClawStateDatabaseAsync();
         // Frozen v24 storage preserves the exact input to the candidate schema migration.
         fs.unlinkSync(agent);
-        const seed = new DatabaseSync(agent);
-        try {
+        {
+          using seed = new DatabaseSync(agent);
           seed.exec(OPENCLAW_AGENT_SCHEMA_V24_SQL);
           seed.exec(`PRAGMA user_version = 24;
             INSERT INTO schema_meta(meta_key, role, schema_version, agent_id, app_version, created_at, updated_at)
@@ -361,8 +350,6 @@ describe("Doctor schema bumps under an updating parent", () => {
           seed.exec(
             "INSERT INTO cache_entries(scope,key,value_json,expires_at,updated_at) VALUES('test','retained','{\"keep\":true}',NULL,1)",
           );
-        } finally {
-          seed.close();
         }
         if (mode === "foreign-agent" || mode === "early foreign-agent") {
           const foreign = state.path("foreign-agent");
@@ -436,12 +423,7 @@ describe("Doctor schema bumps under an updating parent", () => {
             // The actual CLI preflight must not cache state-only facts as a full fleet.
             const preflight = await preflightUpdateDoctorCli({});
             expect(preflight).toBeUndefined();
-            const doctor = runDoctorHealthFlow(
-              runtime,
-              { repair: true, nonInteractive: true },
-              undefined,
-              preflight,
-            );
+            const doctor = runDoctorHealthFlow(runtime, repairOptions, undefined, preflight);
             if (mode === "owned") {
               await doctor;
               expect(
@@ -460,17 +442,13 @@ describe("Doctor schema bumps under an updating parent", () => {
           }
           expect(fs.readFileSync(state.configPath)).toEqual(before[1]);
           if (mode === "owned") {
-            const migrated = new DatabaseSync(agent, { readOnly: true });
-            try {
-              expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(
-                OPENCLAW_AGENT_SCHEMA_VERSION,
-              );
-              expect(
-                migrated.prepare("SELECT value_json FROM cache_entries WHERE key='retained'").get(),
-              ).toEqual({ value_json: '{"keep":true}' });
-            } finally {
-              migrated.close();
-            }
+            using migrated = new DatabaseSync(agent, { readOnly: true });
+            expect(migrated.prepare("PRAGMA user_version").get()?.user_version).toBe(
+              OPENCLAW_AGENT_SCHEMA_VERSION,
+            );
+            expect(
+              migrated.prepare("SELECT value_json FROM cache_entries WHERE key='retained'").get(),
+            ).toEqual({ value_json: '{"keep":true}' });
           } else {
             expect(fs.readFileSync(agent)).toEqual(before[0]);
           }

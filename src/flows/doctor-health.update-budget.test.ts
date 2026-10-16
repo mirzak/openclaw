@@ -43,17 +43,11 @@ it.each(["rehearsal", "partial-markers"])(
   "defers only pure advisory contributions during %s and records their IDs",
   async (mode) => {
     const env = {
-      ...(mode === "rehearsal" || mode === "partial-markers"
-        ? buildUpdateRehearsalPathEnv("/synthetic/rehearsal")
-        : {}),
-      ...(mode !== "standalone"
-        ? {
-            OPENCLAW_UPDATE_IN_PROGRESS: "1",
-            OPENCLAW_SERVICE_REPAIR_POLICY: "external",
-            OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR: "0",
-            OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION: "0",
-          }
-        : {}),
+      ...buildUpdateRehearsalPathEnv("/synthetic/rehearsal"),
+      OPENCLAW_UPDATE_IN_PROGRESS: "1",
+      OPENCLAW_SERVICE_REPAIR_POLICY: "external",
+      OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR: "0",
+      OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION: "0",
       ...(mode === "partial-markers" ? { HOME: "/synthetic/operator" } : {}),
     };
     const advisoryIds = new Set([

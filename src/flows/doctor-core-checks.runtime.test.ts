@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createMcpProofPluginRegistry } from "../agents/mcp-connection-resolver.test-fixtures.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import { collectGatewayHealthFindings } from "../commands/doctor-gateway-health.js";
+import { createSqliteWalHealth } from "../commands/sqlite-wal-health.test-support.js";
 import { withPluginRuntimeRegistryScope } from "../plugins/runtime/gateway-request-scope.js";
 import { setPluginToolMeta } from "../plugins/tool-metadata.js";
 import { createCoreHealthChecks } from "./doctor-core-checks.js";
@@ -110,6 +111,10 @@ const { collectGatewayDaemonFindings, collectProviderCatalogProjectionFindings }
   await import("./doctor-core-checks.runtime.js");
 const { collectRuntimeToolSchemaFindings } = await import("./doctor-tool-schema-runtime.js");
 
+const objectSchema = { type: "object", properties: {} };
+const arraySchema = { type: "array", items: { type: "number" } };
+const runtime = { log() {}, error() {}, exit() {} };
+
 function tool(name: string, parameters: unknown): AnyAgentTool {
   return {
     name,
@@ -118,6 +123,10 @@ function tool(name: string, parameters: unknown): AnyAgentTool {
     parameters,
     execute: async () => ({ text: "ok" }),
   } as unknown as AnyAgentTool;
+}
+
+function bundleRuntime(tools: AnyAgentTool[]) {
+  return { tools, dispose: mocks.disposeBundleRuntime };
 }
 
 function bundleMcpTool(name: string, parameters: unknown): AnyAgentTool {
@@ -145,24 +154,23 @@ function mockBundleDiagnostic(serverName = "fuzzplugin") {
   });
 }
 
+function findingMatching(
+  check: string,
+  severity: HealthFinding["severity"],
+  expected: Partial<HealthFinding>,
+) {
+  return expect.objectContaining({ checkId: `core/doctor/${check}`, severity, ...expected });
+}
+
 function expectSchemaError(findings: readonly HealthFinding[], expected: Partial<HealthFinding>) {
-  expect(findings).toContainEqual(
-    expect.objectContaining({
-      checkId: "core/doctor/runtime-tool-schemas",
-      severity: "error",
-      ...expected,
-    }),
-  );
+  expect(findings).toContainEqual(findingMatching("runtime-tool-schemas", "error", expected));
 }
 
 describe("doctor runtime tool schema checks", () => {
   beforeEach(() => {
     mocks.metadataScopes.length = 0;
     mocks.createOpenClawCodingTools.mockReset().mockReturnValue([]);
-    mocks.createBundleMcpToolRuntime.mockReset().mockReturnValue({
-      tools: [],
-      dispose: mocks.disposeBundleRuntime,
-    });
+    mocks.createBundleMcpToolRuntime.mockReset().mockReturnValue(bundleRuntime([]));
     mocks.disposeBundleRuntime.mockReset().mockReturnValue(undefined);
     mocks.loadModelCatalog.mockClear();
     mocks.normalizeProviderToolSchemasWithPlugin
@@ -205,13 +213,12 @@ describe("doctor runtime tool schema checks", () => {
   });
 
   it("reports active bundle MCP schemas before a model turn", async () => {
-    mocks.createBundleMcpToolRuntime.mockReturnValueOnce({
-      tools: [
-        bundleMcpTool("fuzzplugin__healthy", { type: "object", properties: {} }),
-        bundleMcpTool("fuzzplugin__move_angles", { type: "array", items: { type: "number" } }),
-      ],
-      dispose: mocks.disposeBundleRuntime,
-    });
+    mocks.createBundleMcpToolRuntime.mockReturnValueOnce(
+      bundleRuntime([
+        bundleMcpTool("fuzzplugin__healthy", objectSchema),
+        bundleMcpTool("fuzzplugin__move_angles", arraySchema),
+      ]),
+    );
     expectSchemaError(await collectRuntimeToolSchemaFindings(mcpConfig()), {
       path: "mcp.servers",
       target: "fuzzplugin__move_angles",
@@ -282,9 +289,7 @@ describe("doctor runtime tool schema checks", () => {
         compat: { supportsTools: true },
       },
     ]);
-    mocks.createOpenClawCodingTools.mockReturnValueOnce([
-      tool("healthy", { type: "object", properties: {} }),
-    ]);
+    mocks.createOpenClawCodingTools.mockReturnValueOnce([tool("healthy", objectSchema)]);
     await collectRuntimeToolSchemaFindings({});
     expect(mocks.normalizeProviderToolSchemasWithPlugin).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -331,8 +336,8 @@ describe("doctor runtime tool schema checks", () => {
   it("inspects non-default agents with read-only model catalogs", async () => {
     mocks.createOpenClawCodingTools.mockImplementation((options) =>
       options?.agentId === "worker"
-        ? [tool("fuzzplugin_move_angles", { type: "array", items: { type: "number" } })]
-        : [tool("healthy", { type: "object", properties: {} })],
+        ? [tool("fuzzplugin_move_angles", arraySchema)]
+        : [tool("healthy", objectSchema)],
     );
     expectSchemaError(
       await collectRuntimeToolSchemaFindings({
@@ -371,8 +376,8 @@ describe("doctor runtime tool schema checks", () => {
   it("skips ACP-only agents", async () => {
     mocks.createOpenClawCodingTools.mockImplementation((options) =>
       options?.agentId === "acp-worker"
-        ? [tool("fuzzplugin_move_angles", { type: "array", items: { type: "number" } })]
-        : [tool("healthy", { type: "object", properties: {} })],
+        ? [tool("fuzzplugin_move_angles", arraySchema)]
+        : [tool("healthy", objectSchema)],
     );
     await expect(
       collectRuntimeToolSchemaFindings({
@@ -406,9 +411,7 @@ describe("doctor runtime tool schema checks", () => {
       },
     });
     expect(findings).toEqual([
-      expect.objectContaining({
-        checkId: "core/doctor/runtime-tool-schemas",
-        severity: "error",
+      findingMatching("runtime-tool-schemas", "error", {
         path: "mcp.servers.fuzzplugin",
         requirement: 'tools[0].inputSchema.type: Invalid input: expected "object"',
       }),
@@ -442,9 +445,7 @@ describe("doctor runtime tool schema checks", () => {
           },
         }),
       ).toContainEqual(
-        expect.objectContaining({
-          checkId: "core/doctor/runtime-tool-schemas",
-          severity: "info",
+        findingMatching("runtime-tool-schemas", "info", {
           path: "mcp.servers.fuzzplugin",
           requirement: "authenticated requester context",
           fixHint: "Verify this server from an authenticated agent turn.",
@@ -536,14 +537,11 @@ describe("doctor runtime tool schema checks", () => {
         });
       } else {
         if (path === "mcp.servers") {
-          mocks.createBundleMcpToolRuntime.mockResolvedValueOnce({
-            tools: [bundleMcpTool(toolName, { type: "object", properties: {} })],
-            dispose: mocks.disposeBundleRuntime,
-          });
+          mocks.createBundleMcpToolRuntime.mockResolvedValueOnce(
+            bundleRuntime([bundleMcpTool(toolName, objectSchema)]),
+          );
         } else {
-          mocks.createOpenClawCodingTools.mockReturnValueOnce([
-            tool(toolName, { type: "object", properties: {} }),
-          ]);
+          mocks.createOpenClawCodingTools.mockReturnValueOnce([tool(toolName, objectSchema)]);
         }
         mocks.normalizeProviderToolSchemasWithPlugin.mockImplementation(({ context }) => {
           const tools: AnyAgentTool[] = context.tools;
@@ -564,6 +562,17 @@ describe("doctor runtime tool schema checks", () => {
   );
 });
 
+function runningService(executable = "openclaw") {
+  return {
+    installed: true,
+    loadState: { status: "loaded" },
+    running: true,
+    env: {},
+    command: { programArguments: [executable, "gateway"], sourcePath: "/tmp/gateway.service" },
+    runtime: { status: "running" },
+  };
+}
+
 describe("doctor gateway runtime checks", () => {
   beforeEach(() => {
     mocks.resolveNodeRuntimeInfo.mockReset().mockResolvedValue({
@@ -579,14 +588,7 @@ describe("doctor gateway runtime checks", () => {
     });
     mocks.callGateway.mockReset().mockResolvedValue({ degradedSecretOwners: [] });
     mocks.isGatewayCredentialsRequiredError.mockReset().mockReturnValue(false);
-    mocks.readGatewayServiceState.mockReset().mockResolvedValue({
-      installed: true,
-      loadState: { status: "loaded" },
-      running: true,
-      env: {},
-      command: { programArguments: ["openclaw", "gateway"], sourcePath: "/tmp/gateway.service" },
-      runtime: { status: "running" },
-    });
+    mocks.readGatewayServiceState.mockReset().mockResolvedValue(runningService());
     mocks.resolveGatewayService.mockReset().mockReturnValue({ label: "openclaw-gateway" });
   });
 
@@ -628,17 +630,7 @@ describe("doctor gateway runtime checks", () => {
         },
       ],
       degradedPlugins: [{ pluginId: "not-this-check" }],
-      sqliteWal: {
-        state: "blocked",
-        observedAtMs: 1_800_000,
-        walBytes: 128 * 1024 * 1024,
-        databaseBytes: 32 * 1024 * 1024,
-        logFrames: 4000,
-        checkpointedFrames: 100,
-        lastCompletedAtMs: null,
-        consecutiveBlocked: 2,
-        warning: true,
-      },
+      sqliteWal: createSqliteWalHealth(),
     });
 
     const findings = await collectGatewayHealthFindings({
@@ -657,32 +649,24 @@ describe("doctor gateway runtime checks", () => {
       preauthHandshakeTimeoutMs: 1200,
     });
     expect(findings).toEqual([
-      expect.objectContaining({
-        checkId: "core/doctor/gateway-health",
-        severity: "warning",
+      findingMatching("gateway-health", "warning", {
         message: expect.stringContaining("cold account:discord:ops"),
         path: "channels.discord.accounts.ops.token",
         target: "account:discord:ops",
         fixHint: expect.stringContaining("openclaw secrets reload"),
       }),
-      expect.objectContaining({
-        checkId: "core/doctor/gateway-health",
-        severity: "warning",
+      findingMatching("gateway-health", "warning", {
         message: expect.stringContaining("stale capability:tts"),
         path: "tts.providers.elevenlabs.apiKey",
         target: "capability:tts",
         fixHint: expect.stringContaining("openclaw secrets reload"),
       }),
-      expect.objectContaining({
-        checkId: "core/doctor/gateway-health",
-        severity: "warning",
+      findingMatching("gateway-health", "warning", {
         message: expect.stringContaining("provider:vault"),
         path: expect.stringContaining("providers.example.0"),
         target: expect.stringContaining("provider:vault"),
       }),
-      expect.objectContaining({
-        checkId: "core/doctor/gateway-health",
-        severity: "warning",
+      findingMatching("gateway-health", "warning", {
         message: expect.stringContaining("SQLite WAL: checkpoint blocked"),
         fixHint: expect.stringContaining("openclaw status --deep"),
       }),
@@ -727,9 +711,7 @@ describe("doctor gateway runtime checks", () => {
     const findings = await collectGatewayHealthFindings({ cfg: { gateway: { mode: "local" } } });
 
     expect(findings).toEqual([
-      expect.objectContaining({
-        checkId: "core/doctor/gateway-health",
-        severity: "warning",
+      findingMatching("gateway-health", "warning", {
         message: entry.message,
         path: "gateway.mode",
         target: "http://127.0.0.1:5829",
@@ -775,9 +757,7 @@ describe("doctor gateway runtime checks", () => {
     const findings = await collectGatewayHealthFindings({ cfg, env: {} });
 
     expect(findings).toEqual([
-      expect.objectContaining({
-        checkId: "core/doctor/gateway-health",
-        severity: "warning",
+      findingMatching("gateway-health", "warning", {
         message: expect.stringContaining("intentionally skipped"),
         fixHint:
           "Rerun `openclaw doctor --lint --only core/doctor/gateway-health --allow-exec` to permit configured secret execution.",
@@ -879,17 +859,7 @@ describe("doctor gateway runtime checks", () => {
       const message = text
         ? `Node ${version}: unsupported version, capability check passed.`
         : `Node ${version}: node:sqlite truncates TEXT at embedded NUL (nodejs/node#61954)`;
-      mocks.readGatewayServiceState.mockResolvedValueOnce({
-        installed: true,
-        loadState: { status: "loaded" },
-        running: true,
-        env: {},
-        command: {
-          programArguments: ["/opt/runtime/bin/node", "gateway"],
-          sourcePath: "/tmp/gateway.service",
-        },
-        runtime: { status: "running" },
-      });
+      mocks.readGatewayServiceState.mockResolvedValueOnce(runningService("/opt/runtime/bin/node"));
       mocks.resolveNodeRuntimeInfo.mockResolvedValue({
         status,
         version,
@@ -936,9 +906,7 @@ function expectCatalogFinding(
   target = "mockplugin",
 ) {
   expect(findings).toContainEqual(
-    expect.objectContaining({
-      checkId: "core/doctor/provider-catalog-projection",
-      severity: "error",
+    findingMatching("provider-catalog-projection", "error", {
       path: "plugins.entries.mockplugin",
       target,
       requirement,
@@ -1026,7 +994,7 @@ describe("doctor provider catalog projection checks", () => {
     expect(check).toBeDefined();
     const findings = await check!.detect({
       mode: "lint",
-      runtime: { log() {}, error() {}, exit() {} },
+      runtime,
       cfg: {},
     });
     expectCatalogFinding(findings, "order must be simple, profile, paired, or late");
@@ -1058,9 +1026,7 @@ describe("doctor provider catalog projection checks", () => {
     // Promise resolution reads "then", so this fails before result-key inspection.
     mockProviderCatalog({ order: "simple", run: async () => proxy });
     expect(await collectProviderCatalogProjectionFindings({})).toContainEqual(
-      expect.objectContaining({
-        checkId: "core/doctor/provider-catalog-projection",
-        severity: "error",
+      findingMatching("provider-catalog-projection", "error", {
         path: "plugins.entries.mockplugin",
         target: "mockplugin",
         message: "Provider catalog mockplugin failed during doctor validation.",

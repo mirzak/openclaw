@@ -17,7 +17,10 @@ import {
 } from "../infra/update-doctor-result.js";
 import type { UpdateRunResult } from "../infra/update-runner-types.js";
 import { ExitError } from "../runtime.js";
-import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import {
+  withOpenClawTestState,
+  type OpenClawTestState,
+} from "../test-utils/openclaw-test-state.js";
 import type { DoctorHealthFlowContext } from "./doctor-health-contributions.js";
 import { runDoctorHealthFlow } from "./doctor-health.js";
 
@@ -115,6 +118,18 @@ vi.mock("./doctor-health-contributions.js", () => ({
   runDoctorHealthContributions: mocks.runContributions,
 }));
 
+async function withResult(run: (state: OpenClawTestState, resultPath: string) => Promise<void>) {
+  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    const resultPath = createUpdatePostInstallDoctorResultPath();
+    vi.stubEnv(UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV, resultPath);
+    try {
+      await run(state, resultPath);
+    } finally {
+      await consumeUpdatePostInstallDoctorResult(resultPath);
+    }
+  });
+}
+
 describe("runDoctorHealthFlow update outcomes", () => {
   const dirs = useAutoCleanupTempDirTracker(afterEach);
   afterEach(() => {
@@ -145,7 +160,7 @@ describe("runDoctorHealthFlow update outcomes", () => {
   });
 
   it("publishes the first include input and last Doctor write through result IPC", async () => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    await withResult(async (state, resultPath) => {
       const includePath = path.join(path.dirname(state.configPath), "logging.json");
       const originalInclude = '{"level":"info"}\n';
       const finalInclude = '{\n  "level": "error"\n}\n';
@@ -156,8 +171,6 @@ describe("runDoctorHealthFlow update outcomes", () => {
       await fs.writeFile(includePath, originalInclude);
       const originalRoot = await fs.readFile(state.configPath, "utf8");
       const resolvedInclude = await fs.realpath(includePath);
-      const resultPath = createUpdatePostInstallDoctorResultPath();
-      vi.stubEnv(UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV, resultPath);
       mocks.runContributions.mockImplementation(async () => {
         for (const level of ["warn", "error"] as const) {
           await transformConfigFile({
@@ -169,25 +182,21 @@ describe("runDoctorHealthFlow update outcomes", () => {
         }
       });
 
-      try {
-        await runDoctorHealthFlow(
-          { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
-          { nonInteractive: true },
-        );
-        const result = await consumeUpdatePostInstallDoctorResult(resultPath);
-        expect(result).toMatchObject({ status: "ok", configHash: "unchanged" });
-        expect(result?.configInputHash).toBeUndefined();
-        expect(result?.configFileWrites).toEqual({
-          [resolvedInclude]: {
-            inputHash: createHash("sha256").update(originalInclude).digest("hex"),
-            hash: createHash("sha256").update(finalInclude).digest("hex"),
-          },
-        });
-        await expect(fs.readFile(state.configPath, "utf8")).resolves.toBe(originalRoot);
-        await expect(fs.readFile(includePath, "utf8")).resolves.toBe(finalInclude);
-      } finally {
-        await consumeUpdatePostInstallDoctorResult(resultPath);
-      }
+      await runDoctorHealthFlow(
+        { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+        { nonInteractive: true },
+      );
+      const result = await consumeUpdatePostInstallDoctorResult(resultPath);
+      expect(result).toMatchObject({ status: "ok", configHash: "unchanged" });
+      expect(result?.configInputHash).toBeUndefined();
+      expect(result?.configFileWrites).toEqual({
+        [resolvedInclude]: {
+          inputHash: createHash("sha256").update(originalInclude).digest("hex"),
+          hash: createHash("sha256").update(finalInclude).digest("hex"),
+        },
+      });
+      await expect(fs.readFile(state.configPath, "utf8")).resolves.toBe(originalRoot);
+      await expect(fs.readFile(includePath, "utf8")).resolves.toBe(finalInclude);
     });
   });
 
@@ -197,9 +206,7 @@ describe("runDoctorHealthFlow update outcomes", () => {
   ])(
     "retains deferred inspection warnings in update IPC (refused=$refused, noisy=$noisy)",
     async ({ refused, noisy }) => {
-      await withOpenClawTestState({ scenario: "minimal" }, async () => {
-        const resultPath = createUpdatePostInstallDoctorResultPath();
-        vi.stubEnv(UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV, resultPath);
+      await withResult(async (_state, resultPath) => {
         const receipt = (
           id: string,
           outcome: "warning" | "skipped" | "refused",
@@ -272,39 +279,27 @@ describe("runDoctorHealthFlow update outcomes", () => {
           }),
         };
 
-        try {
-          if (refused) {
-            await expect(runDoctorHealthFlow(runtime, { nonInteractive: true })).rejects.toBe(
-              refusal,
-            );
-          } else {
-            await runDoctorHealthFlow(runtime, { nonInteractive: true });
-          }
-          expect(mocks.disposeConfig).toHaveBeenCalledOnce();
-          const result = await consumeUpdatePostInstallDoctorResult(resultPath);
-          expect(result?.status).toBe(refused ? "error" : "ok");
-          expect(result?.warnings).toHaveLength(refused ? 2 : noisy ? 32 : 4);
-          expect(result?.warnings).toContain(inspectionWarning);
-          if (refused) {
-            expect(refusal.message).toContain(refusalWarning);
-            expect(result?.failureFacts).toEqual([refusalFact]);
-            expect(result?.warnings).toContain(refusalWarning);
-            expect(mocks.runContributions.mock.calls[0]?.[0].updateWarnings).toContain(
-              refusalWarning,
-            );
-          } else {
-            expect(result?.warnings).toContain("preflight cleanup: run openclaw doctor --fix");
-            if (!noisy) {
-              expect(result?.warnings).toEqual(
-                expect.arrayContaining([
-                  "skipped audit recovery: run openclaw doctor --fix",
-                  "deferred cleanup: run openclaw doctor --fix",
-                ]),
-              );
-            }
-          }
-        } finally {
-          await consumeUpdatePostInstallDoctorResult(resultPath);
+        if (refused) {
+          await expect(runDoctorHealthFlow(runtime, { nonInteractive: true })).rejects.toBe(
+            refusal,
+          );
+        } else {
+          await runDoctorHealthFlow(runtime, { nonInteractive: true });
+        }
+        expect(mocks.disposeConfig).toHaveBeenCalledOnce();
+        const result = await consumeUpdatePostInstallDoctorResult(resultPath);
+        expect(result?.status).toBe(refused ? "error" : "ok");
+        expect(result?.warnings).toHaveLength(refused ? 2 : 32);
+        expect(result?.warnings).toContain(inspectionWarning);
+        if (refused) {
+          expect(refusal.message).toContain(refusalWarning);
+          expect(result?.failureFacts).toEqual([refusalFact]);
+          expect(result?.warnings).toContain(refusalWarning);
+          expect(mocks.runContributions.mock.calls[0]?.[0].updateWarnings).toContain(
+            refusalWarning,
+          );
+        } else {
+          expect(result?.warnings).toContain("preflight cleanup: run openclaw doctor --fix");
         }
       });
     },
@@ -313,9 +308,7 @@ describe("runDoctorHealthFlow update outcomes", () => {
   it.each(["partial", "all", "unreadable"] as const)(
     "publishes current plugin migration warnings after Doctor (%s)",
     async (settlement) => {
-      await withOpenClawTestState({ scenario: "minimal" }, async () => {
-        const resultPath = createUpdatePostInstallDoctorResultPath();
-        vi.stubEnv(UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH_ENV, resultPath);
+      await withResult(async (_state, resultPath) => {
         const pending = (pluginId: string) => ({
           pluginId,
           reason: "The installed plugin has not confirmed its saved data and settings.",
@@ -347,22 +340,18 @@ describe("runDoctorHealthFlow update outcomes", () => {
         }
         const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
 
-        try {
-          await runDoctorHealthFlow(runtime, { nonInteractive: true });
-          const result = await consumeUpdatePostInstallDoctorResult(resultPath);
-          const expected =
-            settlement === "unreadable"
-              ? [settled, stillPending]
-              : settlement === "all"
-                ? []
-                : [stillPending];
-          expect(result).toMatchObject({ status: "ok" });
-          expect(result?.warnings ?? []).toEqual(
-            expected.map((plugin) => formatDeferredPluginMigration(plugin)),
-          );
-        } finally {
-          await consumeUpdatePostInstallDoctorResult(resultPath);
-        }
+        await runDoctorHealthFlow(runtime, { nonInteractive: true });
+        const result = await consumeUpdatePostInstallDoctorResult(resultPath);
+        const expected =
+          settlement === "unreadable"
+            ? [settled, stillPending]
+            : settlement === "all"
+              ? []
+              : [stillPending];
+        expect(result).toMatchObject({ status: "ok" });
+        expect(result?.warnings ?? []).toEqual(
+          expected.map((plugin) => formatDeferredPluginMigration(plugin)),
+        );
       });
     },
   );

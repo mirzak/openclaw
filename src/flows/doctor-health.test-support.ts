@@ -5,7 +5,10 @@ import { createConfigIO } from "../config/io.factory.js";
 import { hashConfigRaw } from "../config/io.read-helpers.js";
 import { ConfigWritePostCommitError } from "../config/io.write-errors.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { UpdateDoctorError } from "../infra/update-doctor-result.js";
+import {
+  UpdateDoctorError,
+  type UpdatePostInstallDoctorResult,
+} from "../infra/update-doctor-result.js";
 import type { OpenClawStateDatabase } from "../state/openclaw-state-db-contract.js";
 import { UpdateSchemaRefusalError } from "../state/openclaw-update-schema-refusal.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
@@ -389,55 +392,40 @@ export function registerDoctorConfigReceiptTests(
         } else {
           await completed;
         }
+        const result: UpdatePostInstallDoctorResult = {
+          ...(outcome === "advisory" ? postInstallAdvisory : { status: failure ? "error" : "ok" }),
+          configHash: expectedHash,
+        };
+        if (outcome === "partial-config" || outcome === "unrestored-config") {
+          result.maintenanceRefusal = { kind: "data-at-risk", reason: "gateway-state-unverified" };
+        } else if (outcome === "schema-refusal") {
+          result.maintenanceRefusal = { kind: "data-at-risk", reason: "incomplete-migration" };
+        }
+        if (failure) {
+          const [check, code]: [string, string] =
+            outcome === "partial-config" || outcome === "unrestored-config"
+              ? ["config-write", "rollback-state-unverified"]
+              : outcome === "schema-refusal"
+                ? ["database-schema-preflight", "update-schema-bump-unfenced"]
+                : outcome === "wrapped-refusal"
+                  ? ["gateway-stop", "stale-gateway-stop-failed"]
+                  : ["doctor", "doctor-failed"];
+          result.failureFacts = [
+            { check, code, message: outcome === "error" ? failure.message : expect.any(String) },
+          ];
+        }
+        if (outcome !== "unchanged") {
+          result.configChanges = [
+            { kind: "key", key: "gateway" },
+            { kind: "key", key: "meta" },
+          ];
+          if (outcome !== "interleaved") {
+            result.configInputHash = expectedInputHash;
+          }
+        }
         expect(mocks.writeUpdatePostInstallDoctorResult).toHaveBeenCalledWith({
           resultPath,
-          result: {
-            ...(outcome === "advisory"
-              ? postInstallAdvisory
-              : { status: failure ? "error" : "ok" }),
-            ...(outcome === "partial-config" || outcome === "unrestored-config"
-              ? { maintenanceRefusal: { kind: "data-at-risk", reason: "gateway-state-unverified" } }
-              : outcome === "schema-refusal"
-                ? { maintenanceRefusal: { kind: "data-at-risk", reason: "incomplete-migration" } }
-                : {}),
-            configHash: expectedHash,
-            ...(failure
-              ? {
-                  failureFacts: [
-                    {
-                      check:
-                        outcome === "partial-config" || outcome === "unrestored-config"
-                          ? "config-write"
-                          : outcome === "schema-refusal"
-                            ? "database-schema-preflight"
-                            : outcome === "wrapped-refusal"
-                              ? "gateway-stop"
-                              : "doctor",
-                      code:
-                        outcome === "partial-config" || outcome === "unrestored-config"
-                          ? "rollback-state-unverified"
-                          : outcome === "schema-refusal"
-                            ? "update-schema-bump-unfenced"
-                            : outcome === "wrapped-refusal"
-                              ? "stale-gateway-stop-failed"
-                              : "doctor-failed",
-                      message: outcome === "error" ? failure.message : expect.any(String),
-                    },
-                  ],
-                }
-              : {}),
-            ...(outcome === "unchanged"
-              ? {}
-              : {
-                  configChanges: [
-                    { kind: "key", key: "gateway" },
-                    { kind: "key", key: "meta" },
-                  ],
-                }),
-            ...(outcome === "unchanged" || outcome === "interleaved"
-              ? {}
-              : { configInputHash: expectedInputHash }),
-          },
+          result,
         });
         if (outcome !== "unchanged") {
           expect(expectedHash).not.toBe(hashConfigRaw(fs.readFileSync(state.configPath, "utf8")));
@@ -500,11 +488,7 @@ export function registerDoctorConfigReceiptTests(
       ctx.configWriteRefusal = "cron-owner-safety";
       ctx.postInstallDoctorResult = postInstallAdvisory;
     });
-    const runtime = {
-      log: vi.fn(),
-      error: vi.fn(),
-      exit: vi.fn(),
-    };
+    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
     vi.stubEnv(
       "OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH",
       "/tmp/openclaw-update-doctor-result.json",

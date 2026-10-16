@@ -16,6 +16,36 @@ import {
 import { mockProcessPlatform } from "../test-utils/vitest-spies.js";
 import { CORE_HEALTH_CHECKS } from "./doctor-core-checks.js";
 
+function platformCheck() {
+  const check = CORE_HEALTH_CHECKS.find(
+    (entry) => entry.id === "core/doctor/gateway-services/platform-notes",
+  );
+  if (!check) {
+    throw new Error("Missing registered gateway platform notes check");
+  }
+  return check;
+}
+
+function triage(
+  findings: Parameters<typeof renderTriagePrompt>[0]["findings"],
+  stateDir = ".openclaw",
+) {
+  return renderTriagePrompt({
+    findings,
+    bundle: { kind: "skipped" },
+    redaction: { env: process.env, stateDir: path.join(home, stateDir) },
+  });
+}
+
+function effectiveUnit(mode: string, loadState: string) {
+  execSystemctlUserMock.mockResolvedValue({
+    stdout: `KillMode=${mode}\nLoadState=${loadState}\n`,
+    stderr: "",
+    code: 0,
+    termination: "exit",
+  });
+}
+
 const runtime = { log() {}, error() {}, exit() {} };
 let home: string;
 let unitPath: string;
@@ -52,13 +82,8 @@ describe("registered gateway platform notes", () => {
       "[Unit]\nAfter=network-online.target\nWants=network-online.target\n[Service]\nExecStart=/usr/bin/node gateway\nRestartSec=5\nKillMode=control-group\n";
     await fs.writeFile(unitPath, unit);
     expect(isDefaultInstallIdentity()).toBe(true);
-    const check = CORE_HEALTH_CHECKS.find(
-      (entry) => entry.id === "core/doctor/gateway-services/platform-notes",
-    );
-    if (!check) {
-      throw new Error("Missing registered gateway platform notes check");
-    }
-    const findings = await check.detect({
+
+    const findings = await platformCheck().detect({
       mode: "lint",
       runtime,
       cfg: { gateway: { mode: "local" } },
@@ -70,11 +95,7 @@ describe("registered gateway platform notes", () => {
         fixHint: expect.stringContaining("gateway install --force"),
       }),
     ]);
-    const prompt = renderTriagePrompt({
-      findings,
-      bundle: { kind: "skipped" },
-      redaction: { env: process.env, stateDir: path.join(home, ".openclaw") },
-    });
+    const prompt = triage(findings);
     expect(prompt).toContain("KillMode=mixed");
     expect(prompt).toContain("gateway install --force");
     expect(prompt).toContain("drop-ins");
@@ -86,19 +107,9 @@ describe("registered gateway platform notes", () => {
     { name: "masked service", mode: "control-group", loadState: "masked" },
   ])("does not propose repairs for $name", async ({ mode, loadState }) => {
     await fs.writeFile(unitPath, "[Service]\nKillMode=control-group\n");
-    execSystemctlUserMock.mockResolvedValue({
-      stdout: `KillMode=${mode}\nLoadState=${loadState}\n`,
-      stderr: "",
-      code: 0,
-      termination: "exit",
-    });
-    const check = CORE_HEALTH_CHECKS.find(
-      (entry) => entry.id === "core/doctor/gateway-services/platform-notes",
-    );
-    if (!check) {
-      throw new Error("Missing registered gateway platform notes check");
-    }
-    expect(await check.detect({ mode: "lint", runtime, cfg: {} })).toEqual([]);
+    effectiveUnit(mode, loadState);
+
+    expect(await platformCheck().detect({ mode: "lint", runtime, cfg: {} })).toEqual([]);
     expect(resolveNodeRuntimeInfoMock).not.toHaveBeenCalled();
   });
 
@@ -114,25 +125,11 @@ describe("registered gateway platform notes", () => {
     );
     const unit = "[Service]\nKillMode=mixed\n";
     await fs.writeFile(profileUnitPath, unit);
-    execSystemctlUserMock.mockResolvedValue({
-      stdout: "KillMode=control-group\nLoadState=loaded\n",
-      stderr: "",
-      code: 0,
-      termination: "exit",
-    });
+    effectiveUnit("control-group", "loaded");
     expect(isDefaultInstallIdentity()).toBe(true);
-    const check = CORE_HEALTH_CHECKS.find(
-      (entry) => entry.id === "core/doctor/gateway-services/platform-notes",
-    );
-    if (!check) {
-      throw new Error("Missing registered gateway platform notes check");
-    }
-    const findings = await check.detect({ mode: "lint", runtime, cfg: {} });
-    const prompt = renderTriagePrompt({
-      findings,
-      bundle: { kind: "skipped" },
-      redaction: { env: process.env, stateDir: path.join(home, ".openclaw-upgrade-proof") },
-    });
+
+    const findings = await platformCheck().detect({ mode: "lint", runtime, cfg: {} });
+    const prompt = triage(findings, ".openclaw-upgrade-proof");
     expect(prompt).toContain("openclaw --profile upgrade-proof gateway install --force");
     expect(prompt).toContain("drop-ins separately");
     expect(execSystemctlUserMock.mock.calls[0]?.[1]).toContain(
@@ -152,14 +149,9 @@ describe("registered gateway platform notes", () => {
       if (scope === "relocated") {
         vi.stubEnv("OPENCLAW_STATE_DIR", path.join(home, "other-state"));
       }
-      const check = CORE_HEALTH_CHECKS.find(
-        (entry) => entry.id === "core/doctor/gateway-services/platform-notes",
-      );
-      if (!check) {
-        throw new Error("Missing registered gateway platform notes check");
-      }
+
       expect(
-        await check.detect({
+        await platformCheck().detect({
           mode: "lint",
           runtime,
           cfg: { gateway: { mode: scope === "remote" ? "remote" : "local" } },
