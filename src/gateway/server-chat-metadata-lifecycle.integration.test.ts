@@ -111,6 +111,70 @@ async function createLifecycle(getConfig: () => OpenClawConfig = () => config) {
   });
 }
 
+async function attachLifecycle(activeContext = context, activeSidecars = sidecars) {
+  const lifecycle = await createLifecycle(activeContext.getRuntimeConfig);
+  await lifecycle.attachContext(activeContext, activeSidecars.publish);
+  return lifecycle;
+}
+
+function readOwner(activeConfig = config) {
+  return getPreparedModelCatalogOwnerSnapshot({
+    agentId: "main",
+    config: activeConfig,
+    readOnly: true,
+    allowGatewaySubagentBinding: true,
+  });
+}
+
+function installNativeHarness(
+  methods: Pick<AgentHarnessV2, "loadModelCatalog" | "readModelCatalogReadiness">,
+) {
+  const harness: AgentHarnessV2 = {
+    id: "native-test",
+    label: "Synthetic native harness",
+    authBootstrap: "harness",
+    supports: () => ({ supported: true }),
+    runAttempt: vi.fn(),
+    ...methods,
+  };
+  const previousRegistry = captureActivePluginRegistrySnapshot();
+  const registry = createEmptyPluginRegistry();
+  registry.agentHarnesses.push({ pluginId: harness.id, source: "test", harness });
+  setActivePluginRegistry(registry);
+  mocks.loadAgentRuntimePluginRegistryHandle.mockReturnValue(registry);
+  mocks.authStorage.getAll.mockReturnValue({});
+  const authStore = { version: 1, profiles: {} };
+  mocks.preparedAuthStore = authStore;
+  return { previousRegistry, authStore };
+}
+
+function reportAuthBinding(
+  binding: Pick<
+    Parameters<typeof reportEmbeddedRunSuccessfulAuthBinding>[0],
+    "apiKeyInfo" | "attempt" | "modelApi" | "modelBaseUrl"
+  > &
+    Partial<
+      Pick<Parameters<typeof reportEmbeddedRunSuccessfulAuthBinding>[0], "profileId" | "config">
+    >,
+) {
+  const profileStore = mocks.preparedAuthStore;
+  if (!profileStore) {
+    throw new Error("expected unresolved prepared auth store");
+  }
+  reportEmbeddedRunSuccessfulAuthBinding({
+    profileStore,
+    provider: "openai",
+    agentDir: state.agentDir("main"),
+    modelId: "gpt-5.4",
+    requestTransportOverrides: "none",
+    config,
+    agentHarnessId: "codex",
+    pluginHarnessOwnsTransport: true,
+    pluginHarnessOwnsAuthBootstrap: true,
+    ...binding,
+  });
+}
+
 async function publishOwner(ownerConfig: OpenClawConfig = config): Promise<void> {
   await refreshPreparedModelRuntimeSnapshots(ownerConfig, {
     gatewayLifecycle: true,
@@ -136,12 +200,7 @@ async function expectAvailable(
   activeConfig: OpenClawConfig = config,
   activeContext: GatewayRequestContext = context,
 ): Promise<void> {
-  const owner = getPreparedModelCatalogOwnerSnapshot({
-    agentId: "main",
-    config: activeConfig,
-    readOnly: true,
-    allowGatewaySubagentBinding: true,
-  });
+  const owner = readOwner(activeConfig);
   if (!owner) {
     throw new Error("expected prepared model owner");
   }
@@ -190,8 +249,7 @@ async function expectAvailable(
 describe("gateway chat metadata lifecycle composition", () => {
   it("joins superseding owner replacements when an explicit catch-up overlaps publication", async () => {
     await publishOwner();
-    const lifecycle = await createLifecycle();
-    await lifecycle.attachContext(context, sidecars.publish);
+    const lifecycle = await attachLifecycle();
     const entered = createDeferredCore();
     const release = createDeferredCore();
     const successorEntered = createDeferredCore();
@@ -271,22 +329,10 @@ describe("gateway chat metadata lifecycle composition", () => {
       }));
       let ready = initialReady;
       const loadModelCatalog = vi.fn(async () => rows);
-      const harness: AgentHarnessV2 = {
-        id: "native-test",
-        label: "Synthetic native harness",
-        authBootstrap: "harness",
-        supports: () => ({ supported: true }),
-        runAttempt: vi.fn(),
+      const { previousRegistry, authStore } = installNativeHarness({
         loadModelCatalog,
         readModelCatalogReadiness: () => (ready ? { accountType: "apiKey" } : undefined),
-      };
-      const registry = createEmptyPluginRegistry();
-      registry.agentHarnesses.push({ pluginId: "native-test", source: "test", harness });
-      const previousRegistry = captureActivePluginRegistrySnapshot();
-      setActivePluginRegistry(registry);
-      mocks.loadAgentRuntimePluginRegistryHandle.mockReturnValue(registry);
-      mocks.authStorage.getAll.mockReturnValue({});
-      mocks.preparedAuthStore = { version: 1, profiles: {} };
+      });
       mocks.buildPreparedModelCatalogSnapshot.mockResolvedValue({
         entries: rows,
         routeVariants: rows,
@@ -296,12 +342,7 @@ describe("gateway chat metadata lifecycle composition", () => {
         await publishOwner(nativeConfig);
         expect(loadModelCatalog).toHaveBeenCalled();
         loadModelCatalog.mockClear();
-        const owner = getPreparedModelCatalogOwnerSnapshot({
-          agentId: "main",
-          config: nativeConfig,
-          readOnly: true,
-          allowGatewaySubagentBinding: true,
-        });
+        const owner = readOwner(nativeConfig);
         if (!owner) {
           throw new Error("expected prepared native model owner");
         }
@@ -310,7 +351,7 @@ describe("gateway chat metadata lifecycle composition", () => {
           agentId: "main",
           snapshot: owner.modelCatalog,
           metadataSnapshot: owner.metadataSnapshot,
-          preparedAuthStore: mocks.preparedAuthStore,
+          preparedAuthStore: authStore,
           preparedRuntimeAuthModes: owner.authModes,
         });
         const evaluateEntry = projector.evaluateEntry;
@@ -396,13 +437,7 @@ describe("gateway chat metadata lifecycle composition", () => {
         },
       };
       let currentConfig = nativeConfig;
-      const readOwner = () =>
-        getPreparedModelCatalogOwnerSnapshot({
-          agentId: "main",
-          config: currentConfig,
-          readOnly: true,
-          allowGatewaySubagentBinding: true,
-        });
+      const currentOwner = () => readOwner(currentConfig);
       const nativeModel = {
         provider: "openai",
         id: "codex-latest",
@@ -429,27 +464,15 @@ describe("gateway chat metadata lifecycle composition", () => {
           modelId: "codex-latest",
         });
         // Native observations retain their preparation identity across public config stamps.
-        if (scope.config !== readOwner()?.observationConfig) {
+        if (scope.config !== currentOwner()?.observationConfig) {
           return undefined;
         }
         return !disposed && observedRevision === revision ? { accountType: "apiKey" } : undefined;
       });
-      const harness: AgentHarnessV2 = {
-        id: "native-test",
-        label: "Synthetic native harness",
-        authBootstrap: "harness",
-        supports: () => ({ supported: true }),
-        runAttempt: vi.fn(),
+      const { previousRegistry } = installNativeHarness({
         loadModelCatalog,
         readModelCatalogReadiness,
-      };
-      const registry = createEmptyPluginRegistry();
-      registry.agentHarnesses.push({ pluginId: "native-test", source: "test", harness });
-      const previousRegistry = captureActivePluginRegistrySnapshot();
-      setActivePluginRegistry(registry);
-      mocks.loadAgentRuntimePluginRegistryHandle.mockReturnValue(registry);
-      mocks.authStorage.getAll.mockReturnValue({});
-      mocks.preparedAuthStore = { version: 1, profiles: {} };
+      });
       const catalog = { entries: [nativeModel], routeVariants: [nativeModel], authoritative };
       mocks.buildPreparedModelCatalogSnapshot.mockResolvedValue(catalog);
       // Startup discovery builds the same catalog in the worker.
@@ -459,12 +482,11 @@ describe("gateway chat metadata lifecycle composition", () => {
       try {
         await publishOwner(nativeConfig);
         // This fixture tests retained discovery; startup now acquires provider inventory only.
-        await readOwner()?.loadNativeModelCatalog?.();
+        await currentOwner()?.loadNativeModelCatalog?.();
         expect(loadModelCatalog).toHaveBeenCalled();
         loadModelCatalog.mockClear();
         revision += 1;
-        const lifecycle = await createLifecycle(() => currentConfig);
-        await lifecycle.attachContext(nativeContext, sidecars.publish);
+        const lifecycle = await attachLifecycle(nativeContext);
         const expectedModels = (available: boolean) =>
           wildcard && !available
             ? []
@@ -476,7 +498,7 @@ describe("gateway chat metadata lifecycle composition", () => {
                   available,
                 }),
               ];
-        const owner = readOwner();
+        const owner = currentOwner();
         if (!owner) {
           throw new Error("expected prepared native model owner");
         }
@@ -659,7 +681,7 @@ describe("gateway chat metadata lifecycle composition", () => {
                 }),
               ],
             });
-            const replacement = readOwner();
+            const replacement = currentOwner();
             expect(replacement).toBeDefined();
             expect(replacement).not.toBe(owner);
             expect(replacement?.pluginRegistry).toBe(owner.pluginRegistry);
@@ -697,7 +719,7 @@ describe("gateway chat metadata lifecycle composition", () => {
 
         if (invalidate === "stamp") {
           advancePreparedModelRuntimeConfig(currentConfig);
-          const advanced = readOwner();
+          const advanced = currentOwner();
           expect(advanced).not.toBe(owner);
           expect(advanced?.config).toBe(currentConfig);
           expect(advanced?.pluginRegistry).toBe(owner.pluginRegistry);
@@ -739,8 +761,7 @@ describe("gateway chat metadata lifecycle composition", () => {
     async (_, kind, available, rejected) => {
       configureAuthFixture(kind, rejected);
       await publishOwner();
-      const lifecycle = await createLifecycle();
-      await lifecycle.attachContext(context, sidecars.publish);
+      const lifecycle = await attachLifecycle();
 
       await expectAvailable(lifecycle, available);
     },
@@ -818,10 +839,8 @@ describe("gateway chat metadata lifecycle composition", () => {
       ui: { prefs: { chatShowThinking: false } },
     } satisfies OpenClawConfig;
     await publishOwner(publishedConfig);
-    const lifecycle = await createLifecycle(() => currentConfig);
     const currentContext = createCatalogContext(() => currentConfig);
-
-    await lifecycle.attachContext(currentContext, sidecars.publish);
+    const lifecycle = await attachLifecycle(currentContext);
 
     await expect(lifecycle.read({ agentId: "main" })).resolves.toMatchObject({
       models: [
@@ -837,16 +856,9 @@ describe("gateway chat metadata lifecycle composition", () => {
   it("publishes a successful harness auth binding before the next metadata read", async () => {
     configureHarnessOwnedUnresolvedAuth();
     await publishOwner();
-    const lifecycle = await createLifecycle();
-    await lifecycle.attachContext(context, sidecars.publish);
+    const lifecycle = await attachLifecycle();
     await expectAvailable(lifecycle, false);
-    const profileStore = mocks.preparedAuthStore;
-    if (!profileStore) {
-      throw new Error("expected unresolved prepared auth store");
-    }
-
-    reportEmbeddedRunSuccessfulAuthBinding({
-      profileStore,
+    reportAuthBinding({
       apiKeyInfo: null,
       attempt: {
         runtimeArtifact: {
@@ -854,16 +866,8 @@ describe("gateway chat metadata lifecycle composition", () => {
           fingerprint: "codex-runtime-fingerprint",
         },
       } as EmbeddedRunAttemptResult,
-      provider: "openai",
-      agentDir: state.agentDir("main"),
-      modelId: "gpt-5.4",
       modelApi: "openai-chatgpt-responses",
       modelBaseUrl: "https://chatgpt.com/backend-api/codex",
-      requestTransportOverrides: "none",
-      config,
-      agentHarnessId: "codex",
-      pluginHarnessOwnsTransport: true,
-      pluginHarnessOwnsAuthBootstrap: true,
     });
 
     expect(mocks.ensureOpenClawModelsJson).toHaveBeenCalledOnce();
@@ -900,17 +904,10 @@ describe("gateway chat metadata lifecycle composition", () => {
     } as GatewayRequestContext;
     configureAuthFixture("unresolved-secret-ref");
     await publishOwner(orderedConfig);
-    const lifecycle = await createLifecycle(() => orderedConfig);
-    await lifecycle.attachContext(orderedContext, sidecars.publish);
+    const lifecycle = await attachLifecycle(orderedContext);
     await expectAvailable(lifecycle, false, orderedConfig, orderedContext);
-    const profileStore = mocks.preparedAuthStore;
-    if (!profileStore) {
-      throw new Error("expected unresolved prepared auth store");
-    }
-
-    reportEmbeddedRunSuccessfulAuthBinding({
+    reportAuthBinding({
       profileId: "openai:default",
-      profileStore,
       apiKeyInfo: {
         apiKey: "resolved-at-runtime",
         source: "profile:openai:default",
@@ -918,16 +915,9 @@ describe("gateway chat metadata lifecycle composition", () => {
         profileId: "openai:default",
       },
       attempt: {} as EmbeddedRunAttemptResult,
-      provider: "openai",
-      agentDir: state.agentDir("main"),
-      modelId: "gpt-5.4",
       modelApi: "openai-responses",
       modelBaseUrl: "https://api.openai.com/v1",
-      requestTransportOverrides: "none",
       config: orderedConfig,
-      agentHarnessId: "codex",
-      pluginHarnessOwnsTransport: true,
-      pluginHarnessOwnsAuthBootstrap: true,
     });
 
     expect(mocks.preparedAuthMaterializations).toEqual([
@@ -1021,8 +1011,7 @@ describe("gateway chat metadata lifecycle composition", () => {
   });
 
   it("adopts a prepared owner that publishes after attachment", async () => {
-    const lifecycle = await createLifecycle();
-    await lifecycle.attachContext(context, sidecars.publish);
+    const lifecycle = await attachLifecycle();
     await expect(lifecycle.read({ agentId: "main" })).rejects.toThrow(
       'prepared chat metadata is unavailable for agent "main"',
     );

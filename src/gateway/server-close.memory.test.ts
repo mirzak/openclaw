@@ -31,6 +31,7 @@ import type { GatewayServer } from "./server-public.js";
 import { startGatewayServerCore } from "./server-start.js";
 
 async function createFixture(label: string) {
+  const original = captureActivePluginRegistrySnapshot();
   const state = await createOpenClawTestState({
     label,
     layout: "home",
@@ -66,13 +67,63 @@ async function createFixture(label: string) {
     },
   };
   const registry = createGatewayMemoryCloseRegistryFactory(config);
-  return { state, config, registry };
+  const servers: GatewayServer[] = [];
+  return {
+    state,
+    config,
+    registry,
+    async start(
+      memory: ReturnType<typeof registry>,
+      onKernel?: (kernel: Awaited<ReturnType<typeof createGatewayKernel>>) => void,
+    ) {
+      const port = await getFreePort();
+      const auth = { mode: "token" as const, token: "memory-close-token" };
+      await state.writeConfig({
+        ...config,
+        gateway: {
+          auth,
+          port,
+          controlUi: { enabled: false },
+          reload: { mode: "off" },
+        },
+      });
+      setActivePluginRegistry(memory.registry);
+      const create = createGatewayKernel;
+      const factory = vi
+        .spyOn(await import("./server-kernel.js"), "createGatewayKernel")
+        .mockImplementation(async (...args) => {
+          const kernel = await create(...args);
+          onKernel?.(kernel);
+          return kernel;
+        });
+      let server: GatewayServer;
+      try {
+        server = await startGatewayServerCore(port, {
+          auth,
+          bind: "loopback",
+          controlUiEnabled: false,
+          sidecarStartup: "defer",
+        });
+        servers.push(server);
+      } finally {
+        factory.mockRestore();
+      }
+      await server.startupSettled;
+      return server;
+    },
+    async cleanup() {
+      for (const server of servers.toReversed()) {
+        await server.close().catch(() => {});
+      }
+      restoreActivePluginRegistrySnapshot(original);
+      await state.cleanup();
+    },
+  };
 }
 
 it("joins accepted Memory sync through Gateway close before its first publication without reopening its executor", async ({
   signal,
 }) => {
-  const original = captureActivePluginRegistrySnapshot();
   const fixture = await createFixture("gateway-memory-sync-close");
   const embeddingEntered = createDeferredCore();
   const releaseEmbedding = createDeferredCore();
@@ -90,39 +141,11 @@ it("joins accepted Memory sync through Gateway close before its first publicatio
       path.join(fixture.state.workspaceDir, "memory", "shutdown.md"),
       "# Accepted shutdown memory\nKeep the synthetic blue release preference.\n",
     );
-    const port = await getFreePort();
-    const token = "accepted-memory-close-token";
-    await fixture.state.writeConfig({
-      ...fixture.config,
-      gateway: {
-        auth: { mode: "token", token },
-        port,
-        controlUi: { enabled: false },
-        reload: { mode: "off" },
-      },
+    server = await fixture.start(memory, (kernel) => {
+      kernel.scheduler.signal.addEventListener("abort", () => closePreludeEntered.resolve(), {
+        once: true,
+      });
     });
-    setActivePluginRegistry(memory.registry);
-    const create = createGatewayKernel;
-    const factory = vi
-      .spyOn(await import("./server-kernel.js"), "createGatewayKernel")
-      .mockImplementation(async (...args) => {
-        const kernel = await create(...args);
-        kernel.scheduler.signal.addEventListener("abort", () => closePreludeEntered.resolve(), {
-          once: true,
-        });
-        return kernel;
-      });
-    try {
-      server = await startGatewayServerCore(port, {
-        auth: { mode: "token", token },
-        bind: "loopback",
-        controlUiEnabled: false,
-        sidecarStartup: "defer",
-      });
-    } finally {
-      factory.mockRestore();
-    }
-    await server.startupSettled;
     const result = await memory.runtime.getMemorySearchManager({
       cfg: fixture.config,
       agentId: "main",
@@ -132,18 +155,8 @@ it("joins accepted Memory sync through Gateway close before its first publicatio
     await manager.probeEmbeddingAvailability();
     const options = { agentId: "main", env: fixture.state.env };
     const agentPath = resolveOpenClawAgentSqlitePath(options);
-    const agentOpenRequests = () =>
-      messages.mock.calls.filter(([request]) => {
-        const value: unknown = request;
-        return (
-          value !== null &&
-          typeof value === "object" &&
-          "type" in value &&
-          value.type === "open" &&
-          "databasePath" in value &&
-          value.databasePath === agentPath
-        );
-      });
+    const requests = () => messages.mock.calls.map(([request]) => request);
+    const agentOpen = expect.objectContaining({ type: "open", databasePath: agentPath });
     const shared = openOpenClawStateDatabase({ env: fixture.state.env });
     const readLeases = () =>
       shared.db
@@ -155,7 +168,7 @@ it("joins accepted Memory sync through Gateway close before its first publicatio
     });
     const acceptedLeases = readLeases();
     expect(acceptedLeases.length).toBeGreaterThan(0);
-    expect(agentOpenRequests().length).toBeGreaterThan(0);
+    expect(requests()).toContainEqual(agentOpen);
     messages.mockClear();
     let closeRequested = false;
     syncing = manager.sync({
@@ -196,7 +209,7 @@ it("joins accepted Memory sync through Gateway close before its first publicatio
     releaseEmbedding.resolve();
     await syncing;
     await closing;
-    expect(agentOpenRequests().length).toBe(0);
+    expect(requests()).not.toContainEqual(agentOpen);
     expect(shared.db.isOpen).toBe(false);
     const stored = new DatabaseSync(agentPath, { readOnly: true });
     const leases = new DatabaseSync(shared.path, { readOnly: true });
@@ -224,19 +237,16 @@ it("joins accepted Memory sync through Gateway close before its first publicatio
     await server?.close().catch(() => {});
     vi.restoreAllMocks();
     resetGatewayWorkAdmission();
-    restoreActivePluginRegistrySnapshot(original);
-    await fixture.state.cleanup();
+    await fixture.cleanup();
   }
 });
 
 it("drains memory before stalled connection cleanup while preserving terminal close", async ({
   signal,
 }) => {
-  const original = captureActivePluginRegistrySnapshot();
   const fixture = await createFixture("gateway-memory-close-failure");
   const kernels: Awaited<ReturnType<typeof createGatewayKernel>>[] = [];
   const servers: GatewayServer[] = [];
-  const create = createGatewayKernel;
   let refuse = true;
   const memoryFailure = new Error("synthetic memory close refused");
   const completed: string[] = [];
@@ -255,41 +265,12 @@ it("drains memory before stalled connection cleanup while preserving terminal cl
   });
   const first = fixture.registry(firstClose);
   try {
-    {
-      const port = await getFreePort();
-      const token = "memory-close-token";
-      await fixture.state.writeConfig({
-        ...fixture.config,
-        gateway: {
-          auth: { mode: "token", token },
-          port,
-          controlUi: { enabled: false },
-          reload: { mode: "off" },
-        },
-      });
-      setActivePluginRegistry(first.registry);
-      const factory = vi
-        .spyOn(await import("./server-kernel.js"), "createGatewayKernel")
-        .mockImplementation(async (...args) => {
-          const kernel = await create(...args);
-          kernels.push(kernel);
-          return kernel;
-        });
-      let server: GatewayServer;
-      try {
-        server = await startGatewayServerCore(port, {
-          auth: { mode: "token", token },
-          bind: "loopback",
-          controlUiEnabled: false,
-          sidecarStartup: "defer",
-        });
-        servers.push(server);
-      } finally {
-        factory.mockRestore();
-      }
-      await server.startupSettled;
-      expect(kernels[0]!.pluginRuntime.registry).toBe(first.registry);
-    }
+    servers.push(
+      await fixture.start(first, (kernel) => {
+        kernels.push(kernel);
+      }),
+    );
+    expect(kernels[0]!.pluginRuntime.registry).toBe(first.registry);
     const one = await first.runtime.getMemorySearchManager({
       cfg: fixture.config,
       agentId: "main",
@@ -348,16 +329,11 @@ it("drains memory before stalled connection cleanup while preserving terminal cl
     releaseConnectionWork.resolve();
     await connectionWork;
     refuse = false;
-    for (const server of servers.toReversed()) {
-      await server.close().catch(() => {});
-    }
-    restoreActivePluginRegistrySnapshot(original);
-    await fixture.state.cleanup();
+    await fixture.cleanup();
   }
 });
 
 it("closes one managed memory runtime exactly once across repeated owner close calls", async () => {
-  const original = captureActivePluginRegistrySnapshot();
   const fixture = await createFixture("gateway-shared-memory-close");
   const close = vi.fn(async () => {});
   const memory = fixture.registry(close);
@@ -380,7 +356,6 @@ it("closes one managed memory runtime exactly once across repeated owner close c
     expect(memory.instance.lifecycle.signal.aborted).toBe(true);
   } finally {
     await Promise.allSettled([owner.close()]);
-    restoreActivePluginRegistrySnapshot(original);
-    await fixture.state.cleanup();
+    await fixture.cleanup();
   }
 });
