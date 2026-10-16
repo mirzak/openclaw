@@ -15,9 +15,7 @@ afterEach(() => {
 
 function nativeBackgroundFixture(options: Parameters<typeof createDraftFixture>[0] = {}) {
   const postMessage = vi.fn();
-  vi.stubGlobal("webkit", {
-    messageHandlers: { openclawNotifications: { postMessage } },
-  });
+  vi.stubGlobal("webkit", { messageHandlers: { openclawNotifications: { postMessage } } });
   const nativeNotifications = createNativeNotificationsCapability();
   const fixture = createDraftFixture(options);
   Object.assign(fixture.context, { nativeNotifications, basePath: "" });
@@ -89,13 +87,9 @@ describe("DraftSubmissionFlow background completion", () => {
         context.gateway.snapshot.hello!.auth!.recoveryScope = "principal-b";
       }
       action?.();
-      expect(context.gateway.setSessionKey).toHaveBeenCalledTimes(
-        scenario === "same-owner reconnect" ? 1 : 0,
-      );
-      expect(context.agentSelection.set).toHaveBeenCalledTimes(
-        scenario === "same-owner reconnect" ? 1 : 0,
-      );
-      expect(navigate).toHaveBeenCalledTimes(scenario === "same-owner reconnect" ? 1 : 0);
+      for (const effect of [context.gateway.setSessionKey, context.agentSelection.set, navigate]) {
+        expect(effect).toHaveBeenCalledTimes(scenario === "same-owner reconnect" ? 1 : 0);
+      }
     } finally {
       dispose();
     }

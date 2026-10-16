@@ -166,10 +166,7 @@ export function createDraftFixture(options: FixtureOptions = {}) {
   );
   const browser = new DraftPlaceBrowser(
     gateway,
-    () => ({
-      context,
-      isAdmin: place?.isAdmin() ?? false,
-    }),
+    () => ({ context, isAdmin: place?.isAdmin() ?? false }),
     {
       changed: vi.fn(),
       updateComplete: () => Promise.resolve(),

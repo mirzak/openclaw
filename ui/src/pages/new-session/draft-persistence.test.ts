@@ -4,7 +4,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { createChatAttachmentHandoff } from "../../app/chat-attachment-handoff.ts";
 import { canReloadControlUiDocument } from "../../app/document-reload-guard.ts";
-import type { HumanMention } from "../../lib/chat/chat-types.ts";
 import { reviewPrivateComposerDraft } from "../chat/components/private-composer-recovery-dialog.tsx";
 import type { DraftGatewayState } from "./draft-gateway-state.ts";
 import { restoreDraft, retainDraft } from "./draft-navigation-handoff.ts";
@@ -12,20 +11,20 @@ import type { DraftPlaceState } from "./draft-place-state.ts";
 import { createDraftFixture } from "./draft-submission-flow.test-support.ts";
 import { DraftSubmissionFlow } from "./draft-submission-flow.ts";
 
-type StoreReadResult =
-  | {
-      status: "found";
-      draft: {
-        revision: number;
-        text: string;
-        mentions?: readonly HumanMention[];
-        modelSelection?: { agentId: string; model: string; thinkingLevel: string };
-        attachments: unknown[];
-        writeId: string;
-      };
-    }
-  | { status: "not-found"; revision?: number; writeId?: string }
-  | { status: "storage-failed" };
+type StoreReadResult = Awaited<
+  ReturnType<
+    typeof import("../../lib/chat/composer-draft-store.runtime.ts").readDurableComposerDraft
+  >
+>;
+
+function storedDraft(
+  text: string,
+  writeId: string,
+  revision = 7,
+  extra: Partial<Extract<StoreReadResult, { status: "found" }>["draft"]> = {},
+): StoreReadResult {
+  return { status: "found", draft: { revision, text, attachments: [], writeId, ...extra } };
+}
 
 const store = vi.hoisted(() => {
   const pendingReads: Array<(result: unknown) => void> = [];
@@ -78,6 +77,10 @@ vi.mock("../chat/durable-composer-persistence.ts", async (importOriginal) => {
   };
 });
 
+const writeSnapshot = store.writeDurableComposerSnapshot;
+const retireDraft = store.retireDurableComposerDraft;
+const hydrateAttachments = store.hydrateDurableComposerAttachments;
+
 async function resolvePendingRead(result: StoreReadResult) {
   // The read is issued behind the store's lazy import; wait for it to land.
   await vi.waitFor(() => {
@@ -96,13 +99,22 @@ function settle() {
 }
 
 // The gateway/place states are untouched by draft persistence and typing paths.
-function createFlow() {
-  return new DraftSubmissionFlow(
+function createFlow(route?: string, activate = false) {
+  const flow = new DraftSubmissionFlow(
     {} as DraftGatewayState,
     {} as DraftPlaceState,
     () => ({ context: undefined, data: undefined, isConnected: false }),
     { changed: vi.fn(), closeTransientUi: vi.fn() },
   );
+  if (route) {
+    flow.draftPersistence.setOwner("ws://gateway.test", "recovery-a");
+    if (activate) {
+      flow.draftPersistence.activateRoute(route);
+    } else {
+      flow.draftPersistence.selectRoute(route);
+    }
+  }
+  return flow;
 }
 
 afterEach(() => {
@@ -121,18 +133,13 @@ describe("NewSessionDraftPersistence restore race", () => {
       restore: restoreSelection,
       retire: vi.fn(),
     };
-    store.readDurableComposerDraft.mockResolvedValueOnce({
-      status: "found",
-      draft: {
-        revision: 7,
-        text: "@Alex stored draft",
+    store.readDurableComposerDraft.mockResolvedValueOnce(
+      storedDraft("@Alex stored draft", "stored", 7, {
         mentions: [{ profileId: "old-alex", start: 0, end: 5 }],
         modelSelection: { agentId: "main", model: "openai/stored", thinkingLevel: "low" },
-        attachments: [],
-        writeId: "stored",
-      },
-    });
-    store.hydrateDurableComposerAttachments.mockImplementationOnce(() => {
+      }),
+    );
+    hydrateAttachments.mockImplementationOnce(() => {
       hydrationEntered.resolve();
       return hydration.promise;
     });
@@ -173,33 +180,28 @@ describe("NewSessionDraftPersistence restore race", () => {
         flow.draftPersistence.captureSubmission();
       }
       flow.draftPersistence.noteModelSelectionMutation();
-      const saved = {
-        status: "found" as const,
-        draft: { revision: 10, text: "Keep saved content", attachments: [], writeId: "saved" },
-      };
+      const saved = storedDraft("Keep saved content", "saved", 10);
       if (restoration !== "pending") {
         await resolvePendingRead(saved);
         await settle();
         flow.draftPersistence.persistNow();
-        expect(store.writeDurableComposerSnapshot).not.toHaveBeenCalled();
+        expect(writeSnapshot).not.toHaveBeenCalled();
       }
       if (restoration === "read" || restoration === "attachments") {
         if (restoration === "attachments") {
-          store.hydrateDurableComposerAttachments.mockRejectedValueOnce(
-            new Error("Attachment unavailable"),
-          );
+          hydrateAttachments.mockRejectedValueOnce(new Error("Attachment unavailable"));
         }
         await resolvePendingRead(restoration === "read" ? { status: "storage-failed" } : saved);
         await settle();
         flow.draftPersistence.persistNow();
-        expect(store.writeDurableComposerSnapshot).not.toHaveBeenCalled();
+        expect(writeSnapshot).not.toHaveBeenCalled();
         flow.draftPersistence.noteModelSelectionMutation();
       }
       await resolvePendingRead(saved);
       await vi.waitFor(() => expect(flow.message).toBe("Keep saved content"));
       flow.draftPersistence.persistNow();
       await vi.waitFor(() =>
-        expect(store.writeDurableComposerSnapshot).toHaveBeenLastCalledWith(
+        expect(writeSnapshot).toHaveBeenLastCalledWith(
           expect.objectContaining({ text: "Keep saved content", modelSelection: selection }),
         ),
       );
@@ -226,7 +228,7 @@ describe("NewSessionDraftPersistence restore race", () => {
     flow.draftPersistence.noteModelSelectionMutation();
     flow.draftPersistence.persistNow();
     await vi.waitFor(() =>
-      expect(store.writeDurableComposerSnapshot).toHaveBeenLastCalledWith(
+      expect(writeSnapshot).toHaveBeenLastCalledWith(
         expect.objectContaining({
           text: "Still unsent",
           modelSelection: expect.objectContaining({ model: selected }),
@@ -252,31 +254,20 @@ describe("NewSessionDraftPersistence restore race", () => {
   });
 
   it("saves the captured normal draft after retirement settles on another route", async () => {
-    let finishRetirement!: (result: {
-      status: "persisted";
-      revision: number;
-      writeId: string;
-    }) => void;
-    store.retireDurableComposerDraft.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          finishRetirement = resolve;
-        }),
-    );
-    const flow = createFlow();
-    flow.draftPersistence.setOwner("ws://gateway.test", "recovery-a");
-    flow.draftPersistence.selectRoute("original-route");
+    const retirement = createDeferred<{ status: "persisted"; revision: number; writeId: string }>();
+    retireDraft.mockReturnValueOnce(retirement.promise);
+    const flow = createFlow("original-route");
     flow.setVisibility("incognito");
     flow.setMessage("private input becoming an ordinary draft");
     flow.setVisibility("normal");
     flow.draftPersistence.selectRoute("other-route");
     flow.setMessage("other route input");
-    await vi.waitFor(() => expect(finishRetirement).toBeTypeOf("function"));
-    expect(store.writeDurableComposerSnapshot).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(retireDraft).toHaveBeenCalled());
+    expect(writeSnapshot).not.toHaveBeenCalled();
     const revision = Date.now() + 1000;
-    finishRetirement({ status: "persisted", revision, writeId: "retired:original" });
+    retirement.resolve({ status: "persisted", revision, writeId: "retired:original" });
     await settle();
-    expect(store.writeDurableComposerSnapshot).toHaveBeenCalledWith(
+    expect(writeSnapshot).toHaveBeenCalledWith(
       expect.objectContaining({
         scope: expect.objectContaining({ scopeKey: "original-route" }),
         text: "private input becoming an ordinary draft",
@@ -299,12 +290,8 @@ describe("NewSessionDraftPersistence restore race", () => {
         new Promise<{ status: "persisted"; revision: number; writeId: string }>((resolve) => {
           retirements.push(resolve);
         });
-      store.retireDurableComposerDraft
-        .mockImplementationOnce(holdRetirement)
-        .mockImplementationOnce(holdRetirement);
-      const flow = createFlow();
-      flow.draftPersistence.setOwner("ws://gateway.test", "recovery-a");
-      flow.draftPersistence.selectRoute("private-route");
+      retireDraft.mockImplementationOnce(holdRetirement).mockImplementationOnce(holdRetirement);
+      const flow = createFlow("private-route");
       flow.setVisibility("incognito");
       flow.setMessage("must remain private");
       flow.setVisibility("normal");
@@ -322,10 +309,10 @@ describe("NewSessionDraftPersistence restore race", () => {
       finishFirst({ status: "persisted", revision, writeId: "retired:first" });
       await settle();
       // The later retirement is deliberately still pending: CAS cannot fence this interval.
-      expect(store.writeDurableComposerSnapshot).not.toHaveBeenCalled();
+      expect(writeSnapshot).not.toHaveBeenCalled();
       finishSecond({ status: "persisted", revision: revision + 1, writeId: "retired:second" });
       await settle();
-      expect(store.writeDurableComposerSnapshot).not.toHaveBeenCalled();
+      expect(writeSnapshot).not.toHaveBeenCalled();
       expect(flow.visibility).toBe("incognito");
       flow.disconnect();
     },
@@ -352,30 +339,25 @@ describe("NewSessionDraftPersistence restore race", () => {
     }
     expect(target.visibility).toBe("incognito");
     expect(target.message).toBe("private incognito draft");
-    expect(store.writeDurableComposerSnapshot).not.toHaveBeenCalled();
+    expect(writeSnapshot).not.toHaveBeenCalled();
     target.disconnect();
     handoff.dispose();
     expect(canReloadControlUiDocument()).toBe(true);
   });
 
   it.each(["conflict", "late commit"])("reconciles a handed-off edit after %s", async (outcome) => {
-    const source = createFlow();
     const route = "pending-handoff";
-    source.draftPersistence.setOwner("ws://gateway.test", "recovery-a");
-    source.draftPersistence.activateRoute(route);
-    await resolvePendingRead({
-      status: "found",
-      draft: { revision: 7, text: "original", attachments: [], writeId: "original-write" },
-    });
+    const source = createFlow(route, true);
+    await resolvePendingRead(storedDraft("original", "original-write"));
     await settle();
     let finishWrite: (() => void) | undefined;
     if (outcome === "conflict") {
-      store.writeDurableComposerSnapshot.mockResolvedValueOnce({
+      writeSnapshot.mockResolvedValueOnce({
         result: { status: "conflict" },
         payloadUnavailable: false,
       });
     } else {
-      store.writeDurableComposerSnapshot.mockImplementationOnce(
+      writeSnapshot.mockImplementationOnce(
         () =>
           new Promise((resolve) => {
             finishWrite = () =>
@@ -385,33 +367,23 @@ describe("NewSessionDraftPersistence restore race", () => {
     }
     source.setMessage("latest unsent edit");
     const handoff = source.draftPersistence.captureSubmission();
-    const revision = store.writeDurableComposerSnapshot.mock.calls[0]![0].revision;
+    const revision = writeSnapshot.mock.calls[0]![0].revision;
     source.disconnect();
-    const target = createFlow();
+    const target = createFlow(route);
     const persistence = target.draftPersistence;
-    persistence.setOwner("ws://gateway.test", "recovery-a");
-    persistence.selectRoute(route);
     target.restoreMessage("latest unsent edit");
     persistence.adoptHandoff(handoff);
     persistence.activateRoute(route);
     finishWrite?.();
     await settle();
-    await resolvePendingRead({
-      status: "found",
-      draft: {
-        revision: outcome === "conflict" ? 8 : revision + 1,
-        text: "newer stored draft",
-        attachments: [],
-        writeId: "another-tab",
-      },
-    });
+    await resolvePendingRead(
+      storedDraft("newer stored draft", "another-tab", outcome === "conflict" ? 8 : revision + 1),
+    );
     await settle();
     expect(target.message).toBe(
       outcome === "conflict" ? "latest unsent edit" : "newer stored draft",
     );
-    expect(store.writeDurableComposerSnapshot).toHaveBeenCalledTimes(
-      outcome === "conflict" ? 2 : 1,
-    );
+    expect(writeSnapshot).toHaveBeenCalledTimes(outcome === "conflict" ? 2 : 1);
     persistence.disconnect();
   });
 
@@ -429,15 +401,7 @@ describe("NewSessionDraftPersistence restore race", () => {
       fallbacks: {},
     });
     restoreDraft(context, flow, "first-owner", "");
-    await resolvePendingRead({
-      status: "found",
-      draft: {
-        revision: 7,
-        text: "newer stored draft",
-        attachments: [],
-        writeId: "newer-stored",
-      },
-    });
+    await resolvePendingRead(storedDraft("newer stored draft", "newer-stored"));
     await settle();
     expect(flow.message).toBe("newer stored draft");
     flow.disconnect();
@@ -445,26 +409,14 @@ describe("NewSessionDraftPersistence restore race", () => {
   });
 
   it("consumes a handed-off draft sent before its durable restore resolves", async () => {
-    const source = createFlow();
-    source.draftPersistence.setOwner("ws://gateway.test", "recovery-a");
-    source.draftPersistence.activateRoute("handoff-route");
-    const stored: StoreReadResult = {
-      status: "found",
-      draft: {
-        revision: 7,
-        text: "handed-off draft",
-        attachments: [],
-        writeId: "stored-handoff",
-      },
-    };
+    const source = createFlow("handoff-route", true);
+    const stored = storedDraft("handed-off draft", "stored-handoff");
     await resolvePendingRead(stored);
     await settle();
     const handoff = source.draftPersistence.captureSubmission();
     source.disconnect();
-    const target = createFlow();
+    const target = createFlow("handoff-route");
     const persistence = target.draftPersistence;
-    persistence.setOwner("ws://gateway.test", "recovery-a");
-    persistence.selectRoute("handoff-route");
     target.restoreMessage("handed-off draft");
     persistence.adoptHandoff(handoff);
     persistence.activateRoute("handoff-route");
@@ -475,7 +427,7 @@ describe("NewSessionDraftPersistence restore race", () => {
     await resolvePendingRead(stored);
     await clearing;
     expect(target.message).toBe("");
-    expect(store.writeDurableComposerSnapshot.mock.calls.at(-1)?.[0]).toMatchObject({
+    expect(writeSnapshot.mock.calls.at(-1)?.[0]).toMatchObject({
       text: "",
       expectedWriteId: "stored-handoff",
     });
@@ -485,11 +437,9 @@ describe("NewSessionDraftPersistence restore race", () => {
   it.each([false, true])(
     "retires a mutation captured during conflict restore (retry settled: %s)",
     async (settled) => {
-      const flow = createFlow();
+      const flow = createFlow("conflict-route");
       const persistence = flow.draftPersistence;
-      persistence.setOwner("ws://gateway.test", "recovery-a");
-      persistence.selectRoute("conflict-route");
-      store.writeDurableComposerSnapshot.mockResolvedValueOnce({
+      writeSnapshot.mockResolvedValueOnce({
         result: { status: "conflict" },
         payloadUnavailable: false,
       });
@@ -497,50 +447,32 @@ describe("NewSessionDraftPersistence restore race", () => {
       persistence.persistNow();
       await vi.waitFor(() => expect(store.pendingReads).toHaveLength(1));
       const submitted = persistence.captureSubmission();
-      const competing: StoreReadResult = {
-        status: "found",
-        draft: {
-          revision: 7,
-          text: "another draft",
-          attachments: [],
-          writeId: "another-writer",
-        },
-      };
+      const competing = storedDraft("another draft", "another-writer");
       const clearing = settled ? null : persistence.clearSubmittedDraft(submitted);
       await resolvePendingRead(competing);
       await settle();
       if (settled) {
-        expect(store.writeDurableComposerSnapshot).toHaveBeenCalledTimes(2);
-        const retry = store.writeDurableComposerSnapshot.mock.calls[1]![0];
+        expect(writeSnapshot).toHaveBeenCalledTimes(2);
+        const retry = writeSnapshot.mock.calls[1]![0];
         const accepted = persistence.clearSubmittedDraft(submitted);
-        await resolvePendingRead({
-          status: "found",
-          draft: {
-            revision: retry.revision,
-            text: retry.text,
-            attachments: [],
-            writeId: retry.writeId,
-          },
-        });
+        await resolvePendingRead(storedDraft(retry.text, retry.writeId, retry.revision));
         await accepted;
-        expect(store.writeDurableComposerSnapshot.mock.calls.at(-1)?.[0].text).toBe("");
+        expect(writeSnapshot.mock.calls.at(-1)?.[0].text).toBe("");
       } else {
         await resolvePendingRead(competing);
         await clearing;
         await settle();
-        expect(store.writeDurableComposerSnapshot).toHaveBeenCalledTimes(1);
+        expect(writeSnapshot).toHaveBeenCalledTimes(1);
       }
       persistence.disconnect();
     },
   );
 
   it("settles the captured write before retiring an accepted submission", async () => {
-    const flow = createFlow();
+    const flow = createFlow("accepted-route");
     const persistence = flow.draftPersistence;
-    persistence.setOwner("ws://gateway.test", "recovery-a");
-    persistence.selectRoute("accepted-route");
     let finishWrite!: () => void;
-    store.writeDurableComposerSnapshot.mockImplementationOnce(
+    writeSnapshot.mockImplementationOnce(
       () =>
         new Promise((resolve) => {
           finishWrite = () =>
@@ -553,19 +485,11 @@ describe("NewSessionDraftPersistence restore race", () => {
     await settle();
     expect(store.pendingReads).toHaveLength(0);
     finishWrite();
-    const snapshot = store.writeDurableComposerSnapshot.mock
+    const snapshot = writeSnapshot.mock
       .calls[0]![0] as import("../chat/durable-composer-persistence.ts").DurableChatComposerSnapshot;
-    await resolvePendingRead({
-      status: "found",
-      draft: {
-        revision: snapshot.revision,
-        text: "submitted prompt",
-        attachments: [],
-        writeId: snapshot.writeId,
-      },
-    });
+    await resolvePendingRead(storedDraft("submitted prompt", snapshot.writeId, snapshot.revision));
     await clearing;
-    expect(store.writeDurableComposerSnapshot.mock.calls.at(-1)?.[0]).toMatchObject({
+    expect(writeSnapshot.mock.calls.at(-1)?.[0]).toMatchObject({
       scope: { scopeKey: "accepted-route" },
       text: "",
       storedAttachments: [],
@@ -612,7 +536,7 @@ describe("NewSessionDraftPersistence restore race", () => {
         expect(flow.mentions).toEqual(mentions);
       }
       if (state !== "pristine") {
-        const write = store.writeDurableComposerSnapshot.mock.calls.at(-1)?.[0];
+        const write = writeSnapshot.mock.calls.at(-1)?.[0];
         expect(write?.text).toBe(expectedText);
         if (state === "newer text") {
           expect(write?.revision).toBeGreaterThan(7);
@@ -625,9 +549,7 @@ describe("NewSessionDraftPersistence restore race", () => {
   );
 
   it("re-arms restore for the next route once the page resets the draft", async () => {
-    const flow = createFlow();
-    flow.draftPersistence.setOwner("ws://gateway.test", "recovery-a");
-    flow.draftPersistence.activateRoute("agent:route-a");
+    const flow = createFlow("agent:route-a", true);
     await resolvePendingRead({ status: "not-found" });
     await settle();
     flow.setMessage("typed on route a");
@@ -635,10 +557,7 @@ describe("NewSessionDraftPersistence restore race", () => {
     flow.draftPersistence.persistNow();
     flow.resetDraft();
     flow.draftPersistence.activateRoute("agent:route-b");
-    await resolvePendingRead({
-      status: "found",
-      draft: { revision: 9, text: "route b draft", attachments: [], writeId: "w-2" },
-    });
+    await resolvePendingRead(storedDraft("route b draft", "w-2", 9));
     await settle();
     expect(flow.message).toBe("route b draft");
   });

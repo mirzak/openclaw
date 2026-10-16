@@ -15,6 +15,22 @@ const REMOTE_PROJECT = {
   defaultBranch: "main",
 };
 
+function createParams(state: ReturnType<typeof createRepositoryFixture>["state"], message = "") {
+  return buildSelectedSessionCreateParams(state, { message, visibility: "normal" });
+}
+
+function machineProfile(id = "aws", machines = ["standard", "fast"]): DraftCloudProfile {
+  return {
+    id,
+    providerId: "crabbox",
+    machines: machines.map((name, index) => ({
+      id: name,
+      label: name[0]!.toUpperCase() + name.slice(1),
+      ...(index === 0 ? { default: true } : {}),
+    })),
+  };
+}
+
 describe("DraftPlaceState repository selection", () => {
   it.each([
     { source: "registered", redacted: false, current: false, savedWorktree: false },
@@ -73,12 +89,7 @@ describe("DraftPlaceState repository selection", () => {
         f.state.selectWorktree(false);
         expect(f.state.worktree).toBe(true);
       }
-      expect(
-        buildSelectedSessionCreateParams(f.state, {
-          message: "Keep my prompt",
-          visibility: "normal",
-        }),
-      ).toMatchObject({
+      expect(createParams(f.state, "Keep my prompt")).toMatchObject({
         projectId,
         worktree: true,
         message: "Keep my prompt",
@@ -145,8 +156,7 @@ describe("DraftPlaceState repository selection", () => {
       f.state.restorePreferenceSelections();
       expect(f.browser.remoteProject).toBeNull();
       expect(f.state.remoteRepository).toBeUndefined();
-      expect(f.state.baseRef).toBe("");
-      expect(f.state.worktreeName).toBe("");
+      expect(f.state).toMatchObject({ baseRef: "", worktreeName: "" });
       expect(f.persistPreference).toHaveBeenCalledWith("main", "/workspace", {
         baseRef: "",
         worktreeName: "",
@@ -180,8 +190,7 @@ describe("DraftPlaceState repository selection", () => {
     restored.state.restorePreferenceSelections();
 
     expect(restored.browser.remoteProject).toEqual(REMOTE_PROJECT);
-    expect(restored.state.baseRef).toBe("main");
-    expect(restored.state.cloudProfileId).toBe("aws");
+    expect(restored.state).toMatchObject({ baseRef: "main", cloudProfileId: "aws" });
     expect(restored.state.remoteRepository).toEqual({
       url: REMOTE_PROJECT.cloneUrl,
       ref: "main",
@@ -205,8 +214,7 @@ describe("DraftPlaceState repository selection", () => {
     });
     state.adoptAgentDefaults();
     await discovered.promise;
-    const create = () =>
-      buildSelectedSessionCreateParams(state, { message: "new task", visibility: "normal" });
+    const create = () => createParams(state, "new task");
 
     expect(create()).toMatchObject({ worktree: true });
     expect(create()).not.toHaveProperty("worktreeBaseRef");
@@ -240,9 +248,7 @@ describe("DraftPlaceState repository selection", () => {
     await settleModelCatalogRequests(context.gateway.snapshot.client!, { agentId: "main" });
     const view = renderControl(state.modelControl, context, "main", state.selectedAgent());
     expect(state.modelControl.modelForSubmission()).toBe("example/first");
-    expect(
-      buildSelectedSessionCreateParams(state, { message: "", visibility: "normal" }).model,
-    ).toBe("example/first");
+    expect(createParams(state).model).toBe("example/first");
     expect(persistPreference).not.toHaveBeenCalled();
 
     const choice = view.querySelector<HTMLButtonElement>(
@@ -324,8 +330,7 @@ describe("DraftPlaceState repository selection", () => {
         workspaceGit: !explicitFolder,
       });
       const discovery = createDeferred<WorktreesBranchesResult>();
-      const create = () =>
-        buildSelectedSessionCreateParams(state, { message: "Start empty", visibility: "normal" });
+      const create = () => createParams(state, "Start empty");
       if (!explicitFolder) {
         readPreference.mockReturnValue({});
         request.mockReturnValue(discovery.promise);
@@ -385,15 +390,13 @@ describe("DraftPlaceState repository selection", () => {
     });
     state.adoptAgentDefaults();
     state.restorePreferenceSelections();
-    expect(state.freshWorkspace).toBe(true);
-    expect(state.placementPreferenceReady).toBe(true);
+    expect(state).toMatchObject({ freshWorkspace: true, placementPreferenceReady: true });
 
     state.invalidateGatewayDiscovery(false);
     state.adoptAgentDefaults();
     state.restorePreferenceSelections();
     expect(state.repository.kind).toBe("checking");
-    expect(state.freshWorkspace).toBe(true);
-    expect(state.placementPreferenceReady).toBe(true);
+    expect(state).toMatchObject({ freshWorkspace: true, placementPreferenceReady: true });
   });
 
   it.each(["device", "cloud"] as const)(
@@ -416,21 +419,15 @@ describe("DraftPlaceState repository selection", () => {
 
       state.adoptAgentDefaults();
       state.restorePreferenceSelections();
-      expect(state.remotePlacement).toBe(true);
-      expect(state.freshWorkspace).toBe(false);
-      expect(state.worktree).toBe(true);
+      expect(state).toMatchObject({ remotePlacement: true, freshWorkspace: false, worktree: true });
       expect(state.worktreeAvailable()).toBe(false);
-      expect(state.baseRef).toBe("release");
-      expect(state.worktreeName).toBe("saved-task");
+      expect(state).toMatchObject({ baseRef: "release", worktreeName: "saved-task" });
 
       state.selectNewWorkspace();
-      expect(state.freshWorkspace).toBe(true);
-      expect(state.placementPreferenceReady).toBe(true);
+      expect(state).toMatchObject({ freshWorkspace: true, placementPreferenceReady: true });
       discovery.resolve({ repositoryStatus: "git", branches: [], defaultBranch: "main" });
       await vi.waitFor(() => expect(state.repository.kind).toBe("git"));
-      expect(
-        buildSelectedSessionCreateParams(state, { message: "Start empty", visibility: "normal" }),
-      ).toEqual({
+      expect(createParams(state, "Start empty")).toEqual({
         agentId: "main",
         message: "",
         titleSource: "Start empty",
@@ -493,8 +490,7 @@ describe("DraftPlaceState repository selection", () => {
       await vi.waitFor(() =>
         expect(state.repository.kind).toBe(result === "git" ? "git" : "unavailable"),
       );
-      expect(state.baseRef).toBe("my-branch");
-      expect(state.worktreeName).toBe("my-checkout");
+      expect(state).toMatchObject({ baseRef: "my-branch", worktreeName: "my-checkout" });
 
       state.invalidateGatewayDiscovery(false);
       request.mockResolvedValue(git);
@@ -506,8 +502,7 @@ describe("DraftPlaceState repository selection", () => {
       expect(state.baseRef).toBe("my-branch");
       state.applyFolder("/another-repo");
       await vi.waitFor(() => expect(state.repository.kind).toBe("git"));
-      expect(state.baseRef).toBe("");
-      expect(state.worktreeName).toBe("");
+      expect(state).toMatchObject({ baseRef: "", worktreeName: "" });
       expect(persistPreference).toHaveBeenCalledWith("main", "/workspace", {
         baseRef: "",
         worktreeName: "",
@@ -577,10 +572,12 @@ describe("DraftPlaceState repository selection", () => {
 
       state.restorePreferenceSelections();
 
-      expect(state.placementPreferenceReady).toBe(true);
-      expect(state.cloudProfileId).toBe("aws");
-      expect(state.worktree).toBe(true);
-      expect(state.freshWorkspace).toBe(true);
+      expect(state).toMatchObject({
+        placementPreferenceReady: true,
+        cloudProfileId: "aws",
+        worktree: true,
+        freshWorkspace: true,
+      });
       expect(persistPreference).not.toHaveBeenCalled();
     },
   );
@@ -635,9 +632,11 @@ describe("DraftPlaceState repository selection", () => {
       expect(state.worktreeAvailable()).toBe(false);
       await vi.waitFor(() => expect(state.repository.kind).toBe("unavailable"));
       expect(state.worktreeAvailable()).toBe(false);
-      expect(state.worktree).toBe(true);
-      expect(state.checkoutVisible).toBe(true);
-      expect(state.placementPreferenceReady).toBe(true);
+      expect(state).toMatchObject({
+        worktree: true,
+        checkoutVisible: true,
+        placementPreferenceReady: true,
+      });
       expect(state.preferenceSelection().worktree).toBe(true);
       expect(state.folderSubmissionBlocked()).toBe(projectSelected);
       state.selectWorktree(false);
@@ -773,9 +772,7 @@ describe("DraftPlaceState repository selection", () => {
     expect(state.worktree).toBe(false);
     expect(state.checkoutVisible).toBe(false);
     expect(state.preferenceSelection().worktree).toBe(false);
-    expect(
-      buildSelectedSessionCreateParams(state, { message: "notes", visibility: "normal" }),
-    ).not.toHaveProperty("worktree");
+    expect(createParams(state, "notes")).not.toHaveProperty("worktree");
   });
 
   it.each([
@@ -804,9 +801,7 @@ describe("DraftPlaceState repository selection", () => {
 
     expect(state.worktree).toBe(false);
     expect(state.preferenceSelection().worktree).toBe(false);
-    expect(
-      buildSelectedSessionCreateParams(state, { message: "notes", visibility: "normal" }),
-    ).not.toHaveProperty("worktree");
+    expect(createParams(state, "notes")).not.toHaveProperty("worktree");
   });
 
   it("restores a preferred worktree when a remote project awaits cloning", () => {
@@ -815,8 +810,7 @@ describe("DraftPlaceState repository selection", () => {
 
     state.adoptAgentDefaults();
 
-    expect(state.worktree).toBe(true);
-    expect(state.placementPreferenceReady).toBe(true);
+    expect(state).toMatchObject({ worktree: true, placementPreferenceReady: true });
   });
 });
 
@@ -868,24 +862,7 @@ describe("DraftPlaceState cloud machine selection", () => {
   });
 
   it("submits each profile's displayed machine and retains selections per destination", () => {
-    const cloudProfiles: DraftCloudProfile[] = [
-      {
-        id: "aws",
-        providerId: "crabbox",
-        machines: [
-          { id: "standard", label: "Standard", default: true },
-          { id: "fast", label: "Fast" },
-        ],
-      },
-      {
-        id: "hetzner",
-        providerId: "crabbox",
-        machines: [
-          { id: "large", label: "Large", default: true },
-          { id: "beast", label: "Beast" },
-        ],
-      },
-    ];
+    const cloudProfiles = [machineProfile(), machineProfile("hetzner", ["large", "beast"])];
     const { state, changed } = createRepositoryFixture({ cloudProfiles });
 
     state.applyPendingPlacement({ agentId: "main", profileId: "aws" });
@@ -908,16 +885,7 @@ describe("DraftPlaceState cloud machine selection", () => {
   });
 
   it("restores the exact recovered choice instead of retaining a stale draft override", () => {
-    const cloudProfiles: DraftCloudProfile[] = [
-      {
-        id: "aws",
-        providerId: "crabbox",
-        machines: [
-          { id: "standard", label: "Standard", default: true },
-          { id: "fast", label: "Fast" },
-        ],
-      },
-    ];
+    const cloudProfiles = [machineProfile()];
     const { state } = createRepositoryFixture({ cloudProfiles });
 
     state.applyPendingPlacement({ agentId: "main", profileId: "aws", machineClass: "fast" });
@@ -942,17 +910,7 @@ describe("DraftPlaceState cloud machine selection", () => {
       selectedByUser: true,
     },
   ])("$name", ({ executionModes, selectedByUser }) => {
-    const cloudProfiles: DraftCloudProfile[] = [
-      {
-        id: "aws",
-        providerId: "crabbox",
-        executionModes,
-        machines: [
-          { id: "standard", label: "Standard", default: true },
-          { id: "fast", label: "Fast" },
-        ],
-      },
-    ];
+    const cloudProfiles = [{ ...machineProfile(), executionModes }];
     const { state, persistPreference } = createRepositoryFixture({ cloudProfiles });
     const resolveRuntime = vi.spyOn(state.modelControl, "resolveAgentRuntime");
     resolveRuntime.mockReturnValue({
@@ -1042,9 +1000,9 @@ describe("device folder selection", () => {
     expect(f.state.checkoutVisible).toBe(false);
     expect(f.request).not.toHaveBeenCalled();
     expect(f.persistPreference).not.toHaveBeenCalled();
-    expect(
-      buildSelectedSessionCreateParams(f.state, { message: "hello", visibility: "normal" }),
-    ).toMatchObject({ deviceFolder: { deviceId: "desktop", path: "/srv/existing project" } });
+    expect(createParams(f.state, "hello")).toMatchObject({
+      deviceFolder: { deviceId: "desktop", path: "/srv/existing project" },
+    });
     f.state.selectDevice("", true);
     expect(f.state.deviceFolderAvailable).toBe(false);
     expect(f.state.deviceFolder).toBeUndefined();

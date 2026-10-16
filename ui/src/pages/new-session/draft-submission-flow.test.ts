@@ -32,6 +32,27 @@ const REMOTE_PROJECT = {
   identity: "openclaw/openclaw",
   cloneUrl: "https://github.com/openclaw/openclaw.git",
 };
+const remoteAccess = {
+  methods: ["sessions.create", "sessions.dispatch"],
+  scopes: ["operator.admin", "operator.read", "operator.write"],
+};
+const note = {
+  id: "attachment-1",
+  dataUrl: "data:text/plain;base64,SGk=",
+  mimeType: "text/plain",
+  fileName: "note.txt",
+};
+const alex = [{ profileId: "profile-alex", start: 0, end: 5 }];
+
+function createParamsOf(context: ApplicationContext, index = 0) {
+  return vi.mocked(context.sessions.createResult).mock.calls[index]?.[0];
+}
+
+function expectEmptyDraft(flow: ReturnType<typeof createDraftFixture>["flow"]) {
+  expect(flow.message).toBe("");
+  expect(flow.mentions).toEqual([]);
+  expect(flow.attachmentDraft.attachments).toEqual([]);
+}
 
 async function readyChatRoute() {
   queueMicrotask(() => document.dispatchEvent(new Event(CHAT_ROUTE_READY_EVENT)));
@@ -41,10 +62,7 @@ describe("DraftSubmissionFlow", () => {
   it.each(["available", "unavailable before create", "unavailable after create"] as const)(
     "preserves the runtime through Auto placement when recovery storage is %s",
     async (storage) => {
-      const { context, flow, place } = createDraftFixture({
-        methods: ["sessions.create", "sessions.dispatch"],
-        scopes: ["operator.admin", "operator.read", "operator.write"],
-      });
+      const { context, flow, place } = createDraftFixture(remoteAccess);
       place.applyPendingPlacement({ agentId: "main", profileId: "", autoDevice: true });
       place.modelControl.selected = "openai/gpt-5.6-sol";
       place.modelControl.agentRuntime = "codex";
@@ -235,9 +253,7 @@ describe("DraftSubmissionFlow", () => {
       await submission;
 
       expect(consumed).toEqual({ message: "", mentions: [], attachments: [] });
-      expect(flow.message).toBe("");
-      expect(flow.mentions).toEqual([]);
-      expect(flow.attachmentDraft.attachments).toEqual([]);
+      expectEmptyDraft(flow);
       expect(context.sessions.createResult).toHaveBeenCalledOnce();
       expect(navigationsBeforeCleanup).toBe(0);
       expect(context.navigateAndWait).toHaveBeenCalledTimes(next === "navigation" ? 1 : 0);
@@ -272,10 +288,7 @@ describe("DraftSubmissionFlow", () => {
     },
   );
   it("starts a cloud repository with its selected ref without cloning on the Gateway", async () => {
-    const { context, flow, gateway, place, request } = createDraftFixture({
-      methods: ["sessions.create", "sessions.dispatch"],
-      scopes: ["operator.admin", "operator.read", "operator.write"],
-    });
+    const { context, flow, gateway, place, request } = createDraftFixture(remoteAccess);
     vi.spyOn(gateway, "cloudProfiles", "get").mockReturnValue([
       { id: "cloud", providerId: "crabbox", executionModes: ["worker-turn", "remote-exec"] },
     ]);
@@ -297,10 +310,7 @@ describe("DraftSubmissionFlow", () => {
     await flow.submit();
 
     expect(context.sessions.createResult).toHaveBeenCalledOnce();
-    const created = expectDefined(
-      vi.mocked(context.sessions.createResult).mock.calls[0]?.[0],
-      "remote session create request",
-    );
+    const created = expectDefined(createParamsOf(context), "remote session create request");
     expect(created).toMatchObject({
       agentId: "main",
       message: "",
@@ -360,7 +370,7 @@ describe("DraftSubmissionFlow", () => {
       expect.objectContaining({
         agentId: "main",
         message: "@Alex start this in the background",
-        mentions: [{ profileId: "profile-alex", start: 0, end: 5 }],
+        mentions: alex,
       }),
       { reconciliation: "background" },
     );
@@ -378,9 +388,7 @@ describe("DraftSubmissionFlow", () => {
       "agent:main:dashboard:background",
       context.gateway.snapshot.client,
     );
-    expect(retained?.message?.["__openclaw"]).toMatchObject({
-      humanMentions: [{ profileId: "profile-alex", start: 0, end: 5 }],
-    });
+    expect(retained?.message?.["__openclaw"]).toMatchObject({ humanMentions: alex });
     expect(retained?.message?.content).toContainEqual({
       type: "attachment",
       attachment: {
@@ -401,8 +409,7 @@ describe("DraftSubmissionFlow", () => {
       const takePreparedTitle = vi.fn(() => "Original prepared title");
       const { context, flow, place } = createDraftFixture({
         takePreparedTitle,
-        methods: ["sessions.create", "sessions.dispatch"],
-        scopes: ["operator.admin", "operator.read", "operator.write"],
+        ...remoteAccess,
       });
       const original = createDeferred<SessionCreateOutcome>();
       const result = { key: "agent:main:direct-resumed", initialRun: { status: "idle" as const } };
@@ -416,7 +423,7 @@ describe("DraftSubmissionFlow", () => {
 
       const initialSubmission = flow.submit(undefined, background);
       await vi.waitFor(() => expect(context.sessions.createResult).toHaveBeenCalledOnce());
-      const originalParams = vi.mocked(context.sessions.createResult).mock.calls[0]?.[0];
+      const originalParams = createParamsOf(context);
       expect(originalParams).toMatchObject({
         displayName: "Original prepared title",
         mentions: [{ profileId: "profile-original", start: 0, end: 5 }],
@@ -441,7 +448,7 @@ describe("DraftSubmissionFlow", () => {
         { profileId: "profile-original", start: 0, end: 5 },
       ]);
       await vi.waitFor(() => expect(context.sessions.createResult).toHaveBeenCalledTimes(2));
-      expect(vi.mocked(context.sessions.createResult).mock.calls[1]?.[0]).toEqual(originalParams);
+      expect(createParamsOf(context, 1)).toEqual(originalParams);
       expect(flow.pendingPlacement.sessionKey).toBe("");
       original.resolve(result);
       await initialSubmission;
@@ -532,7 +539,7 @@ describe("DraftSubmissionFlow", () => {
         sessionKey: "agent:main:dashboard:recovery",
         messageId: "message-recovery",
         message: "@Alex recovered cloud prompt",
-        mentions: [{ profileId: "profile-alex", start: 0, end: 5 }],
+        mentions: alex,
         attachments: [
           {
             type: "file",
@@ -562,7 +569,7 @@ describe("DraftSubmissionFlow", () => {
     expect(noteUserMutation).not.toHaveBeenCalled();
     expect(changed).toHaveBeenCalledOnce();
     expect(flow.message).toBe("@Alex recovered cloud prompt");
-    expect(flow.mentions).toEqual([{ profileId: "profile-alex", start: 0, end: 5 }]);
+    expect(flow.mentions).toEqual(alex);
     expect(buildChatApiAttachments(flow.attachmentDraft.attachments)).toEqual([
       {
         type: "file",
@@ -635,7 +642,7 @@ describe("DraftSubmissionFlow", () => {
       expect(context.sessions.createResult).not.toHaveBeenCalled();
       return;
     }
-    const createParams = vi.mocked(context.sessions.createResult).mock.calls[0]?.[0];
+    const createParams = createParamsOf(context);
     expect(createParams).toMatchObject({ agentId: "main", message, projectId: "openclaw" });
     expect(createParams?.worktree).toBe(worktree || undefined);
     expect(createParams).not.toHaveProperty("projectGitUrl");
@@ -661,14 +668,7 @@ describe("DraftSubmissionFlow", () => {
       place.selectWorktree(true);
     }
     flow.setMessage(message);
-    flow.attachmentDraft.replace([
-      {
-        id: "attachment-1",
-        dataUrl: "data:text/plain;base64,SGk=",
-        mimeType: "text/plain",
-        fileName: "note.txt",
-      },
-    ]);
+    flow.attachmentDraft.replace([{ ...note }]);
 
     const submitted = flow.submit();
     const duplicate = flow.submit();
@@ -683,9 +683,7 @@ describe("DraftSubmissionFlow", () => {
       { reconciliation: "background" },
     );
     expect(request).not.toHaveBeenCalledWith("projects.add", expect.anything(), expect.anything());
-    expect(vi.mocked(context.sessions.createResult).mock.calls[0]?.[0]?.worktree).toBe(
-      worktree || undefined,
-    );
+    expect(createParamsOf(context)?.worktree).toBe(worktree || undefined);
 
     admission.resolve({ key: "agent:main:remote-project", initialRun: { status: "idle" } });
     await Promise.all([submitted, duplicate]);
@@ -744,8 +742,7 @@ describe("DraftSubmissionFlow", () => {
     let backgroundWaitAttempts = 0;
     const { context, flow, place, request } = createDraftFixture({
       agents: [{ id: "cloud", workspace: "/workspace", workspaceGit: true }],
-      scopes: ["operator.admin", "operator.read", "operator.write"],
-      methods: ["sessions.create", "sessions.dispatch"],
+      ...remoteAccess,
       request: async (method) => {
         if (method === "worktrees.branches") {
           return { repositoryStatus: "git", branches: [] };
@@ -779,9 +776,7 @@ describe("DraftSubmissionFlow", () => {
       hasPendingTurn: vi.fn(() => startupPending),
     });
     await context.router.navigate("chat", context);
-    flow.setMessage("@Alex keep this cloud task", [
-      { profileId: "profile-alex", start: 0, end: 5 },
-    ]);
+    flow.setMessage("@Alex keep this cloud task", alex);
     const apiAttachments = [{ fileName: "note.txt", content: "SGk=" }];
     const createParams = buildDraftSessionCreateParams({
       agentId: "cloud",
@@ -794,7 +789,7 @@ describe("DraftSubmissionFlow", () => {
       agentId: "cloud",
       target: { kind: "profile", profileId: "aws" },
       message: "@Alex keep this cloud task",
-      mentions: [{ profileId: "profile-alex", start: 0, end: 5 }],
+      mentions: alex,
       attachments: apiAttachments,
       gatewayUrl: "ws://gateway.example",
       recoveryScope: "principal-a",
@@ -802,14 +797,7 @@ describe("DraftSubmissionFlow", () => {
     });
     flow.pendingPlacement.retryAllowed = true;
     place.applyPendingPlacement({ agentId: "cloud", profileId: "aws", cwd: "/workspace" });
-    flow.attachmentDraft.replace([
-      {
-        id: "attachment-1",
-        dataUrl: "data:text/plain;base64,SGk=",
-        mimeType: "text/plain",
-        fileName: "note.txt",
-      },
-    ]);
+    flow.attachmentDraft.replace([{ ...note }]);
 
     if (background) {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -839,7 +827,7 @@ describe("DraftSubmissionFlow", () => {
     expect(start).toHaveBeenCalledOnce();
     expect(start.mock.calls[0]?.[0].recovery).toMatchObject({
       message: "@Alex keep this cloud task",
-      mentions: [{ profileId: "profile-alex", start: 0, end: 5 }],
+      mentions: alex,
       attachments: apiAttachments,
       phase: "dispatching",
     });
@@ -849,9 +837,7 @@ describe("DraftSubmissionFlow", () => {
       type: "text",
       text: "@Alex keep this cloud task",
     });
-    expect(flow.message).toBe("");
-    expect(flow.mentions).toEqual([]);
-    expect(flow.attachmentDraft.attachments).toHaveLength(0);
+    expectEmptyDraft(flow);
     expect(flow.error).toBe(navigationError);
     expect(flow.submitting).toBe(false);
     expect(createResult).toHaveBeenCalledOnce();
@@ -861,10 +847,7 @@ describe("DraftSubmissionFlow", () => {
       expect(flow.message).toBe("");
       expect(request).toHaveBeenCalledWith(
         "agent.wait",
-        {
-          runId: start.mock.calls[0]?.[0].recovery.messageId,
-          timeoutMs: 30_000,
-        },
+        { runId: start.mock.calls[0]?.[0].recovery.messageId, timeoutMs: 30_000 },
         { timeoutMs: null },
       );
       expect(request.mock.calls.filter(([method]) => method === "agent.wait")).toHaveLength(4);

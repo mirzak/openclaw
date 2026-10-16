@@ -16,6 +16,18 @@ afterEach(() => {
   localStorage.clear();
 });
 
+async function prepareTitle(fixture: ReturnType<typeof createDraftTitleFixture>, message?: string) {
+  if (message !== undefined) {
+    fixture.flow.setMessage(message);
+  }
+  fixture.synchronizeTitles();
+  await vi.advanceTimersByTimeAsync(1_000);
+}
+
+function createdParams(context: ReturnType<typeof createDraftTitleFixture>["context"]) {
+  return vi.mocked(context.sessions.createResult).mock.calls[0]?.[0];
+}
+
 function accountTitleFixture(preview?: Promise<ModelCatalogResult>) {
   const makeAccount = (id: string): UserModelAccount => ({
     authProfileId: `personal:person-a:test:${id}`,
@@ -89,74 +101,51 @@ function accountTitleFixture(preview?: Promise<ModelCatalogResult>) {
 }
 
 describe("prepared title creation handoff", () => {
-  it.each(["before update"])(
-    "keeps a %s title handoff on the selected draft account",
-    async (handoff) => {
-      const fixture = accountTitleFixture();
-      const { accounts, context, flow, place, synchronizeTitles, titleRequest, chooseAccount } =
-        fixture;
-      try {
-        titleRequest
-          .mockResolvedValueOnce({ title: "Automatic title" })
-          .mockResolvedValueOnce({ title: "First account title" })
-          .mockResolvedValueOnce({ title: "Second account title" });
-        flow.setMessage("repair the sidebar naming");
-        synchronizeTitles();
-        await vi.advanceTimersByTimeAsync(1_000);
-        expect(titleRequest).toHaveBeenCalledOnce();
+  it("keeps a title handoff on the selected draft account before update", async () => {
+    const fixture = accountTitleFixture();
+    const { accounts, context, flow, place, titleRequest, chooseAccount } = fixture;
+    try {
+      titleRequest
+        .mockResolvedValueOnce({ title: "Automatic title" })
+        .mockResolvedValueOnce({ title: "First account title" })
+        .mockResolvedValueOnce({ title: "Second account title" });
+      await prepareTitle(fixture, "repair the sidebar naming");
+      expect(titleRequest).toHaveBeenCalledOnce();
 
-        for (const [index, account] of accounts.entries()) {
-          await chooseAccount(account);
-          if (index === 1 && handoff === "before update") {
-            break;
-          }
-          synchronizeTitles();
-          await vi.advanceTimersByTimeAsync(1_000);
-          expect(titleRequest).toHaveBeenLastCalledWith({
-            agentId: "main",
-            message: flow.message,
-            model: `test/primary@${account.authProfileId}`,
-          });
+      for (const [index, account] of accounts.entries()) {
+        await chooseAccount(account);
+        if (index === 1) {
+          break;
         }
-        expect(place.modelControl.selected).toBe("");
-        await flow.submit();
-        expect(context.sessions.createResult).toHaveBeenCalledWith(
-          expect.objectContaining({
-            model: `test/primary@${accounts[1].authProfileId}`,
-          }),
-          { reconciliation: "background" },
-        );
-        const createParams = vi.mocked(context.sessions.createResult).mock.calls[0]?.[0];
-        if (handoff === "ready") {
-          expect(createParams).toHaveProperty("displayName", "Second account title");
-        } else {
-          expect(createParams).not.toHaveProperty("displayName");
-        }
-      } finally {
-        fixture.dispose();
+        await prepareTitle(fixture);
+        expect(titleRequest).toHaveBeenLastCalledWith({
+          agentId: "main",
+          message: flow.message,
+          model: `test/primary@${account.authProfileId}`,
+        });
       }
-    },
-  );
+      expect(place.modelControl.selected).toBe("");
+      await flow.submit();
+      expect(context.sessions.createResult).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: `test/primary@${accounts[1].authProfileId}`,
+        }),
+        { reconciliation: "background" },
+      );
+      expect(createdParams(context)).not.toHaveProperty("displayName");
+    } finally {
+      fixture.dispose();
+    }
+  });
 
   it.each(["pending", "unconfirmed", "different provider"])(
     "pauses personal title inference for a %s preview without disabling ordinary naming",
     async (outcome) => {
       const preview = createDeferred<ModelCatalogResult>();
       const fixture = accountTitleFixture(preview.promise);
-      const {
-        accounts,
-        confirmed,
-        flow,
-        titles,
-        synchronizeTitles,
-        titleRequest,
-        chooseAccount,
-        select,
-      } = fixture;
+      const { accounts, confirmed, titles, titleRequest, chooseAccount, select } = fixture;
       try {
-        flow.setMessage("repair the sidebar naming");
-        synchronizeTitles();
-        await vi.advanceTimersByTimeAsync(1_000);
+        await prepareTitle(fixture, "repair the sidebar naming");
         expect(titleRequest).toHaveBeenCalledOnce();
         await chooseAccount(accounts[0]);
         if (outcome !== "pending") {
@@ -178,14 +167,12 @@ describe("prepared title creation handoff", () => {
           });
           await vi.advanceTimersByTimeAsync(0);
         }
-        synchronizeTitles();
-        await vi.advanceTimersByTimeAsync(1_000);
+        await prepareTitle(fixture);
         expect(titles.takePreparedTitle()).toBeUndefined();
         expect(titleRequest).toHaveBeenCalledOnce();
 
         select("automatic");
-        synchronizeTitles();
-        await vi.advanceTimersByTimeAsync(1_000);
+        await prepareTitle(fixture);
         expect(titleRequest).toHaveBeenCalledTimes(2);
         expect(titles.takePreparedTitle()).toBe("Prepared title");
       } finally {
@@ -196,14 +183,13 @@ describe("prepared title creation handoff", () => {
   );
 
   it("uses a ready title at creation without changing an explicit worktree name", async () => {
-    const { flow, context, place, synchronizeTitles } = createDraftTitleFixture();
+    const fixture = createDraftTitleFixture();
+    const { flow, context, place } = fixture;
     await vi.advanceTimersByTimeAsync(0);
     expect(place.worktreeAvailable()).toBe(true);
     place.selectWorktree(true);
     place.setWorktreeName("my-explicit-branch");
-    flow.setMessage("repair the sidebar naming");
-    synchronizeTitles();
-    await vi.advanceTimersByTimeAsync(1_000);
+    await prepareTitle(fixture, "repair the sidebar naming");
     expect(flow.submitBlock()).toBeUndefined();
     await flow.submit();
     expect(context.sessions.createResult).toHaveBeenCalledWith(
@@ -213,32 +199,23 @@ describe("prepared title creation handoff", () => {
   });
 
   it("sends immediately while preparation is pending and ignores its late result", async () => {
-    let finish!: (value: unknown) => void;
-    const pending = new Promise((resolve) => {
-      finish = resolve;
-    });
-    const { flow, context, titles, synchronizeTitles } = createDraftTitleFixture(
-      async () => pending,
-    );
-    flow.setMessage("repair the sidebar naming");
-    synchronizeTitles();
-    await vi.advanceTimersByTimeAsync(1_000);
+    const pending = createDeferred<unknown>();
+    const fixture = createDraftTitleFixture(async () => pending.promise);
+    const { flow, context, titles } = fixture;
+    await prepareTitle(fixture, "repair the sidebar naming");
     expect(flow.submitBlock()).toBeUndefined();
     await flow.submit();
     expect(context.sessions.createResult).toHaveBeenCalledOnce();
-    expect(vi.mocked(context.sessions.createResult).mock.calls[0]?.[0]).not.toHaveProperty(
-      "displayName",
-    );
-    finish({ title: "Too late" });
+    expect(createdParams(context)).not.toHaveProperty("displayName");
+    pending.resolve({ title: "Too late" });
     await vi.advanceTimersByTimeAsync(0);
     expect(titles.takePreparedTitle()).toBeUndefined();
   });
 
   it("never sends an incognito draft and discards an earlier normal suggestion", async () => {
-    const { flow, request, context, synchronizeTitles } = createDraftTitleFixture();
-    flow.setMessage("repair the sidebar naming");
-    synchronizeTitles();
-    await vi.advanceTimersByTimeAsync(1_000);
+    const fixture = createDraftTitleFixture();
+    const { flow, request, context, synchronizeTitles } = fixture;
+    await prepareTitle(fixture, "repair the sidebar naming");
     flow.setVisibility("incognito");
     synchronizeTitles();
     await vi.advanceTimersByTimeAsync(2_000);
@@ -247,38 +224,29 @@ describe("prepared title creation handoff", () => {
     expect(
       request.mock.calls.filter(([method]) => method === "sessions.title.prepare"),
     ).toHaveLength(1);
-    expect(vi.mocked(context.sessions.createResult).mock.calls[0]?.[0]).toMatchObject({
-      incognito: true,
-    });
-    expect(vi.mocked(context.sessions.createResult).mock.calls[0]?.[0]).not.toHaveProperty(
-      "displayName",
-    );
+    expect(createdParams(context)).toMatchObject({ incognito: true });
+    expect(createdParams(context)).not.toHaveProperty("displayName");
   });
 
   it("does not restart speculation when a submitted draft is retried", async () => {
-    const { flow, request, synchronizeTitles } = createDraftTitleFixture();
-    flow.setMessage("repair the sidebar naming");
-    synchronizeTitles();
-    await vi.advanceTimersByTimeAsync(1_000);
+    const fixture = createDraftTitleFixture();
+    const { flow, request } = fixture;
+    await prepareTitle(fixture, "repair the sidebar naming");
     await flow.submit();
     await flow.submit();
-    synchronizeTitles();
-    await vi.advanceTimersByTimeAsync(1_000);
+    await prepareTitle(fixture);
     expect(
       request.mock.calls.filter(([method]) => method === "sessions.title.prepare"),
     ).toHaveLength(1);
   });
 
   it("rejects a stale title even when Send beats the next UI update", async () => {
-    const { flow, context, synchronizeTitles } = createDraftTitleFixture();
-    flow.setMessage("repair the sidebar naming");
-    synchronizeTitles();
-    await vi.advanceTimersByTimeAsync(1_000);
+    const fixture = createDraftTitleFixture();
+    const { flow, context } = fixture;
+    await prepareTitle(fixture, "repair the sidebar naming");
     flow.setMessage("investigate a different reconnect bug");
     expect(flow.submitBlock()).toBeUndefined();
     await flow.submit();
-    expect(vi.mocked(context.sessions.createResult).mock.calls[0]?.[0]).not.toHaveProperty(
-      "displayName",
-    );
+    expect(createdParams(context)).not.toHaveProperty("displayName");
   });
 });
