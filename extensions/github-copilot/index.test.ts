@@ -285,28 +285,33 @@ describe("github-copilot plugin", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("returns only credentials from runtime auth and sends identity through stream wrappers", async () => {
+  it("keeps configured headers in runtime auth and sends identity through stream wrappers", async () => {
     const provider = registerProviderWithPluginConfig({});
     mocks.resolveCopilotRuntimeAuth.mockResolvedValue({
       apiKey: "github-source-token",
       baseUrl: "https://api.individual.githubcopilot.com",
     });
-
-    // Runtime auth output is sealed and registered as a secret, so identity
-    // values returned there would be masked wherever redaction runs.
-    await expect(
+    const prepare = (headers?: Record<string, string>) =>
       provider.prepareRuntimeAuth({
         config: {},
         env: {},
         provider: "github-copilot",
         modelId: "gpt-5.4-mini",
-        model: { id: "gpt-5.4-mini", provider: "github-copilot" },
+        model: { id: "gpt-5.4-mini", provider: "github-copilot", headers },
         apiKey: "github-source-token",
         authMode: "token",
-      } as never),
-    ).resolves.toEqual({
+      } as never);
+
+    // Runtime auth output is sealed and registered for redaction: configured
+    // headers stay there, while public identity values must not.
+    await expect(prepare()).resolves.toEqual({
       apiKey: "github-source-token",
       baseUrl: "https://api.individual.githubcopilot.com",
+    });
+    await expect(prepare({ "X-Opaque": "inline-header-credential" })).resolves.toEqual({
+      apiKey: "github-source-token",
+      baseUrl: "https://api.individual.githubcopilot.com",
+      request: { headers: { "X-Opaque": "inline-header-credential" } },
     });
 
     const streamFn = vi.fn();

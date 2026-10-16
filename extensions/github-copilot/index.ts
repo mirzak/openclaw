@@ -629,9 +629,13 @@ export default definePluginEntry({
             config: ctx.config,
           }),
         });
+        // Runtime auth output is sealed and registered for redaction. Configured
+        // headers may hold credentials, so they keep that protection; public
+        // identity headers come from the stream wrappers instead.
         return {
           apiKey: auth.apiKey,
           baseUrl: auth.baseUrl,
+          ...(ctx.model.headers ? { request: { headers: ctx.model.headers } } : {}),
         };
       },
       resolveUsageAuth: async (ctx) => await ctx.resolveOAuthToken(),
