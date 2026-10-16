@@ -7,16 +7,13 @@ import {
   createTestGatewayScheduler,
 } from "../test-utils/gateway-scheduler-clock.js";
 import type { ControlUiSessionPullRequests } from "./control-ui-contract.js";
-import { parseControlUiSessionPullRequestsSubscribeParams } from "./control-ui-session-pr-subscriptions.js";
+import { parseControlUiSessionPullRequestsSubscribeParams as parse } from "./control-ui-session-pr-subscriptions.js";
 import { createTestControlUiSessionPrSubscriptions } from "./control-ui-session-pr-subscriptions.test-support.js";
 import type { ControlUiSessionPullRequestsParams } from "./control-ui-session-prs.js";
 
 const CHANGED_EVENT = "controlUi.sessionPullRequests.changed";
 
-const READY: ControlUiSessionPullRequests = {
-  pullRequests: [],
-  rateLimited: false,
-};
+const READY: ControlUiSessionPullRequests = { pullRequests: [], rateLimited: false };
 
 let running: ReturnType<typeof createTestControlUiSessionPrSubscriptions> | undefined;
 let broadcastToConnIds: ReturnType<typeof vi.fn>;
@@ -54,6 +51,20 @@ function publication(connId: string, key = "session", rateLimited = false) {
     },
     new Set([connId]),
     { sessionKeys: [key], agentId: "main" },
+  ] as const;
+}
+
+function expectPublication(connId: string, key = "session", rateLimited = false) {
+  expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(
+    ...publication(connId, key, rateLimited),
+  );
+}
+
+function loadArgs(sessionKey: string, refresh?: true) {
+  return [
+    { sessionKey, agentId: "main", ...(refresh ? { refresh } : {}) },
+    expect.any(AbortSignal),
+    expect.objectContaining({ assertCurrent: expect.any(Function) }),
   ] as const;
 }
 
@@ -130,29 +141,14 @@ describe("control UI session PR subscriptions", () => {
   );
 
   it("bounds retained subscription keys", () => {
+    const params = { sessionKeys: ["watched"], refreshSessionKeys: ["watched"] };
     expect(
-      parseControlUiSessionPullRequestsSubscribeParams({
-        sessionKeys: Array.from({ length: 201 }, (_value, index) => `session-${index}`),
-      }),
+      parse({ sessionKeys: Array.from({ length: 201 }, (_, i) => `session-${i}`) }),
     ).toBeNull();
-    expect(
-      parseControlUiSessionPullRequestsSubscribeParams({ sessionKeys: ["x".repeat(513)] }),
-    ).toBeNull();
-    expect(
-      parseControlUiSessionPullRequestsSubscribeParams({ sessionKeys: ["x".repeat(512)] }),
-    ).not.toBeNull();
-    expect(
-      parseControlUiSessionPullRequestsSubscribeParams({
-        sessionKeys: ["watched"],
-        refreshSessionKeys: ["watched"],
-      }),
-    ).toEqual({ sessionKeys: ["watched"], refreshSessionKeys: ["watched"] });
-    expect(
-      parseControlUiSessionPullRequestsSubscribeParams({
-        sessionKeys: ["watched"],
-        refreshSessionKeys: ["other"],
-      }),
-    ).toBeNull();
+    expect(parse({ sessionKeys: ["x".repeat(513)] })).toBeNull();
+    expect(parse({ sessionKeys: ["x".repeat(512)] })).not.toBeNull();
+    expect(parse(params)).toEqual({ sessionKeys: ["watched"], refreshSessionKeys: ["watched"] });
+    expect(parse({ ...params, refreshSessionKeys: ["other"] })).toBeNull();
   });
 
   it("polls the watched union once per wake, including after sleep", async () => {
@@ -193,15 +189,11 @@ describe("control UI session PR subscriptions", () => {
     revision++;
     await active.pollNow();
 
-    expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(
-      ...publication("conn-a", "shared", true),
-    );
+    expectPublication("conn-a", "shared", true);
     broadcastToConnIds.mockClear();
     revision = 0;
     await active.pollNow();
-    expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(
-      ...publication("conn-a", "shared", false),
-    );
+    expectPublication("conn-a", "shared");
   });
 
   it("shares the four-load limit across connections, hydration, and polling", async () => {
@@ -266,9 +258,7 @@ describe("control UI session PR subscriptions", () => {
     fresh.resolve(READY);
     await Promise.all([initial, forced, current]);
 
-    expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(
-      ...publication("new", "session", false),
-    );
+    expectPublication("new");
   });
 
   it("loads agent-scoped global watch keys from the owning agent store", async () => {
@@ -306,29 +296,16 @@ describe("control UI session PR subscriptions", () => {
     ];
     await active.replace("first", ["shared", "independent"], new Set(["independent"]));
     await clock.advanceBy(9_999);
-    expect(load).toHaveBeenCalledExactlyOnceWith(
-      { sessionKey: "independent", agentId: "main", refresh: true },
-      expect.any(AbortSignal),
-      expect.objectContaining({ assertCurrent: expect.any(Function) }),
-    );
+    expect(load).toHaveBeenCalledExactlyOnceWith(...loadArgs("independent", true));
     broadcastToConnIds.mockClear();
 
     await clock.advanceBy(1);
     await Promise.all(queued);
 
     expect(load).toHaveBeenCalledTimes(2);
-    expect(load).toHaveBeenLastCalledWith(
-      { sessionKey: "shared", agentId: "main", refresh: true },
-      expect.any(AbortSignal),
-      expect.objectContaining({ assertCurrent: expect.any(Function) }),
-    );
+    expect(load).toHaveBeenLastCalledWith(...loadArgs("shared", true));
     expect(broadcastToConnIds.mock.calls).toEqual(
-      ["first", "second"].map((connId) => [
-        CHANGED_EVENT,
-        { sessions: { shared: { ...READY, status: "ready" } } },
-        new Set([connId]),
-        { sessionKeys: ["shared"], agentId: "main" },
-      ]),
+      ["first", "second"].map((connId) => publication(connId, "shared")),
     );
   });
 
@@ -440,31 +417,36 @@ describe("control UI session PR subscriptions", () => {
     },
   );
 
-  it.each(["poll", "refresh"])(
-    "keeps a pending %s current when a replacement retains its watched key",
+  it.each(["poll", "refresh", "handoff"])(
+    "keeps a pending result current through a %s membership change",
     async (kind) => {
       vi.useFakeTimers();
       const pending = createDeferred<ControlUiSessionPullRequests>();
       const load = vi
         .fn()
         .mockResolvedValueOnce(READY)
-        .mockImplementationOnce(() => pending.promise)
-        .mockResolvedValue(READY);
+        .mockImplementationOnce(() => pending.promise);
+      if (kind !== "handoff") {
+        load.mockResolvedValue(READY);
+      }
       const active = start({ load });
       await active.replace("conn-a", ["session"]);
       const pendingLoad =
-        kind === "poll"
-          ? active.pollNow()
-          : active.replace("conn-a", ["session"], new Set(["session"]));
+        kind === "refresh"
+          ? active.replace("conn-a", ["session"], new Set(["session"]))
+          : active.pollNow();
       await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(2));
-      await active.replace("conn-a", ["session", "other"]);
+      if (kind === "handoff") {
+        await active.replace("conn-b", ["session"]);
+        active.unsubscribe("conn-a");
+      } else {
+        await active.replace("conn-a", ["session", "other"]);
+      }
       broadcastToConnIds.mockClear();
       pending.resolve({ ...READY, rateLimited: true });
       await pendingLoad;
 
-      expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(
-        ...publication("conn-a", "session", true),
-      );
+      expectPublication(kind === "handoff" ? "conn-b" : "conn-a", "session", true);
     },
   );
 
@@ -483,28 +465,6 @@ describe("control UI session PR subscriptions", () => {
     expect(broadcastToConnIds).not.toHaveBeenCalled();
   });
 
-  it("keeps a pending poll current through a cached watcher handoff", async () => {
-    vi.useFakeTimers();
-    const pending = createDeferred<ControlUiSessionPullRequests>();
-    const load = vi
-      .fn()
-      .mockResolvedValueOnce(READY)
-      .mockImplementationOnce(() => pending.promise);
-    const active = start({ load });
-    await active.replace("conn-a", ["session"]);
-    const poll = active.pollNow();
-    await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(2));
-    await active.replace("conn-b", ["session"]);
-    active.unsubscribe("conn-a");
-    broadcastToConnIds.mockClear();
-    pending.resolve({ ...READY, rateLimited: true });
-    await poll;
-
-    expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(
-      ...publication("conn-b", "session", true),
-    );
-  });
-
   it("does not publish a superseded replace-set after its load completes", async () => {
     vi.useFakeTimers();
     const { promise: first, resolve: resolveFirst } =
@@ -515,13 +475,7 @@ describe("control UI session PR subscriptions", () => {
     const active = start({ load });
 
     const oldReplace = active.replace("conn-a", ["old", "current"]);
-    await vi.waitFor(() =>
-      expect(load).toHaveBeenCalledWith(
-        { sessionKey: "old", agentId: "main" },
-        expect.any(AbortSignal),
-        expect.objectContaining({ assertCurrent: expect.any(Function) }),
-      ),
-    );
+    await vi.waitFor(() => expect(load).toHaveBeenCalledWith(...loadArgs("old")));
     await active.replace("conn-a", ["current"]);
     resolveFirst(READY);
     await oldReplace;
@@ -558,9 +512,7 @@ describe("control UI session PR subscriptions", () => {
     await oldReplace;
 
     expect(load).toHaveBeenCalledTimes(5);
-    expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(
-      ...publication("conn-a", "shared", false),
-    );
+    expectPublication("conn-a", "shared");
   });
 
   it("propagates rate-limit and failure states per key", async () => {

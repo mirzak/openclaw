@@ -54,6 +54,10 @@ export type Load = NonNullable<
   Parameters<typeof createControlUiSessionPullRequestSubscriptions>[0]["load"]
 >;
 
+function authority(access = new AbortController()) {
+  return { signal: access.signal, assertCurrent: () => access.signal.throwIfAborted() };
+}
+
 let fixtureSequence = 0;
 
 export async function createFixture(
@@ -69,19 +73,9 @@ export async function createFixture(
   const other = ensureProfileForEmail(`publication-owner-${fixtureId}@example.test`);
   const seeded = new Set<string>();
   const sessionId = `${sessionKey}-${fixtureId}`;
+  const readerRole = { agents: ["main"], sessions: { others: "view" as const }, scopes: [scope] };
   const cfg: OpenClawConfig = {
-    gateway: {
-      roles: {
-        default: "reader",
-        definitions: {
-          reader: {
-            agents: ["main"],
-            sessions: { others: "view" },
-            scopes: [scope],
-          },
-        },
-      },
-    },
+    gateway: { roles: { default: "reader", definitions: { reader: readerRole } } },
   };
   setUserProfileRole(profile.id, "reader");
   setRuntimeConfigSnapshot(cfg);
@@ -114,10 +108,7 @@ export async function createFixture(
     const access = new AbortController();
     client.internal = {
       ...client.internal,
-      operatorAccessAuthority: {
-        signal: access.signal,
-        assertCurrent: () => access.signal.throwIfAborted(),
-      },
+      operatorAccessAuthority: authority(access),
     };
     client.authenticatedUserProfile = {
       profileId: profile.id,
@@ -186,13 +177,9 @@ export async function createFixture(
       } else if (change === "grant") {
         reader.access.abort(new Error("Original access retired"));
       } else if (change === "replacement grant") {
-        const replacement = new AbortController();
         reader.client.internal = {
           ...reader.client.internal,
-          operatorAccessAuthority: {
-            signal: replacement.signal,
-            assertCurrent: () => replacement.signal.throwIfAborted(),
-          },
+          operatorAccessAuthority: authority(),
         };
       }
     },
@@ -210,12 +197,7 @@ export async function createFixture(
     async subscribe(keys = [sessionKey], client = reader.client) {
       const respond = vi.fn();
       await handleGatewayRequest({
-        req: {
-          type: "req",
-          id: "guest-publication-watch",
-          method: METHOD,
-          params: { sessionKeys: keys },
-        },
+        req: { type: "req", id: "watch", method: METHOD, params: { sessionKeys: keys } },
         client,
         context,
         isWebchatConnect: () => false,

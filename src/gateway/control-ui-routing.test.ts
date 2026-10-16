@@ -24,72 +24,72 @@ describe("isControlUiApprovalDocumentPath", () => {
   });
 });
 
+const mountedChat = { basePath: "/openclaw", pathname: "/openclaw/chat", method: "HEAD" };
+type Route = Partial<Parameters<typeof classifyControlUiRequest>[0]>;
+
 describe("Control UI SPA fallback Accept routing", () => {
-  it.each<[string, string, string, string, string | undefined, boolean]>([
-    ["missing Accept header", "", "/chat", "GET", undefined, true],
-    ["plugin tab slug at root", "", "/reports", "GET", "text/html", true],
-    ["empty Accept header", "/openclaw", "/openclaw/chat", "HEAD", "  ", true],
+  it.each<[string, string | undefined, boolean, Route?]>([
+    ["missing Accept header", undefined, true],
+    ["plugin tab slug at root", "text/html", true, { pathname: "/reports" }],
+    ["empty Accept header", "  ", true, mountedChat],
     [
       "browser Accept header",
-      "",
-      "/chat",
-      "GET",
       "text/html, application/xhtml+xml;q=0.9, application/xml;q=0.8",
       true,
     ],
     [
       "nonzero text wildcard under a base path",
-      "/openclaw",
-      "/openclaw/chat",
-      "HEAD",
       "application/json, text/*;q=0.5",
       true,
+      mountedChat,
     ],
-    ["zero-quality text wildcard rejection", "", "/chat", "GET", "text/*;q=0", false],
-    ["zero-quality HTML rejection", "", "/chat", "GET", "text/html;q=0", false],
-    [
-      "specific HTML rejection overrides an accepting wildcard",
-      "",
-      "/chat",
-      "GET",
-      "text/html;q=0, */*",
-      false,
-    ],
-    ...[
-      { accept: "text/html;q=0, text/*;charset=utf-8", expected: false },
-      { accept: "text/html;charset=utf-8;q=0, text/html;q=1", expected: false },
-      { accept: "text/html;q=0;charset=utf-8, */*", expected: false },
-      { accept: "text/html;q=1;charset=utf-16, */*;q=0", expected: false },
-      { accept: "text/html;profile=other;q=0, */*", expected: true },
-      { accept: 'text/html;note="a,b;c", */*', expected: true },
-      { accept: "application/xhtml+xml", expected: true },
-    ].map(({ accept, expected }): [string, string, string, string, string, boolean] => [
+    ["zero-quality text wildcard rejection", "text/*;q=0", false],
+    ["zero-quality HTML rejection", "text/html;q=0", false],
+    ["specific HTML rejection overrides an accepting wildcard", "text/html;q=0, */*", false],
+    ...(
+      [
+        ["text/html;q=0, text/*;charset=utf-8", false],
+        ["text/html;charset=utf-8;q=0, text/html;q=1", false],
+        ["text/html;q=0;charset=utf-8, */*", false],
+        ["text/html;q=1;charset=utf-16, */*;q=0", false],
+        ["text/html;profile=other;q=0, */*", true],
+        ['text/html;note="a,b;c", */*', true],
+        ["application/xhtml+xml", true],
+      ] satisfies [string, boolean][]
+    ).map(([accept, expected]): [string, string, boolean, Route] => [
       `representation precedence: ${accept}`,
-      "/openclaw",
-      "/openclaw/chat",
-      "HEAD",
       accept,
       expected,
+      mountedChat,
     ]),
-    ["nonzero HTML quality", "", "/chat", "GET", "text/html;q=0.5", true],
-    ["mixed-case zero-quality parameter", "", "/chat", "GET", "text/html; Q = 0", false],
-    ["trailing-dot zero quality", "", "/chat", "GET", "text/html; q=0.", false],
+    ["nonzero HTML quality", "text/html;q=0.5", true],
+    ["mixed-case zero-quality parameter", "text/html; Q = 0", false],
+    ["trailing-dot zero quality", "text/html; q=0.", false],
     [
       "mixed-case XHTML three-decimal rejection",
-      "/openclaw",
-      "/openclaw/chat",
-      "HEAD",
       "application/json, Application/XHTML+XML ; q=0.000",
       false,
+      mountedChat,
     ],
-    ["zero-quality wildcard rejection", "", "/chat", "GET", "application/json, */*;q=0", false],
-    ["JSON-only Accept header", "", "/chat", "GET", "application/json", false],
-    ["plugin manager recovery at root", "", "/settings/plugins", "GET", "application/json", true],
-  ])("classifies %s", (_name, basePath, pathname, method, accept, expected) => {
-    expect(classifyControlUiRequest({ basePath, pathname, search: "", method, accept })).toEqual({
-      kind: "serve",
-      spaFallback: expected,
-    });
+    ["zero-quality wildcard rejection", "application/json, */*;q=0", false],
+    ["JSON-only Accept header", "application/json", false],
+    [
+      "plugin manager recovery at root",
+      "application/json",
+      true,
+      { pathname: "/settings/plugins" },
+    ],
+  ])("classifies %s", (_name, accept, expected, route) => {
+    expect(
+      classifyControlUiRequest({
+        basePath: "",
+        pathname: "/chat",
+        search: "",
+        method: "GET",
+        accept,
+        ...route,
+      }),
+    ).toEqual({ kind: "serve", spaFallback: expected });
   });
 });
 
@@ -148,34 +148,16 @@ describe("classifyControlUiRequest", () => {
 
   describe("plugin catalogue documents vs plugin HTTP", () => {
     it.each([
-      {
-        name: "serves HTML GET for the catalogue root slash",
-        pathname: "/plugins/",
-        method: "GET",
-        accept: "text/html",
-        expected: serve,
-      },
-      {
-        name: "JSON catalogue reads outside the SPA",
-        pathname: "/plugins",
-        method: "GET",
-        accept: "application/json",
-        expected: outside,
-      },
-      {
-        name: "JSON catalogue slash reads outside the SPA",
-        pathname: "/plugins/",
-        method: "GET",
-        accept: "application/json",
-        expected: outside,
-      },
-    ])("$name", ({ pathname, method, accept, expected }) => {
+      ["HTML catalogue root slash", "/plugins/", "text/html", serve],
+      ["JSON catalogue", "/plugins", "application/json", outside],
+      ["JSON catalogue slash", "/plugins/", "application/json", outside],
+    ] as const)("%s", (_name, pathname, accept, expected) => {
       expect(
         classifyControlUiRequest({
           basePath: "",
           pathname,
           search: "",
-          method,
+          method: "GET",
           accept,
         }),
       ).toEqual(expected);
