@@ -63,6 +63,20 @@ async function fixture() {
   };
 }
 
+function backupReply(record: Awaited<ReturnType<typeof fixture>>["record"]) {
+  return { ok: true, type: "backup.runs", sourceAdmitted: true, runs: [record] };
+}
+
+function dropListingIndex(databasePath: string) {
+  const { DatabaseSync } = requireNodeSqlite();
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.exec("DROP INDEX idx_plugin_state_listing");
+  } finally {
+    db.close();
+  }
+}
+
 async function withoutHostSql(run: () => Promise<void>) {
   requireNodeSqlite();
   const sql = observeMainThreadSql();
@@ -159,23 +173,12 @@ it.each(["fresh", "cached", "artifact"] as const)(
         openOpenClawStateDatabase(options);
       }
       await withoutHostSql(async () => {
-        expect(await read()).toEqual({
-          ok: true,
-          type: "backup.runs",
-          sourceAdmitted: true,
-          runs: [record],
-        });
+        expect(await read()).toEqual(backupReply(record));
       });
       await closeOpenClawStateDatabaseAsync();
       renameSync(options.path, `${options.path}.previous`);
       copyFileSync(`${options.path}.previous`, options.path);
-      const { DatabaseSync } = requireNodeSqlite();
-      const external = new DatabaseSync(options.path);
-      try {
-        external.exec("DROP INDEX idx_plugin_state_listing");
-      } finally {
-        external.close();
-      }
+      dropListingIndex(options.path);
       await withoutHostSql(async () => {
         await expect(read()).rejects.toThrow(/idx_plugin_state_listing|schema/i);
       });
@@ -209,12 +212,7 @@ it("refuses fixed-read custody of a restricted cached handle outside its scope",
   expect(database.db.isOpen).toBe(true);
   await closeOpenClawStateDatabaseAsync();
   await withoutHostSql(async () => {
-    expect(await read()).toEqual({
-      ok: true,
-      type: "backup.runs",
-      sourceAdmitted: true,
-      runs: [record],
-    });
+    expect(await read()).toEqual(backupReply(record));
   });
 });
 
@@ -234,13 +232,7 @@ it("rejects detached fixed reads after their existing-schema scope ends", async 
 it("validates existing runtime shape before a fresh native read callback", async () => {
   const { options } = await fixture();
   withExistingOpenClawStateSchema(options, () => {
-    const { DatabaseSync } = requireNodeSqlite();
-    const external = new DatabaseSync(options.path);
-    try {
-      external.exec("DROP INDEX idx_plugin_state_listing");
-    } finally {
-      external.close();
-    }
+    dropListingIndex(options.path);
     const read = vi.fn(() => "must not run");
     expect(() => withExistingOpenClawStateDatabaseReadOnly(read, options)).toThrow(
       /idx_plugin_state_listing|schema/i,

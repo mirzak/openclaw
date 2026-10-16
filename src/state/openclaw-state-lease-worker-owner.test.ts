@@ -17,11 +17,28 @@ const forbiddenSqlite = vi.hoisted(() =>
 );
 vi.mock("../infra/node-sqlite.js", () => ({ openNodeSqliteDatabase: forbiddenSqlite }));
 
-afterEach(() => {
+const fixtures: ReturnType<typeof fixture>[] = [];
+afterEach(async () => {
+  try {
+    for (const { owner, settled, uncertain } of fixtures.splice(0)) {
+      settled.resolve({ kind: "completed" });
+      try {
+        if (uncertain) {
+          await owner.settle();
+        } else {
+          await owner.drain();
+        }
+      } finally {
+        owner.close();
+      }
+    }
+  } finally {
+    vi.restoreAllMocks();
+  }
   expect(forbiddenSqlite).not.toHaveBeenCalled();
 });
 
-function fixture() {
+function fixture(uncertain = false) {
   const databasePath = "/synthetic-state/lease.sqlite";
   const lease: OpenClawStateLeaseContext = {
     signal: new AbortController().signal,
@@ -34,7 +51,15 @@ function fixture() {
     databasePath,
     assertCurrent: () => lease.assertOwned(),
   });
-  return { lease, owner, databasePath };
+  const result = {
+    uncertain,
+    lease,
+    owner,
+    databasePath,
+    settled: createDeferredCore<SqliteWorkerOperationSettlement>(),
+  };
+  fixtures.push(result);
+  return result;
 }
 
 async function nextMessageTurn(): Promise<void> {
@@ -60,7 +85,7 @@ describe("state lease worker result boundary", () => {
     "beforeCommit expiry",
   ] as const)("keeps caller authority and expiry live through commit (%s)", async (withdrawAt) => {
     const f = fixture();
-    const settled = createDeferredCore<SqliteWorkerOperationSettlement>();
+    const { settled } = f;
     const expiresDuringCommit = withdrawAt === "beforeCommit expiry";
     const expiresDuringTransaction = withdrawAt === "beforeTransaction expiry";
     const replacesTransactionGuard = withdrawAt === "beforeTransaction replacement";
@@ -97,168 +122,137 @@ describe("state lease worker result boundary", () => {
         authority.beforeTransaction = replacement;
       };
     }
-    try {
-      await withOpenClawStateLeaseWorkerAdmission(
-        f.lease,
-        f.databasePath,
-        async (scope) => {
-          const { admission } = scope.createAdmission({ settled: settled.promise });
-          scope.assertCurrent();
-          expect(beforeTransaction).not.toHaveBeenCalled();
-          expect(beforeCommit).not.toHaveBeenCalled();
-          const request = (stage: "transaction" | "commit") => {
-            const decision = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
-            admission.port.postMessage(
-              {
-                stage,
-                facts: {
-                  kind: "state-lease",
-                  identity: scope.identity,
-                  expiresAt: Date.now() + 30_000,
-                },
-                decision: decision.buffer,
+    await withOpenClawStateLeaseWorkerAdmission(
+      f.lease,
+      f.databasePath,
+      async (scope) => {
+        const { admission } = scope.createAdmission({ settled: settled.promise });
+        scope.assertCurrent();
+        expect(beforeTransaction).not.toHaveBeenCalled();
+        expect(beforeCommit).not.toHaveBeenCalled();
+        const request = (stage: "transaction" | "commit") => {
+          const decision = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+          admission.port.postMessage(
+            {
+              stage,
+              facts: {
+                kind: "state-lease",
+                identity: scope.identity,
+                expiresAt: Date.now() + 30_000,
               },
-              [],
-            );
-            admission.service();
-            return Atomics.load(decision, 0);
-          };
-          try {
-            current = withdrawAt !== "transaction";
-            expect(request("transaction")).toBe(
-              current && !expiresDuringTransaction && !replacesTransactionGuard ? 1 : 2,
-            );
-            expect(beforeCommit).not.toHaveBeenCalled();
-            if (!current) {
-              expect(admission.failure).toBe(withdrawn);
-              return;
-            }
-            expect(beforeTransaction).toHaveBeenCalledOnce();
-            if (replacesTransactionGuard) {
-              expect(admission.failure).toBe(withdrawn);
-              return;
-            }
-            if (expiresDuringTransaction) {
-              expect(admission.failure).toMatchObject({ code: "OPENCLAW_STATE_LEASE_LOST" });
-              return;
-            }
-            // One bounded mutation can verify its lease before several statements.
-            expect(request("transaction")).toBe(1);
-            expect(beforeTransaction).toHaveBeenCalledOnce();
-            current = withdrawAt !== "commit";
-            expect(request("commit")).toBe(current && !expiresDuringCommit ? 1 : 2);
-            if (current) {
-              expect(beforeCommit).toHaveBeenCalledOnce();
-              if (expiresDuringCommit) {
-                expect(admission.failure).toMatchObject({ code: "OPENCLAW_STATE_LEASE_LOST" });
-              }
-              // Acknowledgement remains deliverable after the commit grant.
-              current = false;
-            } else {
-              expect(beforeCommit).not.toHaveBeenCalled();
-              expect(admission.failure).toBe(withdrawn);
-            }
-          } finally {
-            admission.finish();
-            settled.resolve({ kind: "completed" });
+              decision: decision.buffer,
+            },
+            [],
+          );
+          admission.service();
+          return Atomics.load(decision, 0);
+        };
+        try {
+          current = withdrawAt !== "transaction";
+          expect(request("transaction")).toBe(
+            current && !expiresDuringTransaction && !replacesTransactionGuard ? 1 : 2,
+          );
+          expect(beforeCommit).not.toHaveBeenCalled();
+          if (!current) {
+            expect(admission.failure).toBe(withdrawn);
+            return;
           }
-        },
-        authority,
-      );
-    } finally {
-      clock?.mockRestore();
-      settled.resolve({ kind: "completed" });
-      await f.owner.drain();
-      f.owner.close();
-    }
+          expect(beforeTransaction).toHaveBeenCalledOnce();
+          if (replacesTransactionGuard) {
+            expect(admission.failure).toBe(withdrawn);
+            return;
+          }
+          if (expiresDuringTransaction) {
+            expect(admission.failure).toMatchObject({ code: "OPENCLAW_STATE_LEASE_LOST" });
+            return;
+          }
+          // One bounded mutation can verify its lease before several statements.
+          expect(request("transaction")).toBe(1);
+          expect(beforeTransaction).toHaveBeenCalledOnce();
+          current = withdrawAt !== "commit";
+          expect(request("commit")).toBe(current && !expiresDuringCommit ? 1 : 2);
+          if (current) {
+            expect(beforeCommit).toHaveBeenCalledOnce();
+            if (expiresDuringCommit) {
+              expect(admission.failure).toMatchObject({ code: "OPENCLAW_STATE_LEASE_LOST" });
+            }
+            // Acknowledgement remains deliverable after the commit grant.
+            current = false;
+          } else {
+            expect(beforeCommit).not.toHaveBeenCalled();
+            expect(admission.failure).toBe(withdrawn);
+          }
+        } finally {
+          admission.finish();
+          settled.resolve({ kind: "completed" });
+        }
+      },
+      authority,
+    );
   });
 
   it.each(["reject", "handled failure"] as const)(
     "reports unknown settlement before a caller observes %s",
     async (completion) => {
-      const f = fixture();
-      const settled = createDeferredCore<SqliteWorkerOperationSettlement>();
+      const f = fixture(true);
+      const { settled } = f;
       const settlementError = new Error("Synthetic command settlement is unknown");
       const commandError = new Error("Synthetic command delivery failed");
-      const observer = vi.fn<(kind: "success" | "failure", value: unknown) => void>();
       const nextOperation = vi.fn(async () => "continued");
-      try {
-        const operation = withOpenClawStateLeaseWorkerAdmission(
-          f.lease,
-          f.databasePath,
-          async (scope) => {
-            const { admission } = scope.createAdmission({ settled: settled.promise });
-            try {
-              // The broker publishes native settlement before delivering the command result.
-              settled.resolve({ kind: "unknown", error: settlementError });
-              if (completion === "handled failure") {
-                await Promise.reject(commandError).catch(() => undefined);
-                return "handled";
-              }
-              throw commandError;
-            } finally {
-              admission.finish();
+      const operation = withOpenClawStateLeaseWorkerAdmission(
+        f.lease,
+        f.databasePath,
+        async (scope) => {
+          const { admission } = scope.createAdmission({ settled: settled.promise });
+          try {
+            // The broker publishes native settlement before delivering the command result.
+            settled.resolve({ kind: "unknown", error: settlementError });
+            if (completion === "handled failure") {
+              await Promise.reject(commandError).catch(() => undefined);
+              return "handled";
             }
-          },
-        );
-        const observed = await operation.then(
-          (value) => {
-            observer("success", value);
-            return { ok: true as const, value };
-          },
-          (error: unknown) => {
-            observer("failure", error);
-            return { ok: false as const, error };
-          },
-        );
-
-        expect(observed).toMatchObject({ ok: false, error: { code: "outcome-unknown" } });
-        expect(observer).toHaveBeenCalledExactlyOnceWith(
-          "failure",
-          expect.objectContaining({ code: "outcome-unknown" }),
-        );
-        const error = observed.ok ? undefined : observed.error;
-        const causes = collectNestedErrorCandidates(error);
-        expect(causes).toContain(settlementError);
-        if (completion === "reject") {
-          expect(causes).toContain(commandError);
-        }
-        expect(f.owner.canRelease()).toBe(false);
-        await expect(
-          Promise.resolve().then(() =>
-            withOpenClawStateLeaseWorkerAdmission(f.lease, f.databasePath, nextOperation),
-          ),
-        ).rejects.toMatchObject({ code: "outcome-unknown" });
-        expect(nextOperation).not.toHaveBeenCalled();
-
-        const authorityError = new OpenClawStateLeaseError("Synthetic lease authority was lost", {
-          code: "OPENCLAW_STATE_LEASE_LOST",
-        });
-        let combined: unknown;
-        try {
-          f.owner.rethrowIfUncertain(error, authorityError);
-        } catch (failure) {
-          combined = failure;
-        }
-        expect(combined).toMatchObject({
-          code: "outcome-unknown",
-          cause: expect.any(AggregateError),
-        });
-        const combinedCauses = collectNestedErrorCandidates(combined);
-        expect(combinedCauses).toContain(error);
-        expect(combinedCauses).toContain(settlementError);
-        expect(combinedCauses).toContain(authorityError);
-        if (completion === "reject") {
-          expect(combinedCauses).toContain(commandError);
-        }
-      } finally {
-        settled.resolve({ kind: "completed" });
-        try {
-          await expect(f.owner.drain()).rejects.toMatchObject({ code: "outcome-unknown" });
-        } finally {
-          f.owner.close();
-        }
+            throw commandError;
+          } finally {
+            admission.finish();
+          }
+        },
+      );
+      const error: unknown = await operation.catch((failure: unknown) => failure);
+      expect(error).toMatchObject({ code: "outcome-unknown" });
+      const causes = collectNestedErrorCandidates(error);
+      expect(causes).toContain(settlementError);
+      if (completion === "reject") {
+        expect(causes).toContain(commandError);
       }
+      expect(f.owner.canRelease()).toBe(false);
+      await expect(
+        Promise.resolve().then(() =>
+          withOpenClawStateLeaseWorkerAdmission(f.lease, f.databasePath, nextOperation),
+        ),
+      ).rejects.toMatchObject({ code: "outcome-unknown" });
+      expect(nextOperation).not.toHaveBeenCalled();
+
+      const authorityError = new OpenClawStateLeaseError("Synthetic lease authority was lost", {
+        code: "OPENCLAW_STATE_LEASE_LOST",
+      });
+      let combined: unknown;
+      try {
+        f.owner.rethrowIfUncertain(error, authorityError);
+      } catch (failure) {
+        combined = failure;
+      }
+      expect(combined).toMatchObject({
+        code: "outcome-unknown",
+        cause: expect.any(AggregateError),
+      });
+      const combinedCauses = collectNestedErrorCandidates(combined);
+      expect(combinedCauses).toContain(error);
+      expect(combinedCauses).toContain(settlementError);
+      expect(combinedCauses).toContain(authorityError);
+      if (completion === "reject") {
+        expect(combinedCauses).toContain(commandError);
+      }
+      await expect(f.owner.drain()).rejects.toMatchObject({ code: "outcome-unknown" });
     },
   );
 
@@ -266,80 +260,62 @@ describe("state lease worker result boundary", () => {
     "preserves the exact original failure for %s settlement",
     async (kind) => {
       const f = fixture();
-      const settled = createDeferredCore<SqliteWorkerOperationSettlement>();
+      const { settled } = f;
       const commandError = new Error("Synthetic known command failure");
       const nextOperation = vi.fn(async () => "continued");
-      try {
-        const operation = withOpenClawStateLeaseWorkerAdmission(
-          f.lease,
-          f.databasePath,
-          async (scope) => {
-            const { admission } = scope.createAdmission({ settled: settled.promise });
-            try {
-              settled.resolve(kind === "completed" ? { kind } : { kind, error: commandError });
-              throw commandError;
-            } finally {
-              admission.finish();
-            }
-          },
-        );
-        await expect(operation).rejects.toBe(commandError);
-        expect(f.owner.canRelease()).toBe(true);
-        await expect(
-          withOpenClawStateLeaseWorkerAdmission(f.lease, f.databasePath, nextOperation),
-        ).resolves.toBe("continued");
-        expect(nextOperation).toHaveBeenCalledOnce();
-      } finally {
-        settled.resolve({ kind: "completed" });
-        try {
-          await f.owner.drain();
-        } finally {
-          f.owner.close();
-        }
-      }
+      const operation = withOpenClawStateLeaseWorkerAdmission(
+        f.lease,
+        f.databasePath,
+        async (scope) => {
+          const { admission } = scope.createAdmission({ settled: settled.promise });
+          try {
+            settled.resolve(kind === "completed" ? { kind } : { kind, error: commandError });
+            throw commandError;
+          } finally {
+            admission.finish();
+          }
+        },
+      );
+      await expect(operation).rejects.toBe(commandError);
+      expect(f.owner.canRelease()).toBe(true);
+      await expect(
+        withOpenClawStateLeaseWorkerAdmission(f.lease, f.databasePath, nextOperation),
+      ).resolves.toBe("continued");
+      expect(nextOperation).toHaveBeenCalledOnce();
     },
   );
 
   it("joins retained settlement after the callback completes and closes further admission", async () => {
     const f = fixture();
-    const settled = createDeferredCore<SqliteWorkerOperationSettlement>();
+    const { settled } = f;
     const nextOperation = vi.fn(async () => "continued");
-    try {
-      await expect(
-        withOpenClawStateLeaseWorkerAdmission(f.lease, f.databasePath, async (scope) => {
-          const { admission } = scope.createAdmission({ settled: settled.promise });
-          try {
-            return "completed callback";
-          } finally {
-            admission.finish();
-          }
-        }),
-      ).resolves.toBe("completed callback");
-      expect(f.owner.canRelease()).toBe(false);
-      let drained = false;
-      const drain = f.owner.drain().then(() => {
-        drained = true;
-      });
-      // An event-loop turn flushes promise continuations without timing a native operation.
-      await nextMessageTurn();
-      expect(drained).toBe(false);
-      await expect(
-        Promise.resolve().then(() =>
-          withOpenClawStateLeaseWorkerAdmission(f.lease, f.databasePath, nextOperation),
-        ),
-      ).rejects.toThrow();
-      expect(nextOperation).not.toHaveBeenCalled();
-      settled.resolve({ kind: "completed" });
-      await drain;
-      expect(drained).toBe(true);
-      expect(f.owner.canRelease()).toBe(true);
-    } finally {
-      settled.resolve({ kind: "completed" });
-      try {
-        await f.owner.drain();
-      } finally {
-        f.owner.close();
-      }
-    }
+    await expect(
+      withOpenClawStateLeaseWorkerAdmission(f.lease, f.databasePath, async (scope) => {
+        const { admission } = scope.createAdmission({ settled: settled.promise });
+        try {
+          return "completed callback";
+        } finally {
+          admission.finish();
+        }
+      }),
+    ).resolves.toBe("completed callback");
+    expect(f.owner.canRelease()).toBe(false);
+    let drained = false;
+    const drain = f.owner.drain().then(() => {
+      drained = true;
+    });
+    // An event-loop turn flushes promise continuations without timing a native operation.
+    await nextMessageTurn();
+    expect(drained).toBe(false);
+    await expect(
+      Promise.resolve().then(() =>
+        withOpenClawStateLeaseWorkerAdmission(f.lease, f.databasePath, nextOperation),
+      ),
+    ).rejects.toThrow();
+    expect(nextOperation).not.toHaveBeenCalled();
+    settled.resolve({ kind: "completed" });
+    await drain;
+    expect(drained).toBe(true);
+    expect(f.owner.canRelease()).toBe(true);
   });
 });

@@ -109,14 +109,7 @@ it.each(["siblings", "nested"] as const)(
 
 it("settles its agent resource before closing the associated native handle", async () => {
   await withOpenClawTestState({ label: "maintenance-resource-order" }, async (state) => {
-    const lock = await acquireGatewayLock({
-      env: state.env,
-      role: "sqlite-maintenance",
-      allowInTests: true,
-    });
-    if (!lock) {
-      throw new Error("Expected maintenance lock");
-    }
+    const lock = await beginCaptureMaintenance("Gateway lock", state.env);
     const observed: boolean[] = [];
     try {
       const owned = lock.run(() => {
@@ -145,14 +138,7 @@ it("settles its agent resource before closing the associated native handle", asy
 it("closes its created agent handle while preserving earlier and later runtime handles", async () => {
   await withOpenClawTestState({ label: "maintenance-native-resources" }, async (state) => {
     const earlier = openOpenClawAgentDatabase({ agentId: "earlier", env: state.env });
-    const lock = await acquireGatewayLock({
-      env: state.env,
-      role: "sqlite-maintenance",
-      allowInTests: true,
-    });
-    if (!lock) {
-      throw new Error("Expected maintenance lock");
-    }
+    const lock = await beginCaptureMaintenance("Gateway lock", state.env);
     try {
       const owned = lock.run(() => openOpenClawAgentDatabase({ agentId: "owned", env: state.env }));
       await lock.release();
@@ -244,9 +230,8 @@ it.each(["Doctor", "Gateway lock"] as const)(
             await writing;
 
             await captureWsEventAsync(frame("outside-after", "outside after"), outsideSettings);
-            const reader = await acquireDebugProxyCaptureStoreAsync({ env: state.env });
-            try {
-              const sessions = await reader.store.listSessions();
+            await withCaptureReader(state.env, async (store) => {
+              const sessions = await store.listSessions();
               expect(
                 sessions.find((session) => session.id === ownedSettings.sessionId),
               ).toMatchObject({
@@ -259,7 +244,7 @@ it.each(["Doctor", "Gateway lock"] as const)(
                 endedAt: null,
                 eventCount: 2,
               });
-              const ownedEvents = await reader.store.getSessionEvents(ownedSettings.sessionId);
+              const ownedEvents = await store.getSessionEvents(ownedSettings.sessionId);
               expect(ownedEvents).toEqual([
                 expect.objectContaining({ flowId: "owned", dataText: "owned capture bytes" }),
               ]);
@@ -267,18 +252,16 @@ it.each(["Doctor", "Gateway lock"] as const)(
               if (typeof blobId !== "string") {
                 throw new Error("Expected captured payload blob");
               }
-              expect(await reader.store.readBlob(blobId)).toBe("owned capture bytes");
+              expect(await store.readBlob(blobId)).toBe("owned capture bytes");
               expect(
-                (await reader.store.getSessionEvents(outsideSettings.sessionId)).map(
+                (await store.getSessionEvents(outsideSettings.sessionId)).map(
                   ({ flowId, dataText }) => ({ flowId, dataText }),
                 ),
               ).toEqual([
                 { flowId: "outside-after", dataText: "outside after" },
                 { flowId: "outside-before", dataText: "outside before" },
               ]);
-            } finally {
-              await reader.release();
-            }
+            });
           } finally {
             await maintenance.release();
           }
@@ -293,6 +276,24 @@ it.each(["Doctor", "Gateway lock"] as const)(
     );
   },
 );
+
+async function withCaptureReader(
+  env: NodeJS.ProcessEnv,
+  run: (
+    store: Awaited<ReturnType<typeof acquireDebugProxyCaptureStoreAsync>>["store"],
+  ) => Promise<void>,
+) {
+  const reader = await acquireDebugProxyCaptureStoreAsync({ env });
+  try {
+    await run(reader.store);
+  } finally {
+    await reader.release();
+  }
+}
+
+function captureSettings(env: NodeJS.ProcessEnv, sessionId: string) {
+  return { ...resolveDebugProxySettings(env), enabled: true, sessionId };
+}
 
 type CaptureMaintenanceProducer = "Doctor" | "Gateway lock";
 
@@ -330,11 +331,7 @@ it.each(["Doctor", "Gateway lock"] as const)(
     await withOpenClawTestState(
       { scenario: "external-service", label: "maintenance-shared-capture-session" },
       async (state) => {
-        const settings = {
-          ...resolveDebugProxySettings(state.env),
-          enabled: true,
-          sessionId: "shared-maintenance-capture",
-        };
+        const settings = captureSettings(state.env, "shared-maintenance-capture");
         const captureBodyEofs = new WeakMap<Response, Promise<void>>();
         const target: typeof globalThis = {
           ...globalThis,
@@ -392,18 +389,15 @@ it.each(["Doctor", "Gateway lock"] as const)(
           expect(target.fetch).toBe(patchedFetch);
           await fetchBody("outside-second");
 
-          const reader = await acquireDebugProxyCaptureStoreAsync({ env: state.env });
-          try {
+          await withCaptureReader(state.env, async (store) => {
             expect(
-              (await reader.store.listSessions()).find(
-                (session) => session.id === settings.sessionId,
-              ),
+              (await store.listSessions()).find((session) => session.id === settings.sessionId),
             ).toMatchObject({ endedAt: null });
             await fetchBody("outside-after-release");
             await finalizeDebugProxyCaptureAsync(settings, deps);
             expect(target.fetch).not.toBe(patchedFetch);
 
-            const events = await reader.store.getSessionEvents(settings.sessionId);
+            const events = await store.getSessionEvents(settings.sessionId);
             expect(events).toHaveLength(6);
             const paths = ["/maintenance-first", "/outside-second", "/outside-after-release"];
             const requestIds: number[] = [];
@@ -432,13 +426,9 @@ it.each(["Doctor", "Gateway lock"] as const)(
             expect(requestIds[0]).toBeLessThan(requestIds[1]!);
             expect(requestIds[1]).toBeLessThan(requestIds[2]!);
             expect(
-              (await reader.store.listSessions()).find(
-                (session) => session.id === settings.sessionId,
-              ),
+              (await store.listSessions()).find((session) => session.id === settings.sessionId),
             ).toMatchObject({ endedAt: expect.any(Number), eventCount: 6 });
-          } finally {
-            await reader.release();
-          }
+          });
         } finally {
           try {
             await maintenance?.release();
@@ -457,11 +447,7 @@ it.each(["Doctor", "Gateway lock"] as const)(
     await withOpenClawTestState(
       { scenario: "external-service", label: "maintenance-late-capture" },
       async (state) => {
-        const settings = {
-          ...resolveDebugProxySettings(state.env),
-          enabled: true,
-          sessionId: "late-maintenance-capture",
-        };
+        const settings = captureSettings(state.env, "late-maintenance-capture");
         const maintenance = await beginCaptureMaintenance(producer, state.env);
         const entered = createDeferredCore();
         const resume = createDeferredCore();
@@ -476,14 +462,11 @@ it.each(["Doctor", "Gateway lock"] as const)(
           resume.resolve();
           await Promise.all([accepted, closing]);
 
-          const reader = await acquireDebugProxyCaptureStoreAsync({ env: state.env });
-          try {
+          await withCaptureReader(state.env, async (store) => {
             expect(
-              (await reader.store.listSessions()).find(
-                (session) => session.id === settings.sessionId,
-              ),
+              (await store.listSessions()).find((session) => session.id === settings.sessionId),
             ).toMatchObject({ endedAt: expect.any(Number), eventCount: 1 });
-            const events = await reader.store.getSessionEvents(settings.sessionId);
+            const events = await store.getSessionEvents(settings.sessionId);
             expect(events).toEqual([
               expect.objectContaining({
                 flowId: "accepted-late-capture",
@@ -494,10 +477,8 @@ it.each(["Doctor", "Gateway lock"] as const)(
             if (typeof blobId !== "string") {
               throw new Error("Expected captured payload blob");
             }
-            expect(await reader.store.readBlob(blobId)).toBe("bytes for accepted-late-capture");
-          } finally {
-            await reader.release();
-          }
+            expect(await store.readBlob(blobId)).toBe("bytes for accepted-late-capture");
+          });
         } finally {
           resume.resolve();
           try {
@@ -517,11 +498,7 @@ it.each(["Doctor", "Gateway lock"] as const)(
     await withOpenClawTestState(
       { scenario: "external-service", label: "maintenance-pending-outside-fetch" },
       async (state) => {
-        const settings = {
-          ...resolveDebugProxySettings(state.env),
-          enabled: true,
-          sessionId: "pending-outside-capture",
-        };
+        const settings = captureSettings(state.env, "pending-outside-capture");
         const transport = createDeferredCore<Response>();
         const response = new Response("late transport response", { status: 200 });
         const target: typeof globalThis = {
@@ -534,6 +511,7 @@ it.each(["Doctor", "Gateway lock"] as const)(
         try {
           await initializeDebugProxyCaptureAsync("outside", settings, deps);
           pending = target.fetch("https://synthetic.invalid/pending-outside");
+          const request = pending;
           maintenance = await beginCaptureMaintenance(producer, state.env);
           await maintenance.run(() =>
             initializeDebugProxyCaptureAsync("maintenance", settings, deps),
@@ -541,28 +519,23 @@ it.each(["Doctor", "Gateway lock"] as const)(
           await maintenance.release();
           await finalizeDebugProxyCaptureAsync(settings, deps);
 
-          const reader = await acquireDebugProxyCaptureStoreAsync({ env: state.env });
-          try {
-            const ended = (await reader.store.listSessions()).find(
+          await withCaptureReader(state.env, async (store) => {
+            const ended = (await store.listSessions()).find(
               (session) => session.id === settings.sessionId,
             );
             expect(ended).toMatchObject({ endedAt: expect.any(Number), eventCount: 0 });
-            expect(await reader.store.getSessionEvents(settings.sessionId)).toEqual([]);
+            expect(await store.getSessionEvents(settings.sessionId)).toEqual([]);
 
             transport.resolve(response);
-            const delivered = await pending;
+            const delivered = await request;
             expect(delivered).toBe(response);
             expect(delivered.status).toBe(200);
             expect(await delivered.text()).toBe("late transport response");
-            expect(await reader.store.getSessionEvents(settings.sessionId)).toEqual([]);
+            expect(await store.getSessionEvents(settings.sessionId)).toEqual([]);
             expect(
-              (await reader.store.listSessions()).find(
-                (session) => session.id === settings.sessionId,
-              ),
+              (await store.listSessions()).find((session) => session.id === settings.sessionId),
             ).toEqual(ended);
-          } finally {
-            await reader.release();
-          }
+          });
         } finally {
           transport.resolve(response);
           try {

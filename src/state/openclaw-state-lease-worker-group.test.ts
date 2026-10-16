@@ -21,7 +21,7 @@ vi.mock("./openclaw-state-worker-store.js", () => ({
 
 type Owner = ReturnType<typeof createOpenClawStateLeaseWorkerOwner>;
 const owners: Owner[] = [];
-const jobs: Array<ReturnType<typeof createJob>> = [];
+const jobs: Array<ReturnType<typeof job>> = [];
 
 afterEach(async () => {
   for (const current of jobs.splice(0)) {
@@ -67,10 +67,10 @@ function fixture(context?: OpenClawStateWorkerContext, key = "collection") {
   return { owner, lease, controller, assertCurrent };
 }
 
-function createJob(createAdmission: SqliteWorkerAdmissionFactory) {
+function job(createAdmission: SqliteWorkerAdmissionFactory) {
   const settled = createDeferredCore<SqliteWorkerOperationSettlement>();
   const { admission } = createAdmission({ settled: settled.promise });
-  return {
+  const current = {
     admission,
     settled,
     request(stage: "transaction" | "commit", leases: unknown) {
@@ -87,12 +87,8 @@ function createJob(createAdmission: SqliteWorkerAdmissionFactory) {
       return Atomics.load(decision, 0);
     },
   };
-}
-
-function job(createAdmission: SqliteWorkerAdmissionFactory) {
-  const next = createJob(createAdmission);
-  jobs.push(next);
-  return next;
+  jobs.push(current);
+  return current;
 }
 
 function facts(identities: readonly OpenClawStateLeaseIdentity[], expiresAt = Date.now() + 30_000) {
@@ -195,16 +191,16 @@ describe("state lease group admission", () => {
           } else if (kind === "member-0" || kind === "member-1") {
             expect(current.admission.failure).toBe(revoked);
           } else {
-            expect(current.admission.failure).toMatchObject({
-              message:
-                kind === "caller"
-                  ? "caller retired"
-                  : kind === "expiry"
-                    ? "State lease worker ownership was refused"
-                    : kind === "async"
-                      ? "State lease worker authority must complete synchronously"
-                      : "original source retired",
-            });
+            const messages = {
+              caller: "caller retired",
+              expiry: "State lease worker ownership was refused",
+              async: "State lease worker authority must complete synchronously",
+            };
+            const message =
+              kind === "caller" || kind === "expiry" || kind === "async"
+                ? messages[kind]
+                : sourceError.message;
+            expect(current.admission.failure).toMatchObject({ message });
           }
           current.settled.resolve({ kind: "completed" });
         },
