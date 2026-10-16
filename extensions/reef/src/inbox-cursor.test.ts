@@ -1,12 +1,12 @@
 import { DatabaseSync } from "node:sqlite";
 import type {
-  OpenAsyncKeyedStoreOptions,
   PluginStateOperation,
   PluginStateOperationDefinitions,
 } from "openclaw/plugin-sdk/plugin-state-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ReefInboxCursorStore } from "./state.js";
 import {
+  beforeNextStateOperation,
   cleanupStateTestDirectory,
   createRuntime as createStateRuntime,
   createStateTestDirectory,
@@ -18,47 +18,14 @@ const options = { namespace: "inbox-cursor", maxEntries: 1, overflowPolicy: "rej
 
 describe("Reef inbox cursor persistence", () => {
   let stateDir: string;
-  let runtime: ReturnType<typeof createRuntime>;
+  let runtime: ReturnType<typeof createStateRuntime>;
   const cursor = (signal?: AbortSignal) => new ReefInboxCursorStore(runtime, binding, signal);
 
   beforeEach(() => {
     stateDir = createStateTestDirectory();
-    runtime = createRuntime();
+    runtime = createStateRuntime(stateDir);
   });
-
   afterEach(() => cleanupStateTestDirectory(stateDir));
-
-  function createRuntime() {
-    const host = createStateRuntime(stateDir);
-    const open = host.state.openKeyedStoreV2;
-    const commands: string[] = [];
-    const hooks: { before?: () => Promise<void> | void; after?: () => Promise<void> | void } = {};
-    host.state.openKeyedStoreV2 = <T>(storeOptions: OpenAsyncKeyedStoreOptions) => {
-      const store = open<T>(storeOptions);
-      const createOperation = store.createOperation!;
-      store.createOperation = <Operations extends PluginStateOperationDefinitions>(
-        ...args: Parameters<typeof createOperation>
-      ): PluginStateOperation<Operations> => {
-        const operation = createOperation<Operations>(...args);
-        return {
-          async execute(command, selection) {
-            commands.push(command.type);
-            const before = hooks.before;
-            hooks.before = undefined;
-            await before?.();
-            const result = await operation.execute(command, selection);
-            const after = hooks.after;
-            hooks.after = undefined;
-            await after?.();
-            return result;
-          },
-        };
-      };
-      return store;
-    };
-    return Object.assign(host, { commands, hooks });
-  }
-
   it("preserves monotonic progress", async () => {
     const first = cursor();
     const second = cursor();
@@ -71,16 +38,25 @@ describe("Reef inbox cursor persistence", () => {
   it("uses one operation per cursor call without application-thread SQL", async () => {
     const prepare = vi.spyOn(DatabaseSync.prototype, "prepare");
     const store = cursor();
+    const backing = runtime.stateStores[0]!;
+    const createOperation = backing.createOperation!;
+    const commands: string[] = [];
+    backing.createOperation = <Operations extends PluginStateOperationDefinitions>(
+      ...args: Parameters<typeof createOperation>
+    ): PluginStateOperation<Operations> => {
+      const operation = createOperation<Operations>(...args);
+      return {
+        execute(command, selection) {
+          commands.push(command.type);
+          return operation.execute(command, selection);
+        },
+      };
+    };
     expect(await store.load()).toBe(0);
     await store.advance(12);
     await store.advance(7);
     expect(await store.load()).toBe(12);
-    expect(runtime.commands).toEqual([
-      "cursor.load",
-      "cursor.advance",
-      "cursor.advance",
-      "cursor.load",
-    ]);
+    expect(commands).toEqual(["cursor.load", "cursor.advance", "cursor.advance", "cursor.load"]);
     expect(prepare).not.toHaveBeenCalled();
   });
 
@@ -97,7 +73,7 @@ describe("Reef inbox cursor persistence", () => {
         entered.resolve();
         await released.promise;
       };
-      runtime.hooks[method === "advance" ? "before" : "after"] = pause;
+      beforeNextStateOperation(runtime, pause, method === "advance" ? "before" : "after");
       const native = vi.spyOn(runtime.state, "openSyncKeyedStore");
       const guarded = cursor(controller.signal);
       const pending = method === "advance" ? guarded.advance(13) : guarded.load();
@@ -118,12 +94,13 @@ describe("Reef inbox cursor persistence", () => {
     "observes a foreign %s committed before cursor admission",
     async (change) => {
       const competing = runtime.state.openKeyedStoreV2(options);
-      runtime.hooks.before = () =>
+      beforeNextStateOperation(runtime, () =>
         competing.register("current", {
           ...binding,
           ...(change === "different identity" ? { handle: "clawd" } : {}),
           cursor: 40,
-        });
+        }),
+      );
       const store = cursor();
       if (change === "different identity") {
         await expectReefStateOperationError(
@@ -144,7 +121,9 @@ describe("Reef inbox cursor persistence", () => {
   it("uses a repair committed before its worker transaction", async () => {
     const competing = runtime.state.openKeyedStoreV2(options);
     await competing.register("current", { ...binding, handle: "clawd", cursor: 3 });
-    runtime.hooks.before = () => competing.register("current", { ...binding, cursor: 5 });
+    beforeNextStateOperation(runtime, () =>
+      competing.register("current", { ...binding, cursor: 5 }),
+    );
     const store = cursor();
     await store.advance(12);
     await expect(store.load()).resolves.toBe(12);
@@ -161,9 +140,9 @@ describe("Reef inbox cursor persistence", () => {
 
   it("propagates a failed operation without falling back to native writes", async () => {
     const failure = new Error("worker operation unavailable");
-    runtime.hooks.before = () => {
+    beforeNextStateOperation(runtime, () => {
       throw failure;
-    };
+    });
     const native = vi.spyOn(runtime.state, "openSyncKeyedStore");
     const store = cursor();
     await expect(store.advance(12)).rejects.toBe(failure);

@@ -9,6 +9,7 @@ import {
   decryptAuditText,
   verifyChain,
   verifyChainSegment,
+  type AuditEntry,
 } from "../protocol/audit.js";
 import type { ReefAuditOperations } from "./audit-state-operation.js";
 import {
@@ -29,6 +30,8 @@ import {
   createRuntime,
   createStateTestDirectory,
 } from "./state.test-support.js";
+
+const eventTypes = (entries: readonly AuditEntry[]) => entries.map((entry) => entry.event.type);
 
 async function expectAuditOperationError(result: Promise<unknown>, message: string) {
   await expect(result).rejects.toBeInstanceOf(Error);
@@ -67,7 +70,7 @@ describe("Reef SQLite audit state", () => {
     );
     await open().appendEvent("contender", { id: 3 }, 12);
     const retained = await initial.entries();
-    expect(retained.map((entry) => entry.event.type)).toEqual(["winner", "contender"]);
+    expect(eventTypes(retained)).toEqual(["winner", "contender"]);
     expect(retained[1]!.prevHash).toBe(retained[0]!.entryHash);
   });
 
@@ -104,7 +107,7 @@ describe("Reef SQLite audit state", () => {
     expect(decryptAuditText(result.value[0]!, key).event.payload).toEqual({ text: "private text" });
     expect(JSON.stringify(result.value)).not.toContain("private");
     const retained = await audit.entries();
-    expect(retained.map((entry) => entry.event.type)).toEqual(["verdict", "envelope"]);
+    expect(eventTypes(retained)).toEqual(["verdict", "envelope"]);
     expect(retained).toEqual(result.value.slice(1));
     expect(
       verifyChainSegment(retained, {
@@ -186,11 +189,7 @@ describe("Reef SQLite audit state", () => {
     const headStore = heads();
     const legacyHead: ReefAuditHeadRecord = {
       ...headStore.lookup(REEF_AUDIT_HEAD_KEY)!,
-      pending: {
-        owner: "retired-writer",
-        expiresAt: 1,
-        entryKey: staleKey,
-      },
+      pending: { owner: "retired-writer", expiresAt: 1, entryKey: staleKey },
       garbageEntryKey: "entry:orphan",
     };
     headStore.register(REEF_AUDIT_HEAD_KEY, legacyHead);
@@ -206,10 +205,7 @@ describe("Reef SQLite audit state", () => {
     link(stale.entryHash);
     const recovered = open();
     await recovered.appendEvent("recovered", { id: 4 }, 13);
-    expect((await recovered.entries()).map((entry) => entry.event.type)).toEqual([
-      "initial",
-      "recovered",
-    ]);
+    expect(eventTypes(await recovered.entries())).toEqual(["initial", "recovered"]);
     expect([raw.lookup(staleKey), raw.lookup("entry:orphan")]).toEqual([undefined, undefined]);
     expect(headStore.lookup(REEF_AUDIT_HEAD_KEY)?.pending).toBeUndefined();
   });
@@ -225,7 +221,7 @@ describe("Reef SQLite audit state", () => {
         second.appendEvent("three", { id: 3 }, 12),
       ]);
       const reopened = await openReefAuditStore(createRuntime(stateDir), key).entries();
-      expect(reopened.map((entry) => entry.event.type)).toEqual(["one", "two", "three"]);
+      expect(eventTypes(reopened)).toEqual(["one", "two", "three"]);
       expect(verifyChain(reopened)).toBe(true);
       expect(observation.queries).toEqual([]);
     } finally {
@@ -268,7 +264,7 @@ describe("Reef SQLite audit state", () => {
       "simulated lost acknowledgement",
     );
     const recovered = await initial.entries();
-    expect(recovered.map((entry) => entry.event.type)).toEqual(["two", "three"]);
+    expect(eventTypes(recovered)).toEqual(["two", "three"]);
     expect(recovered.map((entry) => entry.event.seq)).toEqual([2, 3]);
   });
 
@@ -280,7 +276,7 @@ describe("Reef SQLite audit state", () => {
     await expect(open(2, controller.signal).appendEvent("revoked", {}, 11)).rejects.toThrow(
       "Reef owner retired",
     );
-    expect((await current.entries()).map((entry) => entry.event.type)).toEqual(["current"]);
+    expect(eventTypes(await current.entries())).toEqual(["current"]);
   });
 
   it("rechecks a foreign audit migration marker before committing prepared rows", async () => {
@@ -333,6 +329,6 @@ describe("Reef SQLite audit state", () => {
     beforeNextStateOperation(runtime, () => {
       env.OPENCLAW_STATE_DIR = replacementDir;
     });
-    expect((await open(1).entries()).map((entry) => entry.event.type)).toEqual(["original"]);
+    expect(eventTypes(await open(1).entries())).toEqual(["original"]);
   });
 });

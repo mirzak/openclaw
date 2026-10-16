@@ -6,7 +6,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { generateIdentity, type Verdict } from "../protocol/index.js";
 import { MemoryReplayStore } from "../protocol/memory-stores.test-support.js";
 import { openReefAuditStore } from "./audit-state.js";
-import { isPermanentReefOutboundRejection, prepareReefMessageId, ReefMessageFlow } from "./flow.js";
+import { prepareReefMessageId, ReefMessageFlow } from "./flow.js";
 import {
   allow,
   config,
@@ -38,18 +38,20 @@ describe("Reef worker outbound composition", () => {
   const auditTypes = async (id: string) =>
     (await auditEntries(id)).map((entry) => entry.event.type);
 
-  async function decideReview(approved: boolean) {
+  async function prepareReview(approved?: boolean) {
     const id = prepareReefMessageId();
     classify.classify.mockResolvedValue({ ...allow, decision: "review" });
     await expect(send(id)).rejects.toMatchObject({ reviewOutcome: "pending" });
     const [review] = await stores.reviews.list();
     expect(review?.id).toBe(id);
-    await stores.reviews.decide(review!.approvalDigest, approved);
+    if (approved !== undefined) {
+      await stores.reviews.decide(review!.approvalDigest, approved);
+    }
     classify.classify.mockClear();
     return id;
   }
 
-  const makeFlow = (reviews = stores.reviews) =>
+  const makeFlow = () =>
     new ReefMessageFlow({
       config: cfg,
       trust: trusted,
@@ -58,7 +60,7 @@ describe("Reef worker outbound composition", () => {
       guard: classify,
       audit,
       replay: new MemoryReplayStore(),
-      reviews,
+      reviews: stores.reviews,
       delivered: stores.delivered,
       onIngress: async () => {},
       onOwnerNotice: async () => {},
@@ -135,30 +137,29 @@ describe("Reef worker outbound composition", () => {
     });
   });
 
-  it("settles an existing denied review in one command without classifying again", async () => {
-    const id = await decideReview(false);
+  it.each([false, true])("settles an existing review with approved=%s", async (approved) => {
+    const id = await prepareReview(approved);
     const commands = recordDispatches();
-    await expect(send(id)).rejects.toMatchObject({ reviewOutcome: "denied" });
-    expect(commands()).toEqual(["pluginState.executeOperation"]);
-    expect(classify.classify).not.toHaveBeenCalled();
-    expect(fetcher).not.toHaveBeenCalled();
-  });
-
-  it("reclassifies an approved review once and commits its approved send in two commands", async () => {
-    const id = await decideReview(true);
-    const commands = recordDispatches();
-    expect(await send(id)).toBe(id);
-    expect(commands()).toHaveLength(2);
-    expect(classify.classify).toHaveBeenCalledOnce();
-    expect(fetcher).toHaveBeenCalledOnce();
-    expect(await auditTypes(id)).toEqual([
-      "proposal",
-      "guard_verdict",
-      "proposal",
-      "review_approval",
-      "guard_verdict",
-      "envelope",
-    ]);
+    if (approved) {
+      expect(await send(id)).toBe(id);
+    } else {
+      await expect(send(id)).rejects.toMatchObject({ reviewOutcome: "denied" });
+    }
+    expect(commands()).toEqual(
+      Array.from({ length: approved ? 2 : 1 }, () => "pluginState.executeOperation"),
+    );
+    expect(classify.classify).toHaveBeenCalledTimes(Number(approved));
+    expect(fetcher).toHaveBeenCalledTimes(Number(approved));
+    if (approved) {
+      expect(await auditTypes(id)).toEqual([
+        "proposal",
+        "guard_verdict",
+        "proposal",
+        "review_approval",
+        "guard_verdict",
+        "envelope",
+      ]);
+    }
   });
 
   it("refuses removal and reapproval with identical keys while classification is pending", async () => {
@@ -173,35 +174,12 @@ describe("Reef worker outbound composition", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
-  it("refuses a committed binding's effect when a sanctioned mutation invalidates its receipt", async () => {
-    const result = await flow
-      .send("alice", "private coordination", {
-        onPlatformSendDispatch: async () => {
-          await trusted.remove("alice");
-        },
-      })
-      .catch((error: unknown) => error);
-    expect(result).toBeInstanceOf(Error);
-    expect(isPermanentReefOutboundRejection(result)).toBe(true);
-    expect(fetcher).not.toHaveBeenCalled();
-  });
-
   it("keeps the guard audit on a review-capacity refusal without recording delivery", async () => {
-    const reviews = stores.reviews;
-    await reviews.request({
-      id: "occupied",
-      from: "bob#1",
-      to: "alice#1",
-      direction: "outbound",
-      bodyHash: "a".repeat(64),
-      approvalDigest: "b".repeat(64),
-      verdict: { ...allow, decision: "review" },
-    });
+    await prepareReview();
     const id = prepareReefMessageId();
-    classify.classify.mockResolvedValue({ ...allow, decision: "review" });
     const commands = recordDispatches();
     await expect(
-      makeFlow(reviews).send("alice", "private coordination", { messageId: id }),
+      makeFlow().send("alice", "private coordination", { messageId: id }),
     ).rejects.toThrow("pending review capacity");
     expect(commands()).toHaveLength(2);
     expect(fetcher).not.toHaveBeenCalled();

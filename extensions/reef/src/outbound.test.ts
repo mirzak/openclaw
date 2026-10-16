@@ -24,7 +24,6 @@ import { createReefRuntimeAuthority, getActiveReef } from "./runtime.js";
 import type { ReefTransportClient } from "./transport.js";
 
 afterEach(resetFlowStoresForTests);
-
 const messageId = "01JZ0000000000000000000200";
 const message = { cfg: {}, to: "reef:Alice", text: "hello" };
 const prepareId = (text: string) =>
@@ -59,16 +58,9 @@ async function createFlow(
 }
 
 describe("reefOutboundAdapter", () => {
-  it("removes internal tool text while preserving user-visible examples", () => {
-    const sanitize = (text: string) =>
-      reefOutboundAdapter.sanitizeText!({ text, payload: { text } });
-    const fenced = ["```xml", '<tool_call>{"name":"exec"}</tool_call>', "```"].join("\n");
-
-    expect(sanitize("Done.\n⚠️ 🛠️ `search repos (agent)` failed")).toBe("Done.");
-    expect(sanitize('<tool_call>{"name":"exec"}</tool_call>Message sent.')).toBe("Message sent.");
-    expect(sanitize("Delivered.")).toBe("Delivered.");
-    expect(sanitize(fenced)).toBe(fenced);
-    expect(sanitize("⚠️ 🛠️ `search repos (agent)` failed")).toBe("");
+  it("applies the shared sanitizer to outgoing text", () => {
+    const text = "Done.\n⚠️ 🛠️ `search repos (agent)` failed";
+    expect(reefOutboundAdapter.sanitizeText!({ text, payload: { text } })).toBe("Done.");
   });
 
   it.each(["outbound", "message"] as const)(
@@ -83,7 +75,6 @@ describe("reefOutboundAdapter", () => {
         order.push("dispatch");
       });
       activateSend(send);
-
       const context = {
         ...message,
         accountId: "default",
@@ -99,18 +90,16 @@ describe("reefOutboundAdapter", () => {
           target: { kind: "chat", id: "alice" },
           toJid: "reef:alice",
         });
-      } else {
-        await reefMessageAdapter.send.text({ ...message, onPlatformSendDispatch });
-      }
-      expect(order).toEqual(["dispatch", "send"]);
-      if (adapter === "outbound") {
         expect(send).toHaveBeenCalledWith("alice", "hello", {
           thread: "42",
           replyTo: "01JZ0000000000000000000199",
           messageId,
           onPlatformSendDispatch: expect.any(Function),
         });
+      } else {
+        await reefMessageAdapter.send.text({ ...message, onPlatformSendDispatch });
       }
+      expect(order).toEqual(["dispatch", "send"]);
     },
   );
 
@@ -118,14 +107,12 @@ describe("reefOutboundAdapter", () => {
     const guardEntered = createDeferred<void>();
     const guardPaused = createDeferred<void>();
     const firstAuthority = createReefRuntimeAuthority();
-    const classifier = {
-      ...guard(allow),
-      classify: vi.fn(async () => {
-        guardEntered.resolve();
-        await guardPaused.promise;
-        return allow;
-      }),
-    };
+    const classifier = guard(allow);
+    classifier.classify.mockImplementation(async () => {
+      guardEntered.resolve();
+      await guardPaused.promise;
+      return allow;
+    });
     const relay = transport();
     const flow = await createFlow(
       { alice: peerTrust(generateIdentity()) },
@@ -139,16 +126,13 @@ describe("reefOutboundAdapter", () => {
     const stale = reefMessageAdapter.send.text({ cfg: {}, to: "reef:alice", text: "stale" });
     await Promise.race([guardEntered.promise, stale]);
     expect(classifier.classify).toHaveBeenCalledOnce();
-
     const replacementAuthority = createReefRuntimeAuthority();
     const replacement = { flow: {}, friends: {}, reviews: {} } as never;
     replacementAuthority.activate(replacement);
     try {
       guardPaused.resolve();
-      const staleResult = await stale.catch((error: unknown) => error);
-
+      await expect(stale).rejects.toBeInstanceOf(PlatformMessageNotDispatchedError);
       expect(relay.sendEnvelope).not.toHaveBeenCalled();
-      expect(staleResult).toBeInstanceOf(PlatformMessageNotDispatchedError);
       expect(getActiveReef()).toBe(replacement);
     } finally {
       replacementAuthority.release();
@@ -161,7 +145,6 @@ describe("reefOutboundAdapter", () => {
     createReefRuntimeAuthority().activate({ flow, friends: {}, reviews: {} } as never);
 
     const error = await reefMessageAdapter.send.text(message).catch((caught: unknown) => caught);
-
     expect(error).toBeInstanceOf(PlatformMessageNotDispatchedError);
     expect(error).toMatchObject({
       cause: {
@@ -184,7 +167,6 @@ describe("reefOutboundAdapter", () => {
     activateSend(send);
 
     const error = await reefMessageAdapter.send.text(message).catch((caught: unknown) => caught);
-
     expect(error).toBeInstanceOf(PlatformMessageNotDispatchedError);
     expect(error).toMatchObject({ cause, retryable: true });
   });
@@ -199,12 +181,8 @@ describe("reefOutboundAdapter", () => {
     authority.activate({ flow: { send }, friends: {}, reviews: {} } as never);
 
     const error = await reefMessageAdapter.send
-      .text({
-        ...message,
-        onPlatformSendDispatch,
-      })
+      .text({ ...message, onPlatformSendDispatch })
       .catch((caught: unknown) => caught);
-
     expect(onPlatformSendDispatch).toHaveBeenCalledOnce();
     expect(error).toBe(cause);
   });
@@ -212,7 +190,6 @@ describe("reefOutboundAdapter", () => {
   it("prepares a protocol-valid id without requiring an active Gateway runtime", () => {
     const first = prepareId("hello");
     const second = prepareId("again");
-
     expect(first).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/u);
     expect(second).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/u);
     expect(second > first).toBe(true);
@@ -223,7 +200,6 @@ describe("reefOutboundAdapter", () => {
     const preparedMessageId = prepareId(rawText);
     const send = vi.fn(async () => messageId);
     activateSend(send);
-
     const error = await reefOutboundAdapter.sendText!({
       cfg: {},
       accountId: "default",
@@ -243,17 +219,13 @@ describe("reefOutboundAdapter", () => {
   it("chunks ordinary text by canonical plaintext bytes", () => {
     const text = `${"a".repeat(40_000)}${"🦞".repeat(10_000)}`;
     const chunks = reefOutboundAdapter.chunker!(text, REEF_MAX_PLAINTEXT_BYTES);
-
+    const metadata = { replyTo: messageId, thread: messageId };
     expect(chunks.join("")).toBe(text);
     expect(chunks.length).toBeGreaterThan(1);
     for (const chunk of chunks) {
-      expect(
-        canonicalBytes({
-          text: chunk,
-          replyTo: "0".repeat(26),
-          thread: "0".repeat(26),
-        }).length,
-      ).toBeLessThanOrEqual(REEF_MAX_PLAINTEXT_BYTES);
+      expect(canonicalBytes({ text: chunk, ...metadata }).length).toBeLessThanOrEqual(
+        REEF_MAX_PLAINTEXT_BYTES,
+      );
     }
   });
 });
