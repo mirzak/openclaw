@@ -69,6 +69,41 @@ async function queueHttp(compressed = false) {
   return { waiting, closed, abort: () => controllers.forEach((controller) => controller.abort()) };
 }
 
+function countTo(target: number) {
+  const done = createDeferred<void>();
+  let count = 0;
+  return {
+    promise: done.promise,
+    tick: () => {
+      if (++count === target) {
+        done.resolve();
+      }
+    },
+  };
+}
+
+function deferDns() {
+  const started = createDeferred<void>();
+  const dns = createDeferred<{ lookup: undefined }>();
+  transport.resolve.mockImplementationOnce(() => {
+    started.resolve();
+    return dns.promise;
+  });
+  return { started: started.promise, finish: () => dns.resolve({ lookup: undefined }) };
+}
+
+function handshake() {
+  const upgrade = once(relayServer(), "upgrade");
+  const client = connect();
+  return { client, upgrade, rejected: once(client, "unexpected-response") };
+}
+
+function releaseFirst(streams: Awaited<ReturnType<typeof holdUploads>>) {
+  const first = streams[0];
+  assert(first);
+  first.releaseUpload();
+}
+
 async function pipeline() {
   const target = new URL(proxy.baseUrl + "/responses");
   const socket = createConnection({ host: target.hostname, port: Number(target.port) });
@@ -130,19 +165,14 @@ describe("inference relay capacity", () => {
     const http = holdHttpResponses();
     const responses = Array.from({ length: 16 }, () => post());
     await http.waitFor(16);
-    const resolving = createDeferred<void>();
-    const dns = createDeferred<{ lookup: undefined }>();
-    transport.resolve.mockImplementationOnce(() => {
-      resolving.resolve();
-      return dns.promise;
-    });
+    const dns = deferDns();
     const fresh = connect();
     const opened = once(fresh, "open");
-    await resolving.promise;
+    await dns.started;
     const incoming = once(relayServer(), "request");
     responses.push(post());
     await incoming;
-    dns.resolve({ lookup: undefined });
+    dns.finish();
     await opened;
     const upstream = upstreams.at(-1)!;
     await send(fresh, upstream);
@@ -153,34 +183,44 @@ describe("inference relay capacity", () => {
     await finishHttp(http.streams, responses);
   });
 
-  it("bounds resident HTTP operations at 80 plus 16 waiters and recovers after cancellation", async () => {
-    const http = holdHttpResponses();
-    const responses = await fillHttp(http, 80);
-    for (let cycle = 0; cycle < 3; cycle++) {
-      const { waiting, closed, abort } = await queueHttp();
-      expect(await post()).toMatchObject({ status: 503, retryAfter: "1" });
-      expect(transport.fetch).toHaveBeenCalledTimes(80);
-      abort();
-      await Promise.all(closed);
-      expect(await Promise.all(waiting)).toEqual(Array(16).fill(undefined));
-    }
-    http.streams[0]!.close();
-    const firstResponse = responses[0];
-    assert(firstResponse);
-    expect((await firstResponse).status).toBe(200);
-    responses.push(post());
-    await http.waitFor(81);
-    await finishHttp(http.streams.slice(1), responses);
-  });
+  it.each(["resident", "upload"])(
+    "bounds %s HTTP work, cancels waiters, and admits a later request",
+    async (pool) => {
+      const http = pool === "resident" ? holdHttpResponses() : undefined;
+      const responses = http ? await fillHttp(http, 80) : [];
+      const uploads = http ? [] : await holdUploads();
+      for (let cycle = 0; cycle < 3; cycle++) {
+        const { waiting, closed, abort } = await queueHttp();
+        expect(await post()).toMatchObject({ status: 503, retryAfter: "1" });
+        expect(transport.fetch).toHaveBeenCalledTimes(http ? 80 : 0);
+        abort();
+        await Promise.all(closed);
+        expect(await Promise.all(waiting)).toEqual(Array(16).fill(undefined));
+      }
+      if (http) {
+        http.streams[0]!.close();
+        const firstResponse = responses[0];
+        assert(firstResponse);
+        expect((await firstResponse).status).toBe(200);
+        responses.push(post());
+        await http.waitFor(81);
+        await finishHttp(http.streams.slice(1), responses);
+      } else {
+        releaseFirst(uploads);
+        expect((await post()).status).toBe(200);
+        expect(transport.fetch).toHaveBeenCalledOnce();
+      }
+    },
+  );
 
   it("holds residency through physical upstream closure after a cancelled handshake", async () => {
     const http = holdHttpResponses();
     const responseController = new AbortController();
     const responses: ReturnType<typeof post>[] = [];
-    let completedResponses = 0;
+    const observed = { requestClosed: false, socketClosed: false, completedResponses: 0 };
     const startHttp = () =>
       post(responseController.signal).then((response) => {
-        completedResponses++;
+        observed.completedResponses++;
         return response;
       });
     const destroyStarted = createDeferred<void>();
@@ -206,22 +246,16 @@ describe("inference relay capacity", () => {
         received.resolve();
       });
       const logicalClosed = createDeferred<void>();
-      let requestClosed = false;
-      let socketClosed = false;
       const target = new URL(transport.upstream);
       transport.upstreamOptions = (options) => ({
         ...options,
         createConnection: () =>
           upstreamSocket.connect({ host: target.hostname, port: Number(target.port) }),
         finishRequest(upstreamRequest, websocket) {
-          upstreamRequest.once("socket", (socket) => {
-            socket.once("close", () => {
-              socketClosed = true;
-            });
-          });
-          upstreamRequest.once("close", () => {
-            requestClosed = true;
-          });
+          upstreamRequest.once("socket", (socket) =>
+            socket.once("close", () => (observed.socketClosed = true)),
+          );
+          upstreamRequest.once("close", () => (observed.requestClosed = true));
           // A CONNECTING websocket emits error before its logical close.
           websocket.once("close", () => logicalClosed.resolve());
           assert(options.finishRequest);
@@ -234,17 +268,9 @@ describe("inference relay capacity", () => {
       await received.promise;
       const fetch = transport.fetch.getMockImplementation();
       assert(fetch);
-      const replacement = createDeferred<{
-        requestClosed: boolean;
-        socketClosed: boolean;
-        calls: number;
-      }>();
+      const replacement = createDeferred<typeof observed & { calls: number }>();
       transport.fetch.mockImplementationOnce((args) => {
-        replacement.resolve({
-          requestClosed,
-          socketClosed,
-          calls: transport.fetch.mock.calls.length,
-        });
+        replacement.resolve({ ...observed, calls: transport.fetch.mock.calls.length });
         return fetch(args);
       });
       const incoming = once(relayServer(), "request");
@@ -259,15 +285,18 @@ describe("inference relay capacity", () => {
       // Logical WS closure and downstream cleanup cannot release the 80th slot
       // while its real upstream socket is still waiting to be destroyed.
       expect(upstreamSocket.closed).toBe(false);
-      expect(requestClosed).toBe(false);
-      expect(socketClosed).toBe(false);
-      expect(completedResponses).toBe(0);
+      expect(observed).toEqual({
+        requestClosed: false,
+        socketClosed: false,
+        completedResponses: 0,
+      });
       expect(http.streams).toHaveLength(79);
       expect(transport.fetch).toHaveBeenCalledTimes(79);
       allowDestroy.resolve();
       expect(await replacement.promise).toEqual({
         requestClosed: true,
         socketClosed: true,
+        completedResponses: 0,
         calls: 80,
       });
       await Promise.all([http.waitFor(80), peerClosed.promise]);
@@ -283,13 +312,8 @@ describe("inference relay capacity", () => {
     const http = holdHttpResponses();
     const responses = await fillHttp(http, 79);
     const { socket, wire } = await pipeline();
-    let incoming = 0;
-    const received = createDeferred<void>();
-    relayServer().on("request", () => {
-      if (++incoming === 2) {
-        received.resolve();
-      }
-    });
+    const received = countTo(2);
+    relayServer().on("request", received.tick);
     socket.write(wire + wire);
     await Promise.all([received.promise, http.waitFor(80)]);
     expect(transport.fetch).toHaveBeenCalledTimes(80);
@@ -303,18 +327,15 @@ describe("inference relay capacity", () => {
   });
 
   it("cancels every fully read pipelined request when its shared socket closes", async () => {
-    const started = createDeferred<void>();
+    const started = countTo(2);
     const backpressured = createDeferred<void>();
-    const released = createDeferred<void>();
+    const released = countTo(2);
     const signals: AbortSignal[] = [];
     let responseBytes = 0;
-    let releaseCount = 0;
     transport.fetch.mockImplementation(async (args) => {
       await new Response(args.init.body).arrayBuffer();
       signals.push(args.signal);
-      if (signals.length === 2) {
-        started.resolve();
-      }
+      started.tick();
       return {
         response: new Response(
           new ReadableStream<Uint8Array>({
@@ -325,11 +346,7 @@ describe("inference relay capacity", () => {
             },
           }),
         ),
-        release: async () => {
-          if (++releaseCount === 2) {
-            released.resolve();
-          }
-        },
+        release: async () => released.tick(),
       };
     });
     const incoming: IncomingMessage[] = [];
@@ -426,23 +443,16 @@ describe("inference relay capacity", () => {
 
   it("bounds pending handshakes before dialing and drains without leaking permits", async () => {
     const pending: (() => void)[] = [];
-    const admitted = createDeferred<void>();
+    const admitted = countTo(16);
     transport.resolve.mockImplementation(
       () =>
         new Promise((resolve) => {
           pending.push(() => resolve({ lookup: undefined }));
-          if (pending.length === 16) {
-            admitted.resolve();
-          }
+          admitted.tick();
         }),
     );
-    let upgrades = 0;
-    const queued = createDeferred<void>();
-    relayServer().on("upgrade", () => {
-      if (++upgrades === 32) {
-        queued.resolve();
-      }
-    });
+    const queued = countTo(32);
+    relayServer().on("upgrade", queued.tick);
     const opened = Array.from({ length: 32 }, () => once(connect(), "open"));
     await admitted.promise;
     await queued.promise;
@@ -522,14 +532,10 @@ describe("inference relay capacity", () => {
   });
 
   it("keeps cancelled native decompression charged until its callback settles", async () => {
-    const started = createDeferred<void>();
+    const started = countTo(16);
     const jobs: (() => void)[] = [];
     transport.decompressions = jobs;
-    transport.decompressionStarted = () => {
-      if (jobs.length === 16) {
-        started.resolve();
-      }
-    };
+    transport.decompressionStarted = started.tick;
     const { waiting: cancelled, closed, abort } = await queueHttp(true);
     await started.promise;
     abort();
@@ -553,9 +559,7 @@ describe("inference relay capacity", () => {
   it("expires a queued handshake before native connect timeout without dialing upstream", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
     await holdUploads();
-    const upgrade = once(relayServer(), "upgrade");
-    const queued = connect();
-    const rejected = once(queued, "unexpected-response");
+    const { upgrade, rejected } = handshake();
     await upgrade;
     await vi.advanceTimersByTimeAsync(10_000);
     const [, response] = await rejected;
@@ -566,22 +570,6 @@ describe("inference relay capacity", () => {
     expect(upstreams).toHaveLength(16);
   });
 
-  it("bounds queued HTTP work, cancels waiters, and admits a later request", async () => {
-    const streams = await holdUploads();
-    for (let cycle = 0; cycle < 3; cycle++) {
-      const { waiting, closed, abort } = await queueHttp();
-      expect(await post()).toMatchObject({ status: 503, retryAfter: "1" });
-      abort();
-      await Promise.all(closed);
-      expect(await Promise.all(waiting)).toEqual(Array(16).fill(undefined));
-    }
-    const first = streams[0];
-    assert(first);
-    first.releaseUpload();
-    expect((await post()).status).toBe(200);
-    expect(transport.fetch).toHaveBeenCalledOnce();
-  });
-
   it("cancels a queued handshake on peer FIN before capacity becomes available", async () => {
     const streams = await holdUploads();
     const upgrade = once(relayServer(), "upgrade");
@@ -590,9 +578,7 @@ describe("inference relay capacity", () => {
     const ended = once(socket, "end");
     queued.terminate();
     await ended;
-    const first = streams[0];
-    assert(first);
-    first.releaseUpload();
+    releaseFirst(streams);
     // HTTP admission is a FIFO barrier after the cancelled handshake's slot.
     expect((await post()).status).toBe(200);
     expect(transport.resolve).toHaveBeenCalledTimes(16);
@@ -640,23 +626,19 @@ describe("inference relay capacity", () => {
         const forwarded = once(next.upstream, "message");
         next.client.send(JSON.stringify(child));
         await nextReceived;
-        const first = streams[0];
-        assert(first);
-        first.releaseUpload();
+        releaseFirst(streams);
         await forwarded;
         expect(staleForwarded).not.toHaveBeenCalled();
         await complete(next.client, next.upstream);
         streams.forEach((stream) => stream.releaseUpload());
         registration.release();
-        const closedSockets: Promise<unknown>[] = [];
-        for (const stream of [stale, next, ...streams]) {
-          for (const socket of [stream.client, stream.upstream]) {
-            if (socket.readyState !== WebSocket.CLOSED) {
-              closedSockets.push(once(socket, "close"));
-            }
-          }
-          stream.client.terminate();
-        }
+        const all = [stale, next, ...streams];
+        const closedSockets = all.flatMap(({ client, upstream }) =>
+          [client, upstream]
+            .filter((socket) => socket.readyState !== WebSocket.CLOSED)
+            .map((socket) => once(socket, "close")),
+        );
+        all.forEach(({ client }) => client.terminate());
         await Promise.all(closedSockets);
       }
     },
@@ -666,17 +648,11 @@ describe("inference relay capacity", () => {
     "expires admission during DNS by %s without leaking the permit",
     async (expiry) => {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-      const started = createDeferred<void>();
-      const dns = createDeferred<{ lookup: undefined }>();
-      transport.resolve.mockImplementationOnce(() => {
-        started.resolve();
-        return dns.promise;
-      });
-      const stalled = connect();
-      const rejected = once(stalled, "unexpected-response");
-      await started.promise;
-      await expireHandshake(rejected, expiry, () => dns.resolve({ lookup: undefined }));
-      dns.resolve({ lookup: undefined });
+      const dns = deferDns();
+      const { rejected } = handshake();
+      await dns.started;
+      await expireHandshake(rejected, expiry, dns.finish);
+      dns.finish();
       const streams = await holdUploads();
       expect(upstreams).toHaveLength(16);
       expect(streams.every(({ client }) => client.readyState === WebSocket.OPEN)).toBe(true);
@@ -697,9 +673,7 @@ describe("inference relay capacity", () => {
     const closed = once(transport.downstreams[0]!, "close");
     large.client.terminate();
     await closed;
-    const first = streams[0];
-    assert(first);
-    first.releaseUpload();
+    releaseFirst(streams);
     expect((await post()).status).toBe(200);
   });
 
@@ -727,8 +701,7 @@ describe("inference relay capacity", () => {
         }
         received.resolve();
       });
-      const stalled = connect();
-      const rejected = once(stalled, "unexpected-response");
+      const { client: stalled, rejected } = handshake();
       const closed = new Promise<void>((resolve) => {
         stalled.once("close", () => resolve());
       });
@@ -748,9 +721,7 @@ describe("inference relay capacity", () => {
       socket.on("error", () => {});
       socket.end("HTTP/1.1 401 Unauthorized\r\nContent-Length: 6\r\n\r\ndenied");
     });
-    const upgrade = once(relayServer(), "upgrade");
-    const client = connect();
-    const rejected = once(client, "unexpected-response");
+    const { upgrade, rejected } = handshake();
     const [, downstream] = await upgrade;
     const selected = createDeferred<void>();
     const end = downstream.end.bind(downstream);

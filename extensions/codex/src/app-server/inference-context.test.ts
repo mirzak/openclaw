@@ -57,15 +57,29 @@ function forkContext(
   });
 }
 
-describe("native inference metadata", () => {
+const identity = {
+  session_id: "session",
+  thread_id: "child",
+  turn_id: "turn",
+  parent_thread_id: "parent",
+  parent_turn_id: "parent-turn",
+  root_turn_id: "root-turn",
+};
+const expectedIdentity = {
+  sessionId: "session",
+  threadId: "child",
+  turnId: "turn",
+  parentThreadId: "parent",
+  parentTurnId: "parent-turn",
+  rootTurnId: "root-turn",
+};
+const rejectsMetadata = (...args: Parameters<typeof readCodexInferenceMetadata>) =>
+  expect(() => readCodexInferenceMetadata(...args)).toThrow("metadata disagrees");
+
+describe("native inference context", () => {
   it("reconciles native body and HTTP metadata and rejects conflicting attribution", () => {
     const nested = {
-      session_id: "session",
-      thread_id: "child",
-      turn_id: "turn",
-      parent_thread_id: "parent",
-      parent_turn_id: "parent-turn",
-      root_turn_id: "root-turn",
+      ...identity,
       request_kind: "turn",
       thread_source: "subagent",
       subagent_kind: "thread_spawn",
@@ -90,12 +104,7 @@ describe("native inference metadata", () => {
       "x-codex-turn-metadata": JSON.stringify(nested),
     };
     expect(readCodexInferenceMetadata(source, headers)).toMatchObject({
-      sessionId: "session",
-      threadId: "child",
-      turnId: "turn",
-      parentThreadId: "parent",
-      parentTurnId: "parent-turn",
-      rootTurnId: "root-turn",
+      ...expectedIdentity,
       requestKind: "turn",
       threadSource: "subagent",
       subagent: "collab_spawn",
@@ -105,33 +114,19 @@ describe("native inference metadata", () => {
       generation: "generation",
     });
     for (const key of ["thread-id", "x-codex-parent-thread-id", "x-openai-subagent"]) {
-      expect(() => readCodexInferenceMetadata(source, { ...headers, [key]: "other" })).toThrow(
-        "metadata disagrees",
-      );
+      rejectsMetadata(source, { ...headers, [key]: "other" });
     }
     for (const key of ["session_id", "turn_id", "parent_turn_id", "root_turn_id"]) {
-      expect(() =>
-        readCodexInferenceMetadata(
-          request("child", "generation", nested, { ...flat, [key]: "other" }),
-        ),
-      ).toThrow("metadata disagrees");
+      rejectsMetadata(request("child", "generation", nested, { ...flat, [key]: "other" }));
     }
-    expect(() =>
-      readCodexInferenceMetadata(source, {
-        ...headers,
-        "x-codex-turn-metadata": JSON.stringify({ ...nested, auto_review_enabled: false }),
-      }),
-    ).toThrow("metadata disagrees");
+    rejectsMetadata(source, {
+      ...headers,
+      "x-codex-turn-metadata": JSON.stringify({ ...nested, auto_review_enabled: false }),
+    });
   });
 
   it("uses current WS frame identities and checks only the session-stable handshake source", () => {
-    const source = request("current-thread", "current-generation", {
-      session_id: "current-session",
-      turn_id: "current-turn",
-      parent_thread_id: "current-parent",
-      parent_turn_id: "current-parent-turn",
-      root_turn_id: "current-root-turn",
-    });
+    const source = request("child", "current-generation", identity);
     const headers = {
       "session-id": "previous-session",
       "thread-id": "previous-thread",
@@ -146,16 +141,11 @@ describe("native inference metadata", () => {
       }),
     };
     expect(readCodexInferenceMetadata(source, headers, "websocket")).toMatchObject({
-      sessionId: "current-session",
-      threadId: "current-thread",
-      turnId: "current-turn",
-      parentThreadId: "current-parent",
-      parentTurnId: "current-parent-turn",
-      rootTurnId: "current-root-turn",
+      ...expectedIdentity,
       generation: "current-generation",
       subagent: "guardian",
     });
-    expect(() => readCodexInferenceMetadata(source, headers, "http")).toThrow("metadata disagrees");
+    rejectsMetadata(source, headers, "http");
     expect(() =>
       readCodexInferenceMetadata(
         request("current-thread", undefined, {}, { "x-openai-subagent": "review" }),
@@ -164,21 +154,16 @@ describe("native inference metadata", () => {
       ),
     ).toThrow("subagent metadata disagrees");
   });
-});
-
-describe("parent-local inference context", () => {
   it("forks the retained prepared prefix after parent cleanup under only the new root's authority", () => {
-    let parentActive = true;
-    const { context, controller, register, prepare, rejects } = fixture(() => {
-      if (!parentActive) {
-        throw new Error("parent authority ended");
-      }
-    });
+    const parentAuthority = new AbortController();
+    const { context, controller, register, prepare, rejects } = fixture(() =>
+      parentAuthority.signal.throwIfAborted(),
+    );
     const parent = register("private persona\n\nskills\n\nmemory");
     const expectedInstructions = prepare(request("root", parent.generation)).body.instructions;
     parent.release();
     controller.abort();
-    parentActive = false;
+    parentAuthority.abort(new Error("parent authority ended"));
     rejects(request("root", parent.generation), "current admitted");
     let forkActive = true;
     const forkController = new AbortController();
@@ -244,17 +229,10 @@ describe("parent-local inference context", () => {
   });
 
   it("falls back to native reconstruction when the global wire-prefix LRU evicts a session", () => {
-    const contexts = Array.from({ length: 3 }, () => fixture());
-    const fixtureAt = (index: number) => {
-      const context = contexts[index];
-      if (!context) {
-        throw new Error(`Missing inference context ${index}`);
-      }
-      return context;
-    };
+    const contexts = [fixture(), fixture(), fixture()] as const;
     const payload = "x".repeat(11 * 1024 * 1024);
-    const prepareParent = (index: number) => {
-      const { register, prepare } = fixtureAt(index);
+    const prepareParent = (index: 0 | 1 | 2) => {
+      const { register, prepare } = contexts[index];
       const parent = register("private", "parent");
       prepare({
         ...request("parent", parent.generation),
@@ -262,13 +240,13 @@ describe("parent-local inference context", () => {
       });
       parent.release();
     };
-    const fork = (index: number) =>
-      forkContext(fixtureAt(index).context, { sourceThreadId: "parent" });
+    const fork = (index: 0 | 1 | 2) =>
+      forkContext(contexts[index].context, { sourceThreadId: "parent" });
     prepareParent(0);
     prepareParent(1);
     fork(0).release();
     prepareParent(2);
-    for (const index of [0, 1, 2]) {
+    for (const index of [0, 1, 2] as const) {
       const child = fork(index);
       const rebuilt = {
         ...request("fork", child.generation),
@@ -278,7 +256,7 @@ describe("parent-local inference context", () => {
           { role: "user", content: "side question" },
         ],
       };
-      const prepared = fixtureAt(index).prepare(rebuilt).body;
+      const prepared = contexts[index].prepare(rebuilt).body;
       expect(prepared.instructions).toBe(
         index === 1 ? "rebuilt\n\nprivate" : "native base\n\nprivate",
       );
@@ -316,12 +294,8 @@ describe("parent-local inference context", () => {
   });
 
   it("requires exact physical owner, root identity and admitted generation", () => {
-    let active = true;
-    const { register, prepare, rejects } = fixture(() => {
-      if (!active) {
-        throw new Error("owner retired");
-      }
-    });
+    const authority = new AbortController();
+    const { register, prepare, rejects } = fixture(() => authority.signal.throwIfAborted());
     const registration = register("private");
     const source = request("root", registration.generation);
     const prepared = prepare(source);
@@ -339,7 +313,7 @@ describe("parent-local inference context", () => {
       request("root", registration.generation, {}, { thread_id: "conflicting-root" }),
       "metadata disagrees",
     );
-    active = false;
+    authority.abort(new Error("owner retired"));
     expect(() => prepared.assertCurrent()).toThrow("owner retired");
     rejects(source, "owner retired");
   });
@@ -356,8 +330,6 @@ describe("parent-local inference context", () => {
       const source = request("root", registration.generation, extra);
       expect(prepare(source).body).toEqual(source);
     }
-    // Native Memory metadata intentionally omits its nested thread identity while
-    // client_metadata still carries the physical thread ID.
     const memory = wire(
       { request_kind: "memory" },
       { thread_id: "memory-thread" },
@@ -369,9 +341,7 @@ describe("parent-local inference context", () => {
       requestKind: "memory",
     });
     const classifierIdentity = {
-      session_id: "session",
       thread_id: "classifier-connection",
-      turn_id: "classification-turn",
       parent_turn_id: "parent-turn",
     };
     const classifier = wire(
@@ -400,7 +370,6 @@ describe("parent-local inference context", () => {
     expect(prepare(rootWithClassifierHint).body.instructions).toContain("persona B");
     const startup = { ...request("root", undefined, { request_kind: "prewarm" }), generate: false };
     expect(prepare(startup).body).toEqual(startup);
-    // Immediate normal continuation after compaction still reads the current snapshot.
     expect(prepare(request("root", registration.generation)).body.instructions).toContain(
       "persona B",
     );

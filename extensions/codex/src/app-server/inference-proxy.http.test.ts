@@ -10,6 +10,7 @@ import {
 import { createServer } from "node:https";
 import { Socket } from "node:net";
 import { buffer as readBody } from "node:stream/consumers";
+import { promisify } from "node:util";
 import { zstdCompressSync, zstdDecompressSync } from "node:zlib";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { PROXY_FIXTURE_CERTIFICATE, PROXY_FIXTURE_KEY } from "openclaw/plugin-sdk/test-env";
@@ -132,9 +133,7 @@ afterEach(async () => {
   for (const socket of sockets) {
     socket.destroy();
   }
-  await new Promise<void>((resolve) => {
-    server.close(() => resolve());
-  });
+  await promisify(server.close.bind(server))();
   vi.restoreAllMocks();
 });
 

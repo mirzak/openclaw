@@ -1,20 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
-import {
-  createAgentHarnessHostCapabilitiesForTest,
-  createMockPluginRegistry,
-  initializeGlobalHookRunner,
-  resetGlobalHookRunner,
-} from "openclaw/plugin-sdk/plugin-test-runtime";
+import * as runtime from "openclaw/plugin-sdk/plugin-test-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { shouldEnableCodexAppServerNativeToolSurface } from "./dynamic-tool-build.js";
-import {
-  buildDynamicToolsForTest,
-  cleanupDynamicToolBuildFixture,
-  createParams,
-  setupDynamicToolBuildFixture,
-} from "./dynamic-tool-build.test-support.js";
+import * as fixtures from "./dynamic-tool-build.test-support.js";
 import { createCodexDynamicToolBridge } from "./dynamic-tools.js";
 import { prepareTestNativeExecutionPolicy } from "./native-execution-policy.test-support.js";
 import { buildCodexRuntimeThreadConfig } from "./thread-requests.js";
@@ -22,23 +12,20 @@ import { buildCodexRuntimeThreadConfig } from "./thread-requests.js";
 let root: string;
 const closers: Array<() => void> = [];
 beforeEach(async () => {
-  root = await setupDynamicToolBuildFixture();
+  root = await fixtures.setupDynamicToolBuildFixture();
   vi.stubEnv("OPENCLAW_STATE_DIR", root);
   vi.stubEnv("GH_TOKEN", "synthetic-native-token");
   vi.stubEnv("GITHUB_TOKEN", "synthetic-native-fallback");
 });
 afterEach(async () => {
-  resetGlobalHookRunner();
-  await cleanupDynamicToolBuildFixture(root, closers);
+  runtime.resetGlobalHookRunner();
+  await fixtures.cleanupDynamicToolBuildFixture(root, closers);
 });
 
 async function writeProfile(profileDir: string) {
   await fs.mkdir(profileDir, { recursive: true, mode: 0o700 });
-  await fs.writeFile(
-    path.join(profileDir, "hosts.yml"),
-    "github.com:\n  oauth_token: synthetic-selected-token\n",
-    { mode: 0o600 },
-  );
+  const yaml = "github.com:\n  oauth_token: synthetic-selected-token\n";
+  await fs.writeFile(path.join(profileDir, "hosts.yml"), yaml, { mode: 0o600 });
 }
 
 async function effectCommand(body = '"unexpected"') {
@@ -49,10 +36,25 @@ async function effectCommand(body = '"unexpected"') {
   return { effect, command };
 }
 
+type Params = ReturnType<typeof fixtures.createParams>;
+async function attachHost(params: Params, assertCurrent?: () => void) {
+  const { hostCapabilities: _unused, ...attempt } = params;
+  const host = await runtime.createAgentHarnessHostCapabilitiesForTest({
+    attempt,
+    pluginId: "codex",
+    operatorSource: assertCurrent
+      ? { profileId: "original", scopes: ["operator.admin"], assertCurrent }
+      : undefined,
+  });
+  params.hostCapabilities = host.capabilities;
+  closers.push(host.close);
+  return host;
+}
+
 async function fixture(
   options: { mode?: "full" | "deny"; assertCurrent?: () => void; mutateSelection?: boolean } = {},
 ) {
-  const params = createParams(path.join(root, "session.jsonl"), root);
+  const params = fixtures.createParams(path.join(root, "session.jsonl"), root);
   params.agentId = "main";
   params.disableTools = false;
   params.config = {
@@ -61,16 +63,7 @@ async function fixture(
       github: { profileId: "ghp_11111111111111111111111111111111" },
     },
   };
-  const { hostCapabilities: _unused, ...attempt } = params;
-  const host = await createAgentHarnessHostCapabilitiesForTest({
-    attempt,
-    pluginId: "codex",
-    operatorSource: options.assertCurrent
-      ? { profileId: "original", scopes: ["operator.admin"], assertCurrent: options.assertCurrent }
-      : undefined,
-  });
-  params.hostCapabilities = host.capabilities;
-  closers.push(host.close);
+  const host = await attachHost(params, options.assertCurrent);
   const profileDir = host.capabilities.preparedEnvironment!().localIdentityEnv.GH_CONFIG_DIR!;
   await writeProfile(profileDir);
   if (options.mutateSelection) {
@@ -78,27 +71,22 @@ async function fixture(
   }
   const policy = { nativeExecutionPolicy: await prepareTestNativeExecutionPolicy(params) };
   const native = shouldEnableCodexAppServerNativeToolSurface(params, undefined, policy);
-  const tools = await buildDynamicToolsForTest(params, root, {
+  const tools = await fixtures.buildDynamicToolsForTest(params, root, {
     sandbox: null,
     nativeToolSurfaceEnabled: native,
     ...policy,
   });
   const bridge = createCodexDynamicToolBridge({ tools, signal: new AbortController().signal });
   let sequence = 0;
-  return {
-    host,
-    native,
-    profileDir,
-    tools,
-    execute: (command: string) =>
-      bridge.handleToolCall({
-        threadId: "thread",
-        turnId: "turn",
-        callId: "call-" + ++sequence,
-        tool: "exec",
-        arguments: { command, yieldMs: 10000 },
-      }),
-  };
+  const execute = (command: string) =>
+    bridge.handleToolCall({
+      threadId: "thread",
+      turnId: "turn",
+      callId: "call-" + ++sequence,
+      tool: "exec",
+      arguments: { command, yieldMs: 10000 },
+    });
+  return { host, native, profileDir, tools, execute };
 }
 
 describe.skipIf(process.platform === "win32")("Codex host-owned credential execution", () => {
@@ -148,8 +136,8 @@ describe.skipIf(process.platform === "win32")("Codex host-owned credential execu
         await release.promise;
         return {};
       };
-      initializeGlobalHookRunner(
-        createMockPluginRegistry([{ hookName: "before_tool_call", handler }]),
+      runtime.initializeGlobalHookRunner(
+        runtime.createMockPluginRegistry([{ hookName: "before_tool_call", handler }]),
       );
     }
     const { effect, command } = await effectCommand();
@@ -172,20 +160,14 @@ describe.skipIf(process.platform === "win32")("Codex host-owned credential execu
   });
 
   it("retains the native surface by default and disables inherited shell features for host-owned execution", async () => {
-    const params = createParams(path.join(root, "default.jsonl"), root);
+    const params = fixtures.createParams(path.join(root, "default.jsonl"), root);
     params.disableTools = false;
-    const { hostCapabilities: _unused, ...attempt } = params;
-    const host = await createAgentHarnessHostCapabilitiesForTest({ attempt, pluginId: "codex" });
-    closers.push(host.close);
-    params.hostCapabilities = host.capabilities;
+    await attachHost(params);
     const policy = { nativeExecutionPolicy: await prepareTestNativeExecutionPolicy(params) };
     expect(shouldEnableCodexAppServerNativeToolSurface(params, undefined, policy)).toBe(true);
-    expect(
-      buildCodexRuntimeThreadConfig(
-        { "features.shell_tool": true, "features.unified_exec": true },
-        { nativeCodeModeEnabled: false },
-      ),
-    ).toMatchObject({
+    const inherited = { "features.shell_tool": true, "features.unified_exec": true };
+    const config = buildCodexRuntimeThreadConfig(inherited, { nativeCodeModeEnabled: false });
+    expect(config).toMatchObject({
       "features.code_mode": false,
       "features.code_mode_only": false,
       "features.shell_tool": false,
