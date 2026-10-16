@@ -18,14 +18,14 @@ afterEach(() => vi.unstubAllEnvs());
 const stats = (value: number) => ({ avg: value, p50: value, p95: value, min: value, max: value });
 const writeReport = (file: string, cases: unknown[]) =>
   fs.writeFileSync(file, JSON.stringify({ primary: { cases } }));
-const measuredCase = (id: string, name: string) => ({
+const measuredCase = (id: string, name: string, maxRssMb: number | null = 10) => ({
   id,
   name,
-  samples: [{ ms: 10, firstOutputMs: 5, maxRssMb: 10, exitCode: 0, signal: null }],
+  samples: [{ ms: 10, firstOutputMs: 5, maxRssMb, exitCode: 0, signal: null }],
   summary: {
     durationMs: stats(10),
     firstOutputMs: stats(5),
-    maxRssMb: stats(10),
+    maxRssMb: maxRssMb === null ? null : stats(maxRssMb),
   },
 });
 
@@ -46,8 +46,7 @@ function runBenchmark(entry: string, args: string[], env = process.env) {
 }
 
 function expectInputError(result: ReturnType<typeof runBudget>, message: string) {
-  expect(result.status).toBe(1);
-  expect(result.stdout).toBe("");
+  expect(result).toMatchObject({ status: 1, stdout: "" });
   expect(result.stderr).toContain(message);
   expect(result.stderr).not.toContain("at ");
 }
@@ -423,13 +422,7 @@ describe("CLI startup benchmark script spawners", () => {
 
     const missingRssCase = {
       contract: null,
-      ...measuredCase("version", "--version"),
-      samples: [{ ms: 10, firstOutputMs: 5, maxRssMb: null, exitCode: 0, signal: null }],
-      summary: {
-        durationMs: stats(10),
-        firstOutputMs: stats(5),
-        maxRssMb: null,
-      },
+      ...measuredCase("version", "--version", null),
     };
     writeReport(baselinePath, [missingRssCase]);
     writeReport(reportPath, [missingRssCase]);

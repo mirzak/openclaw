@@ -31,7 +31,6 @@ it("scores child submissions and rejects incorrect, missing, excessive, and prem
   const workspace = tempDirs.make("openclaw-fanout-fixture-");
   const receiptsPath = path.join(workspace, "receipts.jsonl");
   const entry = path.join(workspace, "fixture.mjs");
-  await fs.writeFile(receiptsPath, "");
   await fs.writeFile(entry, fixture.pluginSource!);
   const factories: ToolFactory[] = [];
   const plugin = (await import(pathToFileURL(entry).href)) as {

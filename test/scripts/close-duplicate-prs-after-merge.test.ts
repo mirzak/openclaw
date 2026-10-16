@@ -153,36 +153,19 @@ Closing #70530 as a duplicate.`,
 });
 
 describe("defaultRunGh", () => {
-  it("bounds each GitHub lookup with a timeout and SIGKILL", () => {
+  it.each([undefined, "body"])("bounds GitHub calls and forwards optional stdin: %s", (input) => {
+    const args = input ? ["pr", "edit", "123", "--add-label", "duplicate"] : ["pr", "view", "123"];
+    const options = input ? { input } : {};
     const execFileSyncImpl = vi.fn(() => "result");
-    const result = defaultRunGh(["pr", "view", "123"], {}, { execFileSyncImpl });
-    expect(result).toBe("result");
+    expect(defaultRunGh(args, options, { execFileSyncImpl })).toBe("result");
     expect(execFileSyncImpl).toHaveBeenCalledWith(
       "gh",
-      ["pr", "view", "123"],
+      args,
       expect.objectContaining({
+        ...options,
         encoding: "utf8",
         killSignal: "SIGKILL",
-        stdio: ["ignore", "pipe", "inherit"],
-        timeout: 60_000,
-      }),
-    );
-  });
-
-  it("forwards stdin input while keeping the timeout bound", () => {
-    const execFileSyncImpl = vi.fn(() => "ok");
-    defaultRunGh(
-      ["pr", "edit", "123", "--add-label", "duplicate"],
-      { input: "body" },
-      { execFileSyncImpl },
-    );
-    expect(execFileSyncImpl).toHaveBeenCalledWith(
-      "gh",
-      ["pr", "edit", "123", "--add-label", "duplicate"],
-      expect.objectContaining({
-        input: "body",
-        killSignal: "SIGKILL",
-        stdio: ["pipe", "pipe", "inherit"],
+        stdio: [input ? "pipe" : "ignore", "pipe", "inherit"],
         timeout: 60_000,
       }),
     );

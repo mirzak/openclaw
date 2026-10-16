@@ -37,6 +37,9 @@ const repository = "openclaw/openclaw";
 const parentWorkflow = ".github/workflows/openclaw-release-publish.yml";
 const childWorkflow = ".github/workflows/plugin-clawhub-release.yml";
 const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+const jobsPath = (run: number, attempt: number, page = 1) =>
+  `actions/runs/${run}/attempts/${attempt}/jobs?per_page=100&page=${page}`;
+const artifactsPath = (run: number) => `actions/runs/${run}/artifacts?per_page=100&page=1`;
 const completed = { status: "completed", conclusion: "success" };
 function job(name: string, run_id = 20, run_attempt = 1, steps: string[] = []) {
   return {
@@ -79,18 +82,15 @@ function sealParent(f: ReturnType<typeof fixture>, conclusion = "success") {
     "authorization.json",
     createClawHubParentAuthorization(f.transactions, "automated-sealed"),
   );
-  f.metadata.set(
-    "actions/runs/10/attempts/1/jobs?per_page=100&page=1",
-    jobPage([
-      {
-        ...job("Publish plugins, then OpenClaw", 10, 1, [
-          "Upload exact release child dispatch record",
-          "Upload immutable ClawHub parent authorization",
-        ]),
-        conclusion,
-      },
-    ]),
-  );
+  f.setJobs(10, 1, [
+    {
+      ...job("Publish plugins, then OpenClaw", 10, 1, [
+        "Upload exact release child dispatch record",
+        "Upload immutable ClawHub parent authorization",
+      ]),
+      conclusion,
+    },
+  ]);
 }
 
 function zip(name: string, bytes: Buffer) {
@@ -259,12 +259,9 @@ function fixture(
     [`actions/runs/10/attempts/${parentRunAttempt}`, parent],
     ["actions/runs/20/attempts/1", child],
     ["actions/runs/20", child],
+    [artifactsPath(10), { total_count: 2, artifacts: [receiptArtifact, dispatchArtifact] }],
     [
-      "actions/runs/10/artifacts?per_page=100&page=1",
-      { total_count: 2, artifacts: [receiptArtifact, dispatchArtifact] },
-    ],
-    [
-      "actions/runs/20/artifacts?per_page=100&page=1",
+      artifactsPath(20),
       { total_count: 3, artifacts: [transactionsArtifact, packageArtifact, recoveryArtifact] },
     ],
     [
@@ -272,7 +269,7 @@ function fixture(
       { total_count: 1, artifacts: [transactionsArtifact] },
     ],
     [
-      "actions/runs/20/attempts/1/jobs?per_page=100&page=1",
+      jobsPath(20, 1),
       jobPage([
         job("Seal exact ClawHub recovery manifest", 20, 1, ["Upload sealed recovery manifest"]),
         job("Seal ClawHub package transactions"),
@@ -292,6 +289,10 @@ function fixture(
       recoveryArtifact,
     ].map((item): [string, unknown] => [`actions/artifacts/${item.id}`, item]),
   ]);
+  const setJobs = (id: number, attempt: number, jobs: unknown[], total = jobs.length, page = 1) =>
+    metadata.set(jobsPath(id, attempt, page), { total_count: total, jobs });
+  const setArtifacts = (id: number, artifacts: unknown[], total = artifacts.length) =>
+    metadata.set(artifactsPath(id), { total_count: total, artifacts });
   const githubReads: string[] = [];
   const registryReads: string[] = [];
   const archiveIdentity = {
@@ -367,6 +368,8 @@ function fixture(
     },
   };
   return {
+    setJobs,
+    setArtifacts,
     directory,
     tarball,
     packageArtifact,
@@ -406,19 +409,13 @@ function retryFixture({
   f.metadata.set(`actions/runs/10/attempts/${terminalAttempt}`, f.parent);
   const uploadStep = {
     name: "Upload exact release child dispatch record",
-    status: "completed",
-    conclusion: "success",
+    ...completed,
     number: 23,
     started_at: "2026-10-05T18:48:31Z",
     completed_at: "2026-10-05T18:48:32Z",
   };
   const producer = {
-    run_id: 10,
-    run_attempt: producerAttempt,
-    head_sha: sha,
-    name: jobName,
-    status: "completed",
-    conclusion: "success",
+    ...job(jobName, 10, producerAttempt),
     runner_id: 42,
     started_at: "2026-10-05T18:43:49Z",
     completed_at: "2026-10-05T19:10:19Z",
@@ -428,10 +425,7 @@ function retryFixture({
   const terminalUpload = { ...uploadStep };
   const terminalProducer = { ...producer, run_attempt: terminalAttempt, steps: [terminalUpload] };
   for (const producerJob of [originalProducer, terminalProducer]) {
-    f.metadata.set(`actions/runs/10/attempts/${producerJob.run_attempt}/jobs?per_page=100&page=1`, {
-      total_count: 1,
-      jobs: [producerJob],
-    });
+    f.setJobs(10, producerJob.run_attempt, [producerJob]);
   }
   return { ...f, originalProducer, terminalProducer, terminalUpload };
 }
@@ -900,29 +894,19 @@ describe("ClawHub detached postpublish verification", () => {
     const oldRun = { ...f.parent, run_attempt: 1, conclusion: "failure" };
     const oldJob = { ...structuredClone(f.originalProducer), run_attempt: 1, runner_id: 7 };
     f.metadata.set("actions/runs/10/attempts/1", oldRun);
-    f.metadata.set("actions/runs/10/attempts/1/jobs?per_page=100&page=1", {
-      total_count: 1,
-      jobs: [oldJob],
-    });
-    const oldArchive = zip(
-      "dispatch.json",
-      Buffer.from(
-        JSON.stringify({ ...f.dispatch, parentRunAttempt: "1", normalClawHubRunId: "19" }),
-      ),
-    );
+    f.setJobs(10, 1, [oldJob]);
     const oldArtifact = {
       ...f.dispatchArtifact,
       id: 5,
       name: "openclaw-release-children-10-1",
-      size_in_bytes: oldArchive.length,
-      digest: `sha256:${digest(oldArchive)}`,
     };
-    f.archives.set(5, oldArchive);
-    f.metadata.set("actions/artifacts/5", oldArtifact);
-    f.metadata.set("actions/runs/10/artifacts?per_page=100&page=1", {
-      total_count: 3,
-      artifacts: [oldArtifact, f.receiptArtifact, f.dispatchArtifact],
+    replaceJsonArtifact(f, oldArtifact, "dispatch.json", {
+      ...f.dispatch,
+      parentRunAttempt: "1",
+      normalClawHubRunId: "19",
     });
+    f.metadata.set("actions/artifacts/5", oldArtifact);
+    f.setArtifacts(10, [oldArtifact, f.receiptArtifact, f.dispatchArtifact]);
     expect(await verifyClawHubPostpublish(f.options)).toMatchObject({
       complete: true,
       parentRunAttempt: 3,
@@ -959,10 +943,11 @@ describe("ClawHub detached postpublish verification", () => {
       } else if (change === "future record") {
         f.dispatchArtifact.name = "openclaw-release-children-10-3";
       } else if (change === "ambiguous records") {
-        f.metadata.set("actions/runs/10/artifacts?per_page=100&page=1", {
-          total_count: 3,
-          artifacts: [f.receiptArtifact, f.dispatchArtifact, { ...f.dispatchArtifact, id: 5 }],
-        });
+        f.setArtifacts(10, [
+          f.receiptArtifact,
+          f.dispatchArtifact,
+          { ...f.dispatchArtifact, id: 5 },
+        ]);
       } else if (change === "changed digest") {
         const changed = Buffer.from(f.archives.get(4)!);
         changed.writeUInt32LE(0, 0);
@@ -974,18 +959,15 @@ describe("ClawHub detached postpublish verification", () => {
           path: `${parentWorkflow}@refs/heads/main`,
         });
       } else if (change === "parallel producer") {
-        f.metadata.set("actions/runs/10/attempts/2/jobs?per_page=100&page=1", {
-          total_count: 2,
-          jobs: [f.terminalProducer, { ...f.terminalProducer, runner_id: 7 }],
-        });
+        f.setJobs(10, 2, [f.terminalProducer, { ...f.terminalProducer, runner_id: 7 }]);
       } else if (change === "excessive history") {
-        f.metadata.set("actions/runs/10/artifacts?per_page=100&page=1", {
-          total_count: 33,
-          artifacts: Array.from({ length: 33 }, (_, index) => ({
+        f.setArtifacts(
+          10,
+          Array.from({ length: 33 }, (_, index) => ({
             ...f.dispatchArtifact,
             id: index + 4,
           })),
-        });
+        );
       } else {
         f.metadata.set("actions/runs/10/attempts/1", {
           ...f.parent,
@@ -998,102 +980,70 @@ describe("ClawHub detached postpublish verification", () => {
   );
 
   it.each([
-    {
-      label: "sealed milestone while the parent remains active",
-      status: "in_progress",
-      conclusion: null,
-      parentStatePolicy: "sealed-producer",
-      childConclusion: "success",
-      parentJobConclusion: "success",
-    },
-    {
-      label: "sealed milestone after parent and child failure",
-      status: "completed",
-      conclusion: "failure",
-      parentStatePolicy: "sealed-producer",
-      childConclusion: "failure",
-      parentJobConclusion: "success",
-    },
-    {
-      label: "sealed milestone after parent success",
-      status: "completed",
-      conclusion: "success",
-      parentStatePolicy: "sealed-producer",
-      childConclusion: "success",
-      parentJobConclusion: "success",
-    },
-    {
-      label: "protected recovery after parent cancellation",
-      status: "completed",
-      conclusion: "cancelled",
-      parentStatePolicy: "recovery-producer",
-      childConclusion: "success",
-      parentJobConclusion: "cancelled",
-    },
-  ])("reconciles the complete roster from $label", async (parentState) => {
-    const f = fixture();
-    const parent = {
-      ...f.parent,
-      status: parentState.status,
-      conclusion: parentState.conclusion,
-    };
-    f.metadata.set("actions/runs/10/attempts/1", parent);
-    f.child.conclusion = parentState.childConclusion;
-    sealParent(f, parentState.parentJobConclusion);
+    ["active parent", "in_progress", null, "sealed-producer", "success", "success"],
+    ["failed parent and child", "completed", "failure", "sealed-producer", "failure", "success"],
+    ["successful parent", "completed", "success", "sealed-producer", "success", "success"],
+    ["cancelled parent", "completed", "cancelled", "recovery-producer", "success", "cancelled"],
+  ] as const)(
+    "reconciles the complete roster from %s",
+    async (_label, status, conclusion, parentStatePolicy, childConclusion, parentJobConclusion) => {
+      const f = fixture();
+      const parent = {
+        ...f.parent,
+        status,
+        conclusion,
+      };
+      f.metadata.set("actions/runs/10/attempts/1", parent);
+      f.child.conclusion = childConclusion;
+      sealParent(f, parentJobConclusion);
 
-    const recoveryManifest = {
-      schemaVersion: 1,
-      kind: "openclaw-clawhub-recovery-manifest",
-      identity: f.transactions.identity,
-      packages: f.transactions.packages.map((entry) => ({
-        ...entry,
-        publicationStatus: "pending",
-        attemptId: "attempt-1",
-      })),
-    };
-    if (parentState.parentStatePolicy === "recovery-producer") {
-      const authorized = await verifyClawHubPostpublish({
+      const recoveryManifest = {
+        schemaVersion: 1,
+        kind: "openclaw-clawhub-recovery-manifest",
+        identity: f.transactions.identity,
+        packages: f.transactions.packages.map((entry) => ({
+          ...entry,
+          publicationStatus: "pending",
+          attemptId: "attempt-1",
+        })),
+      };
+      if (parentStatePolicy === "recovery-producer") {
+        const authorized = await verifyClawHubPostpublish({
+          ...f.options,
+          parent,
+          parentStatePolicy,
+          recoveryManifest,
+          verifyPublication: false,
+        });
+        expect(authorized).toMatchObject({
+          complete: true,
+          outcome: "authorized-recovery-roster",
+        });
+        expect(f.registryReads).toEqual([]);
+      }
+
+      const result = await verifyClawHubPostpublish({
         ...f.options,
         parent,
-        parentStatePolicy: parentState.parentStatePolicy,
-        recoveryManifest,
-        verifyPublication: false,
+        parentStatePolicy,
+        recoveryManifest: parentStatePolicy === "recovery-producer" ? recoveryManifest : undefined,
       });
-      expect(authorized).toMatchObject({
-        complete: true,
-        outcome: "authorized-recovery-roster",
-      });
-      expect(f.registryReads).toEqual([]);
-    }
-
-    const result = await verifyClawHubPostpublish({
-      ...f.options,
-      parent,
-      parentStatePolicy: parentState.parentStatePolicy,
-      recoveryManifest:
-        parentState.parentStatePolicy === "recovery-producer" ? recoveryManifest : undefined,
-    });
-    expect(result.complete).toBe(true);
-    expect(result.packages).toHaveLength(1);
-    f.metadata.set("actions/runs/20/artifacts?per_page=100&page=1", {
-      total_count: 2,
-      artifacts: [f.metadata.get("actions/artifacts/2"), f.packageArtifact],
-    });
-    await expect(
-      verifyClawHubPostpublish({
-        ...f.options,
-        parent,
-        parentStatePolicy: parentState.parentStatePolicy,
-      }),
-    ).rejects.toThrow(/sealed ClawHub original attempt roster/u);
-  });
+      expect(result.complete).toBe(true);
+      expect(result.packages).toHaveLength(1);
+      f.setArtifacts(20, [f.metadata.get("actions/artifacts/2"), f.packageArtifact]);
+      await expect(
+        verifyClawHubPostpublish({
+          ...f.options,
+          parent,
+          parentStatePolicy,
+        }),
+      ).rejects.toThrow(/sealed ClawHub original attempt roster/u);
+    },
+  );
 
   it("verifies historical successful publishers without recovery manifests", async () => {
     const f = fixture();
-    f.metadata.set("actions/runs/20/artifacts?per_page=100&page=1", {
-      total_count: 2,
-      artifacts: [f.metadata.get("actions/artifacts/2"), f.packageArtifact],
-    });
+    f.setArtifacts(20, [f.metadata.get("actions/artifacts/2"), f.packageArtifact]);
     expect(await verifyClawHubPostpublish(f.options)).toMatchObject({
       complete: true,
       packages: [expect.objectContaining({ inventoryDigest: f.entry.inventoryDigest })],
@@ -1191,17 +1141,11 @@ describe("ClawHub detached postpublish verification", () => {
     f.metadata.set("actions/runs/10/attempts/1", parent);
     sealParent(f);
     const firstPage = Array.from({ length: 100 }, (_, index) => job(`Unrelated job ${index}`));
-    const original = f.metadata.get("actions/runs/20/attempts/1/jobs?per_page=100&page=1") as {
+    const original = f.metadata.get(jobsPath(20, 1)) as {
       jobs: unknown[];
     };
-    f.metadata.set("actions/runs/20/attempts/1/jobs?per_page=100&page=1", {
-      total_count: 103,
-      jobs: firstPage,
-    });
-    f.metadata.set("actions/runs/20/attempts/1/jobs?per_page=100&page=2", {
-      total_count: 103,
-      jobs: original.jobs,
-    });
+    f.setJobs(20, 1, firstPage, 103);
+    f.setJobs(20, 1, original.jobs, 103, 2);
     const result = await verifyClawHubPostpublish({
       ...f.options,
       parent,
@@ -1353,10 +1297,7 @@ describe("ClawHub detached postpublish verification", () => {
 
   it("does not mistake a missing dispatch record for an empty release", async () => {
     const f = fixture();
-    f.metadata.set("actions/runs/10/artifacts?per_page=100&page=1", {
-      total_count: 0,
-      artifacts: [],
-    });
+    f.setArtifacts(10, []);
     await rejectsBeforeRegistry(f, /dispatch record/u);
   });
 
