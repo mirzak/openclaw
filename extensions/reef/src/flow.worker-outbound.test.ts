@@ -30,6 +30,24 @@ describe("Reef worker outbound composition", () => {
   let trusted: ReturnType<typeof openReefTrustStore>;
   let audit: ReturnType<typeof openReefAuditStore>;
   let flow: ReefMessageFlow;
+  const send = (id: string) => flow.send("alice", "private coordination", { messageId: id });
+  const auditEntries = async (id: string) =>
+    (await audit.entries()).filter(
+      (entry) => isRecord(entry.event.payload) && entry.event.payload.id === id,
+    );
+  const auditTypes = async (id: string) =>
+    (await auditEntries(id)).map((entry) => entry.event.type);
+
+  async function decideReview(approved: boolean) {
+    const id = prepareReefMessageId();
+    classify.classify.mockResolvedValue({ ...allow, decision: "review" });
+    await expect(send(id)).rejects.toMatchObject({ reviewOutcome: "pending" });
+    const [review] = await stores.reviews.list();
+    expect(review?.id).toBe(id);
+    await stores.reviews.decide(review!.approvalDigest, approved);
+    classify.classify.mockClear();
+    return id;
+  }
 
   const makeFlow = (reviews = stores.reviews) =>
     new ReefMessageFlow({
@@ -90,7 +108,7 @@ describe("Reef worker outbound composition", () => {
     const hostSql = observeHostDataSql();
     const firstSecond = Math.floor(Date.now() / 1000);
     try {
-      expect(await flow.send("alice", "private coordination", { messageId: id })).toBe(id);
+      expect(await send(id)).toBe(id);
       expect(commands()).toEqual(["pluginState.executeOperation", "pluginState.executeOperation"]);
       for (const call of hostSql.calls) {
         expect(call).not.toHaveBeenCalled();
@@ -99,9 +117,7 @@ describe("Reef worker outbound composition", () => {
       hostSql.restore();
     }
     expect(fetcher).toHaveBeenCalledOnce();
-    const entries = (await audit.entries()).filter(
-      (entry) => isRecord(entry.event.payload) && entry.event.payload.id === id,
-    );
+    const entries = await auditEntries(id);
     expect(entries.map((entry) => entry.event.type)).toEqual([
       "proposal",
       "guard_verdict",
@@ -114,54 +130,28 @@ describe("Reef worker outbound composition", () => {
     const delivery = (await trusted.readOutboundDelivery("alice", id))?.delivery;
     expect(delivery).toMatchObject({
       recipient: { keyEpoch: 1, ed25519PublicKey: peer.signing.publicKey },
+      bodyHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      textHash: expect.stringMatching(/^[a-f0-9]{64}$/u),
     });
-    expect(delivery?.bodyHash).toMatch(/^[a-f0-9]{64}$/u);
-    expect(delivery?.textHash).toMatch(/^[a-f0-9]{64}$/u);
   });
 
-  it.each(["denied"] as const)(
-    "settles an existing %s review in one command without classifying again",
-    async (decision) => {
-      const id = prepareReefMessageId();
-      classify.classify.mockResolvedValue({ ...allow, decision: "review" });
-      await expect(
-        flow.send("alice", "private coordination", { messageId: id }),
-      ).rejects.toMatchObject({ reviewOutcome: "pending" });
-      const [review] = await stores.reviews.list();
-      expect(review?.id).toBe(id);
-      if (decision === "denied") {
-        await stores.reviews.decide(review!.approvalDigest, false);
-      }
-      classify.classify.mockClear();
-      const commands = recordDispatches();
-      await expect(
-        flow.send("alice", "private coordination", { messageId: id }),
-      ).rejects.toMatchObject({ reviewOutcome: decision });
-      expect(commands()).toEqual(["pluginState.executeOperation"]);
-      expect(classify.classify).not.toHaveBeenCalled();
-      expect(fetcher).not.toHaveBeenCalled();
-    },
-  );
+  it("settles an existing denied review in one command without classifying again", async () => {
+    const id = await decideReview(false);
+    const commands = recordDispatches();
+    await expect(send(id)).rejects.toMatchObject({ reviewOutcome: "denied" });
+    expect(commands()).toEqual(["pluginState.executeOperation"]);
+    expect(classify.classify).not.toHaveBeenCalled();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
 
   it("reclassifies an approved review once and commits its approved send in two commands", async () => {
-    const id = prepareReefMessageId();
-    classify.classify.mockResolvedValue({ ...allow, decision: "review" });
-    await expect(
-      flow.send("alice", "private coordination", { messageId: id }),
-    ).rejects.toMatchObject({ reviewOutcome: "pending" });
-    const [review] = await stores.reviews.list();
-    await stores.reviews.decide(review!.approvalDigest, true);
-    classify.classify.mockClear();
+    const id = await decideReview(true);
     const commands = recordDispatches();
-    expect(await flow.send("alice", "private coordination", { messageId: id })).toBe(id);
+    expect(await send(id)).toBe(id);
     expect(commands()).toHaveLength(2);
     expect(classify.classify).toHaveBeenCalledOnce();
     expect(fetcher).toHaveBeenCalledOnce();
-    expect(
-      (await audit.entries())
-        .filter((entry) => isRecord(entry.event.payload) && entry.event.payload.id === id)
-        .map((entry) => entry.event.type),
-    ).toEqual([
+    expect(await auditTypes(id)).toEqual([
       "proposal",
       "guard_verdict",
       "proposal",
@@ -215,11 +205,7 @@ describe("Reef worker outbound composition", () => {
     ).rejects.toThrow("pending review capacity");
     expect(commands()).toHaveLength(2);
     expect(fetcher).not.toHaveBeenCalled();
-    expect(
-      (await audit.entries())
-        .filter((entry) => isRecord(entry.event.payload) && entry.event.payload.id === id)
-        .map((entry) => entry.event.type),
-    ).toEqual(["proposal", "guard_verdict"]);
+    expect(await auditTypes(id)).toEqual(["proposal", "guard_verdict"]);
     expect(await trusted.readOutboundDelivery("alice", id)).toBeUndefined();
   });
 
@@ -232,12 +218,10 @@ describe("Reef worker outbound composition", () => {
     });
     const id = prepareReefMessageId();
     const commands = recordDispatches();
-    const first = flow.send("alice", "private coordination", { messageId: id });
+    const first = send(id);
     try {
       await started.promise;
-      await expect(flow.send("alice", "private coordination", { messageId: id })).rejects.toThrow(
-        "Duplicate outbound",
-      );
+      await expect(send(id)).rejects.toThrow("Duplicate outbound");
       expect(commands()).toHaveLength(1);
     } finally {
       verdict.resolve(allow);

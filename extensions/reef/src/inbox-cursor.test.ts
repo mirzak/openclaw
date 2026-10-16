@@ -1,22 +1,19 @@
 import { DatabaseSync } from "node:sqlite";
 import type {
   OpenAsyncKeyedStoreOptions,
-  OpenKeyedStoreOptions,
   PluginStateKeyedStore,
   PluginStateOperation,
   PluginStateOperationDefinitions,
 } from "openclaw/plugin-sdk/plugin-state-runtime";
-import {
-  createPluginStateKeyedStoreV2ForTests,
-  createPluginStateSyncKeyedStoreForTests,
-  resetPluginStateStoreForTests,
-} from "openclaw/plugin-sdk/plugin-state-test-runtime";
-import { createPluginRuntimeMock } from "openclaw/plugin-sdk/plugin-test-runtime";
+import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ReefInboxCursorStore } from "./state.js";
-import { expectReefStateOperationError } from "./state.test-support.js";
+import {
+  createRuntime as createStateRuntime,
+  expectReefStateOperationError,
+} from "./state.test-support.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const binding = { handle: "molty", relayUrl: "https://reefwire.ai" };
@@ -37,18 +34,12 @@ describe("Reef inbox cursor persistence", () => {
   });
 
   function createRuntime() {
-    const runtime = createPluginRuntimeMock();
+    const runtime = createStateRuntime(stateDir);
+    const open = runtime.state.openKeyedStoreV2;
     const commands: string[] = [];
     const hooks: { before?: () => Promise<void> | void; after?: () => Promise<void> | void } = {};
     runtime.state.openKeyedStoreV2 = <T>(storeOptions: OpenAsyncKeyedStoreOptions) => {
-      const store: PluginStateKeyedStore<T, 2> = createPluginStateKeyedStoreV2ForTests<T>(
-        "reef",
-        {
-          ...storeOptions,
-          env: { OPENCLAW_STATE_DIR: stateDir },
-        },
-        { assertCurrent() {} },
-      );
+      const store: PluginStateKeyedStore<T, 2> = open<T>(storeOptions);
       const createOperation = store.createOperation!;
       store.createOperation = <Operations extends PluginStateOperationDefinitions>(
         ...args: Parameters<typeof createOperation>
@@ -70,11 +61,6 @@ describe("Reef inbox cursor persistence", () => {
       };
       return store;
     };
-    runtime.state.openSyncKeyedStore = <T>(storeOptions: OpenKeyedStoreOptions) =>
-      createPluginStateSyncKeyedStoreForTests<T>("reef", {
-        ...storeOptions,
-        env: { OPENCLAW_STATE_DIR: stateDir },
-      });
     return Object.assign(runtime, { commands, hooks });
   }
 
