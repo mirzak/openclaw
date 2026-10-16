@@ -1,4 +1,3 @@
-// Local Check Runtime tests cover local check runtime script behavior.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -173,45 +172,38 @@ describe("local-check-runtime", () => {
     },
   );
 
-  it.each([{ name: "unresolved capacity", total: 64, capacity: null, throttled: true }])(
-    "sizes compiler workers from $name instead of remaining memory",
-    (row) => {
-      for (const ci of [undefined, "true"]) {
-        const host = {
-          logicalCpuCount: 16,
-          totalMemoryBytes: row.total * GIB,
-          memoryCapacityBytes: row.capacity == null ? row.capacity : row.capacity * GIB,
-          memoryLimitBytes: GIB,
-        };
-        const inputEnv = makeEnv({
-          CI: ci,
-          OPENCLAW_LOCAL_CHECK: ci ? "0" : "1",
-          GOMAXPROCS: undefined,
-          GOGC: undefined,
-          GOMEMLIMIT: undefined,
-        });
-        const tsgo = applyLocalTsgoPolicy(["--noEmit"], inputEnv, host);
-        const oxlint = applyLocalOxlintPolicy([], inputEnv, host);
-        for (const [result, flag, throttled] of [
-          [tsgo, "--singleThreaded", row.throttled],
-          // Local Oxlint remains throttled by default, including on roomy machines.
-          [oxlint, "--threads=1", ci ? row.throttled : true],
-        ] as const) {
-          expect(result.args.includes(flag)).toBe(throttled);
-          expect(result.env.GOMEMLIMIT).toBe(throttled ? "3GiB" : undefined);
-          expect(result.env.GOMAXPROCS).toBe(throttled ? "2" : undefined);
-        }
+  it("sizes compiler workers from unresolved capacity instead of remaining memory", () => {
+    const host = {
+      logicalCpuCount: 16,
+      totalMemoryBytes: 64 * GIB,
+      memoryCapacityBytes: null,
+      memoryLimitBytes: GIB,
+    };
+    for (const ci of [undefined, "true"]) {
+      const inputEnv = makeEnv({
+        CI: ci,
+        OPENCLAW_LOCAL_CHECK: ci ? "0" : "1",
+        GOMAXPROCS: undefined,
+        GOGC: undefined,
+        GOMEMLIMIT: undefined,
+      });
+      for (const [result, flag] of [
+        [applyLocalTsgoPolicy(["--noEmit"], inputEnv, host), "--singleThreaded"],
+        [applyLocalOxlintPolicy([], inputEnv, host), "--threads=1"],
+      ] as const) {
+        expect(result.args).toContain(flag);
+        expect(result.env.GOMEMLIMIT).toBe("3GiB");
+        expect(result.env.GOMAXPROCS).toBe("2");
       }
-    },
-  );
+    }
+  });
 
   type BoundedCase = {
     name: string;
-    args?: string[];
+    args: string[];
     host?: Partial<CheckResources>;
     env?: NodeJS.ProcessEnv;
-    admission?: "missing" | "changed";
-    threads?: "1" | "2";
+    threads: "1" | "2";
     expectedEnv?: NodeJS.ProcessEnv;
     measured?: boolean;
     unmeasuredArgs?: string[][];
@@ -241,18 +233,12 @@ describe("local-check-runtime", () => {
       name: "extensions/tsconfig.json, null available, bound admission",
       args: ["--tsconfig", "extensions/tsconfig.json", "extensions/example"],
       host: { memoryLimitBytes: null },
-      admission: undefined,
       threads: "1",
     },
   ];
   it.each(boundedCases)("applies the bounded CI budget for $name", (row) => {
-    const args = [...(row.args ?? ["--tsconfig=extensions/tsconfig.json"])];
+    const args = row.args;
     const inputEnv = makeBoundedOxlintEnv(args, row.env);
-    if (row.admission === "missing") {
-      delete inputEnv.OPENCLAW_OXLINT_BOUNDED_SHARD_ARGS;
-    } else if (row.admission === "changed") {
-      args.push("scripts/unmeasured.mts");
-    }
     const host: CheckResources = {
       logicalCpuCount: 4,
       totalMemoryBytes: 16 * GIB,
@@ -263,9 +249,7 @@ describe("local-check-runtime", () => {
     };
     const result = applyLocalOxlintPolicy(args, inputEnv, host);
     expect(result.env).toMatchObject(row.expectedEnv ?? throttledGoEnv);
-    if (row.threads) {
-      expect(result.args).toContain(`--threads=${row.threads}`);
-    }
+    expect(result.args).toContain(`--threads=${row.threads}`);
     if (row.measured) {
       expect(result.args).toContain("--type-aware");
       expect(inputEnv.GOMEMLIMIT).toBeUndefined();
@@ -277,79 +261,72 @@ describe("local-check-runtime", () => {
     }
   });
 
-  it.each([
-    {
-      name: "default Go settings",
-      goEnv: { GOMAXPROCS: undefined, GOGC: undefined, GOMEMLIMIT: undefined },
-      prepGoEnv: { GOMAXPROCS: null, GOGC: null, GOMEMLIMIT: null },
-      lintGoEnv: {
-        GOMAXPROCS: String(Math.min(2, Math.max(1, os.availableParallelism()))),
-        GOGC: "30",
-        GOMEMLIMIT: "3GiB",
-      },
-    },
-  ])(
-    "keeps prep and oxlint resource policies separate with $name",
-    ({ goEnv, prepGoEnv, lintGoEnv }) => {
-      const cwd = createTempDir("openclaw-oxlint-go-limit-");
-      // Keep artifact ownership inside this fixture when its temp directory has a checkout ancestor.
-      fs.mkdirSync(path.join(cwd, ".git"));
-      const binDir = path.join(cwd, "node_modules", ".bin");
-      const scriptsDir = path.join(cwd, "scripts");
-      const capturePath = path.join(cwd, "children.jsonl");
-      const oxlintPath = path.join(binDir, "oxlint");
-      fs.mkdirSync(binDir, { recursive: true });
-      fs.mkdirSync(scriptsDir, { recursive: true });
-      const captureSource = `
+  it("keeps prep and oxlint resource policies separate", () => {
+    const goEnv = { GOMAXPROCS: undefined, GOGC: undefined, GOMEMLIMIT: undefined };
+    const prepGoEnv = { GOMAXPROCS: null, GOGC: null, GOMEMLIMIT: null };
+    const lintGoEnv = {
+      GOMAXPROCS: String(Math.min(2, Math.max(1, os.availableParallelism()))),
+      GOGC: "30",
+      GOMEMLIMIT: "3GiB",
+    };
+    const cwd = createTempDir("openclaw-oxlint-go-limit-");
+    // Keep artifact ownership inside this fixture when its temp directory has a checkout ancestor.
+    fs.mkdirSync(path.join(cwd, ".git"));
+    const binDir = path.join(cwd, "node_modules", ".bin");
+    const scriptsDir = path.join(cwd, "scripts");
+    const capturePath = path.join(cwd, "children.jsonl");
+    const oxlintPath = path.join(binDir, "oxlint");
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.mkdirSync(scriptsDir, { recursive: true });
+    const captureSource = `
 const goEnv = Object.fromEntries(["GOMAXPROCS", "GOGC", "GOMEMLIMIT"].map(key => [key, process.env[key] ?? null]));
 fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({ step, goEnv, args: process.argv.slice(2) }) + "\\n");
 `;
-      fs.writeFileSync(
-        path.join(scriptsDir, "prepare-extension-package-boundary-artifacts.mts"),
-        `import fs from "node:fs";\nconst step = "prep";\n${captureSource}`,
-        "utf8",
-      );
-      fs.writeFileSync(
-        oxlintPath,
-        `#!/usr/bin/env node\nconst fs = require("node:fs");\nconst step = "lint";\n${captureSource}`,
-        "utf8",
-      );
-      fs.chmodSync(oxlintPath, 0o755);
-      const env = makeEnv({
-        CAPTURE_PATH: capturePath,
-        OPENCLAW_OXLINT_SKIP_PREPARE: undefined,
-        ...goEnv,
-      });
+    fs.writeFileSync(
+      path.join(scriptsDir, "prepare-extension-package-boundary-artifacts.mts"),
+      `import fs from "node:fs";\nconst step = "prep";\n${captureSource}`,
+      "utf8",
+    );
+    fs.writeFileSync(
+      oxlintPath,
+      `#!/usr/bin/env node\nconst fs = require("node:fs");\nconst step = "lint";\n${captureSource}`,
+      "utf8",
+    );
+    fs.chmodSync(oxlintPath, 0o755);
+    const env = makeEnv({
+      CAPTURE_PATH: capturePath,
+      OPENCLAW_OXLINT_SKIP_PREPARE: undefined,
+      ...goEnv,
+    });
 
-      const result = spawnSync(
-        process.execPath,
-        [path.resolve("scripts/run-oxlint.mjs"), "--tsconfig", "extensions/tsconfig.json"],
-        { cwd, encoding: "utf8", env },
-      );
+    const result = spawnSync(
+      process.execPath,
+      [path.resolve("scripts/run-oxlint.mjs"), "--tsconfig", "extensions/tsconfig.json"],
+      { cwd, encoding: "utf8", env },
+    );
 
-      expect(result.status, result.stderr).toBe(0);
-      const children = fs
-        .readFileSync(capturePath, "utf8")
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line));
-      expect(children).toEqual([
-        { step: "prep", goEnv: prepGoEnv, args: ["--mode=package-boundary"] },
-        {
-          step: "lint",
-          goEnv: lintGoEnv,
-          args: [
-            "--tsconfig",
-            "extensions/tsconfig.json",
-            "--type-aware",
-            "--report-unused-disable-directives-severity",
-            "error",
-            "--threads=1",
-          ],
-        },
-      ]);
-    },
-  );
+    expect(result.status, result.stderr).toBe(0);
+    const children = fs
+      .readFileSync(capturePath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(children).toEqual([
+      { step: "prep", goEnv: prepGoEnv, args: ["--mode=package-boundary"] },
+      {
+        step: "lint",
+        goEnv: lintGoEnv,
+        args: [
+          "--tsconfig",
+          "extensions/tsconfig.json",
+          "--type-aware",
+          "--report-unused-disable-directives-severity",
+          "error",
+          "--threads=1",
+        ],
+      },
+    ]);
+  });
 
   it.each([undefined, "-fjson"])(
     "keeps GitHub Actions output formatting explicit (%s)",
@@ -495,21 +472,14 @@ describe("Tooling bootstrap dependency ownership", () => {
     },
   );
 
-  it.each([false])(
-    "refuses a missing worktree install with an empty override=%s",
-    (emptyOverride) => {
-      const { checkout, modules } = fixture();
-      if (emptyOverride) {
-        vi.stubEnv("PNPM_CONFIG_MODULES_DIR", "");
-        vi.stubEnv("pnpm_config_modules_dir", modules);
-      }
-      const before = fs.statSync(modules);
-      expect(() => resolveTsxImport(checkout)).toThrow("pnpm install --frozen-lockfile");
-      expect(fs.existsSync(path.join(checkout, "node_modules"))).toBe(false);
-      expect(fs.statSync(modules).ino).toBe(before.ino);
-      expect(fs.statSync(modules).mtimeMs).toBe(before.mtimeMs);
-    },
-  );
+  it("refuses a missing worktree install", () => {
+    const { checkout, modules } = fixture();
+    const before = fs.statSync(modules);
+    expect(() => resolveTsxImport(checkout)).toThrow("pnpm install --frozen-lockfile");
+    expect(fs.existsSync(path.join(checkout, "node_modules"))).toBe(false);
+    expect(fs.statSync(modules).ino).toBe(before.ino);
+    expect(fs.statSync(modules).mtimeMs).toBe(before.mtimeMs);
+  });
 
   it("keeps an existing explicit borrow readable without replacing its link", () => {
     const { checkout, modules, entry } = fixture();
@@ -538,19 +508,10 @@ describe("Tooling bootstrap dependency ownership", () => {
     expect(fs.lstatSync(localModules).isSymbolicLink()).toBe(false);
   });
 
-  it.each([{ key: "npm_config_modules_dir", relative: false }])(
-    "loads the explicitly configured toolchain ($key, relative: $relative)",
-    ({ key, relative }) => {
-      const { checkout, modules, entry } = fixture();
-      const target = relative ? path.join(checkout, " modules") : modules;
-      if (relative) {
-        fs.renameSync(modules, target);
-      }
-      vi.stubEnv(key, relative ? " modules" : modules);
-      expect(resolveTsxImport(checkout)).toBe(
-        relative ? pathToFileURL(path.join(target, "tsx", "esm.mjs")).href : entry,
-      );
-      expect(fs.realpathSync(path.join(checkout, "node_modules"))).toBe(target);
-    },
-  );
+  it("loads the explicitly configured npm toolchain", () => {
+    const { checkout, modules, entry } = fixture();
+    vi.stubEnv("npm_config_modules_dir", modules);
+    expect(resolveTsxImport(checkout)).toBe(entry);
+    expect(fs.realpathSync(path.join(checkout, "node_modules"))).toBe(modules);
+  });
 });

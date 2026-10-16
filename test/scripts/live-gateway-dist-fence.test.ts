@@ -36,6 +36,40 @@ function baseState(overrides: Partial<GatewayServiceState> = {}): GatewayService
   };
 }
 
+function restoreAfter(...mocks: { mockRestore(): unknown }[]) {
+  onTestFinished(() => mocks.forEach((mock) => mock.mockRestore()));
+}
+
+function expectRefusal(
+  result: Awaited<ReturnType<typeof resolveLiveManagedGatewayDistFence>>,
+  ...parts: string[]
+) {
+  expect(result.refuse).toBe(true);
+  const message = result.refuse ? result.message : "";
+  for (const part of parts) {
+    expect(message).toContain(part);
+  }
+  return message;
+}
+
+function gatewayCommand(root: string, rootOptions: string[] = []) {
+  return {
+    programArguments: [
+      process.execPath,
+      path.join(root, "dist", "index.js"),
+      ...rootOptions,
+      "gateway",
+    ],
+  };
+}
+
+function runningUnit(root: string, unit: string, pid: number) {
+  return stateForPackage(root, {
+    running: true,
+    runtime: { status: "running", pid, systemd: { unit } },
+  });
+}
+
 async function inspectFixtureGateway(
   root: string,
   fixture: {
@@ -70,10 +104,7 @@ async function inspectFixtureGateway(
         input,
       );
     });
-  onTestFinished(() => {
-    read.mockRestore();
-    discover.mockRestore();
-  });
+  restoreAfter(read, discover);
   // These service-reader fixtures model Linux or Windows. Darwin's loaded native
   // observation is exercised through real binding dispatch in managed-gateway-bindings.test.ts.
   return withMockedPlatform(
@@ -84,9 +115,7 @@ async function inspectFixtureGateway(
 
 function stateForPackage(root: string, overrides: Partial<GatewayServiceState> = {}) {
   return baseState({
-    command: {
-      programArguments: [process.execPath, path.join(root, "dist", "index.js"), "gateway"],
-    },
+    command: gatewayCommand(root),
     ...overrides,
   });
 }
@@ -109,17 +138,10 @@ describe("live-gateway-dist-fence", () => {
           runtime: { status: "stopped", missingUnit: true },
         }),
       );
-      onTestFinished(() => {
-        discover.mockRestore();
-        location.mockRestore();
-        read.mockRestore();
-      });
+      restoreAfter(discover, location, read);
       await expect(
         withMockedPlatform("linux", () =>
-          resolveLiveManagedGatewayDistFence(root, {
-            env: {},
-            requireVerified: true,
-          }),
+          resolveLiveManagedGatewayDistFence(root, { env: {}, requireVerified: true }),
         ),
       ).rejects.toBe(failure);
       expect(read).not.toHaveBeenCalled();
@@ -151,32 +173,19 @@ describe("live-gateway-dist-fence", () => {
         const result = await inspectFixtureGateway(tmp, {
           readState: async (_binding, input) =>
             baseState({
-              running: true,
-              command: {
-                programArguments: [
-                  process.execPath,
-                  path.join(
-                    input?.requireEffective && input.requireLoadedCommand ? tmp : savedDefinition,
-                    "dist",
-                    "index.js",
-                  ),
-                  ...rootOptions,
-                  "gateway",
-                ],
-              },
-              runtime: {
-                status: "running",
-                pid: process.pid,
-                systemd: { unit: "openclaw-gateway.service" },
-              },
+              ...runningUnit(tmp, "openclaw-gateway.service", process.pid),
+              command: gatewayCommand(
+                input?.requireEffective && input.requireLoadedCommand ? tmp : savedDefinition,
+                rootOptions,
+              ),
             }),
         });
-        expect(result.refuse).toBe(true);
-        if (result.refuse) {
-          expect(result.message).toContain(path.join(tmp, "dist", "index.js"));
-          expect(result.message).toContain("openclaw-gateway.service");
-          expect(result.message).toContain("openclaw update");
-        }
+        expectRefusal(
+          result,
+          path.join(tmp, "dist", "index.js"),
+          "openclaw-gateway.service",
+          "openclaw update",
+        );
       });
     },
   );
@@ -236,7 +245,7 @@ describe("live-gateway-dist-fence", () => {
       const kill = vi.spyOn(process, "kill").mockImplementation(() => {
         throw Object.assign(new Error(`synthetic ${code}`), { code });
       });
-      onTestFinished(() => kill.mockRestore());
+      restoreAfter(kill);
       const result = await inspectFixtureGateway(tmp, {
         readState: async () =>
           stateForPackage(tmp, {
@@ -253,7 +262,7 @@ describe("live-gateway-dist-fence", () => {
       const layout = vi
         .spyOn(serviceLayout, "summarizeGatewayServiceLayout")
         .mockRejectedValue(new Error("realpath failed"));
-      onTestFinished(() => layout.mockRestore());
+      restoreAfter(layout);
     }
     expect(
       await inspectFixtureGateway("/synthetic/openclaw", {
@@ -301,11 +310,7 @@ function isolateSystemdInventory(home: string) {
       }
       return readFile(...args);
     });
-  onTestFinished(() => {
-    loaded.mockRestore();
-    files.mockRestore();
-    directories.mockRestore();
-  });
+  restoreAfter(loaded, files, directories);
   return fixturePath;
 }
 
@@ -355,21 +360,11 @@ describe("live-gateway-dist-fence physical overlap", () => {
             baseState({
               running: true,
               command: {
-                programArguments: [
-                  process.execPath,
-                  path.join(current, "dist", "index.js"),
-                  "gateway",
-                ],
+                ...gatewayCommand(current),
                 ...(sameCheckout
                   ? {}
                   : {
-                      managedDefinition: {
-                        programArguments: [
-                          process.execPath,
-                          path.join(managedRoot, "dist", "index.js"),
-                          "gateway",
-                        ],
-                      },
+                      managedDefinition: gatewayCommand(managedRoot),
                     }),
               },
             }),
@@ -413,25 +408,15 @@ describe("live-gateway-dist-fence cross-profile overlap", () => {
               ? stateForPackage(other, { runtime: { status: "stopped", pid: undefined } })
               : baseState({ command: null });
           }
-          return stateForPackage(tmp, {
-            running: true,
-            runtime: {
-              status: "running",
-              pid: 4242,
-              systemd: { unit: `openclaw-gateway-${profile}.service` },
-            },
-          });
+          return runningUnit(tmp, `openclaw-gateway-${profile}.service`, 4242);
         },
       });
-      expect(result.refuse).toBe(true);
-      if (result.refuse) {
-        for (const profile of profiles) {
-          expect(result.message).toContain(profile);
-          expect(result.message).toContain(`openclaw-gateway-${profile}.service`);
-        }
-        expect(result.message).toContain("openclaw update");
-        expect(result.message).not.toContain("profiles default, fenceproof");
-      }
+      const message = expectRefusal(
+        result,
+        "openclaw update",
+        ...profiles.flatMap((profile) => [profile, `openclaw-gateway-${profile}.service`]),
+      );
+      expect(message).not.toContain("profiles default, fenceproof");
     });
   });
 
@@ -488,6 +473,7 @@ describe("live-gateway-dist-fence cross-profile overlap", () => {
         const renames = vi.spyOn(fs, "rename").mockRejectedValue(new Error("Unexpected rename"));
         const removals = vi.spyOn(fs, "rm").mockRejectedValue(new Error("Unexpected removal"));
         const signals = vi.spyOn(process, "kill").mockReturnValue(true);
+        const mocks = [signals, removals, renames, writes, native, probe, inventory, files];
         try {
           await withMockedPlatform("win32", async () => {
             const env = { HOME: tmp, USERPROFILE: tmp, OPENCLAW_PROFILE: "selected" };
@@ -537,16 +523,7 @@ describe("live-gateway-dist-fence cross-profile overlap", () => {
             }
           });
         } finally {
-          for (const mock of [
-            signals,
-            removals,
-            renames,
-            writes,
-            native,
-            probe,
-            inventory,
-            files,
-          ]) {
+          for (const mock of mocks) {
             mock.mockRestore();
           }
         }
@@ -619,47 +596,14 @@ describe("live-gateway-dist-fence cross-profile overlap", () => {
           const result = await inspectFixtureGateway(checkout, {
             env: callerEnv,
             listBindings: async () => bindings,
-            readState: async (binding) => {
-              if (binding.systemdReadTarget?.unitName === siblingUnit) {
-                return baseState({
-                  running: true,
-                  command: {
-                    programArguments: [
-                      process.execPath,
-                      path.join(checkout, "dist", "index.js"),
-                      "gateway",
-                    ],
-                  },
-                  runtime: {
-                    status: "running",
-                    pid: 77,
-                    systemd: { unit: siblingUnit },
-                  },
-                });
-              }
-              return baseState({
-                running: true,
-                command: {
-                  programArguments: [
-                    process.execPath,
-                    path.join(other, "dist", "index.js"),
-                    "gateway",
-                  ],
-                },
-                runtime: {
-                  status: "running",
-                  pid: 76,
-                  systemd: { unit: "openclaw-gateway.service" },
-                },
-              });
-            },
+            readState: async (binding) =>
+              binding.systemdReadTarget?.unitName === siblingUnit
+                ? runningUnit(checkout, siblingUnit, 77)
+                : runningUnit(other, "openclaw-gateway.service", 76),
           });
-          expect(result.refuse).toBe(true);
-          if (result.refuse) {
-            expect(result.message).toContain(siblingUnit);
-            expect(result.message).toContain("openclaw update");
-            expect(result.message).not.toContain("profiles default, fenceproof");
-          }
+          expect(expectRefusal(result, siblingUnit, "openclaw update")).not.toContain(
+            "profiles default, fenceproof",
+          );
         });
       }),
   );
@@ -810,40 +754,12 @@ describe("live-gateway-dist-fence cross-profile overlap", () => {
             expect(unitName.endsWith("@.service")).toBe(false);
             if (binding?.scope === "system") {
               expect(unitName).toBe(instanceName);
-              return baseState({
-                running: true,
-                command: {
-                  programArguments: [
-                    process.execPath,
-                    path.join(checkout, "dist", "index.js"),
-                    "gateway",
-                  ],
-                },
-                runtime: { status: "running", pid: 91, systemd: { unit: instanceName } },
-              });
+              return runningUnit(checkout, instanceName, 91);
             }
-            return baseState({
-              running: true,
-              command: {
-                programArguments: [
-                  process.execPath,
-                  path.join(other, "dist", "index.js"),
-                  "gateway",
-                ],
-              },
-              runtime: {
-                status: "running",
-                pid: 90,
-                systemd: { unit: "openclaw-gateway.service" },
-              },
-            });
+            return runningUnit(other, "openclaw-gateway.service", 90);
           },
         });
-        expect(result.refuse).toBe(true);
-        if (result.refuse) {
-          expect(result.message).toContain(instanceName);
-          expect(result.message).toContain("openclaw update");
-        }
+        expectRefusal(result, instanceName, "openclaw update");
       });
     },
   );

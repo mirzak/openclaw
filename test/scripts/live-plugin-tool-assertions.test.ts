@@ -1,7 +1,5 @@
-// Live Plugin Tool Assertions tests cover live plugin tool assertions script behavior.
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { zstdCompressSync } from "node:zlib";
@@ -56,8 +54,7 @@ function deferredToolTranscript() {
 }
 
 function runTranscriptAssertion(messages: unknown[], { format = "sqlite" } = {}) {
-  const root = tempDirs.make("openclaw-live-plugin-tool-");
-  writeJson(path.join(root, "agent.json"), { payloads: [{ text: "live-plugin-slug" }] });
+  const { root } = makeTranscriptRoot();
   const file = path.join(root, "state", "agents", "main", "agent", "openclaw-agent.sqlite");
   mkdirSync(path.dirname(file), { recursive: true });
   const database = new DatabaseSync(file);
@@ -97,6 +94,25 @@ function nodeOptionsWithoutExperimentalWarnings(extra?: string): string {
 function writeJson(filePath: string, value: unknown) {
   mkdirSync(path.dirname(filePath), { recursive: true });
   writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+function makeTranscriptRoot() {
+  const root = tempDirs.make("openclaw-live-plugin-tool-");
+  const sessionsDir = path.join(root, "state", "agents", "main", "sessions");
+  writeJson(path.join(root, "agent.json"), { payloads: [{ text: "live-plugin-slug" }] });
+  return { root, sessionsDir };
+}
+
+function writeSession(sessionsDir: string, name: string, contents: string) {
+  mkdirSync(sessionsDir, { recursive: true });
+  writeFileSync(path.join(sessionsDir, name), contents, "utf8");
+}
+
+function expectFailure(result: ReturnType<typeof runAssertion>, ...messages: string[]) {
+  expect(result.status).not.toBe(0);
+  for (const message of messages) {
+    expect(result.stderr).toContain(message);
+  }
 }
 
 function runAssertion(root: string, env: Record<string, string> = {}) {
@@ -155,23 +171,17 @@ describe("live plugin tool assertions", () => {
         messages = [nested, call, result];
       }
       const assertion = runTranscriptAssertion(messages);
-      expect(assertion.status).not.toBe(0);
-      expect(assertion.stderr).toContain("missing causal tool-result evidence");
+      expectFailure(assertion, "missing causal tool-result evidence");
     },
   );
 
   it("rejects loose timeout env values instead of parsing numeric prefixes", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "openclaw-live-plugin-tool-"));
-    try {
-      const result = runAssertionCommand("configure", root, {
-        OPENCLAW_LIVE_PLUGIN_TOOL_TIMEOUT_SECONDS: "1e3",
-      });
+    const root = tempDirs.make("openclaw-live-plugin-tool-");
+    const result = runAssertionCommand("configure", root, {
+      OPENCLAW_LIVE_PLUGIN_TOOL_TIMEOUT_SECONDS: "1e3",
+    });
 
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("invalid OPENCLAW_LIVE_PLUGIN_TOOL_TIMEOUT_SECONDS: 1e3");
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
+    expectFailure(result, "invalid OPENCLAW_LIVE_PLUGIN_TOOL_TIMEOUT_SECONDS: 1e3");
   });
 
   it("reads Code Mode exec evidence from the canonical SQLite transcript", () => {
@@ -201,128 +211,81 @@ describe("live plugin tool assertions", () => {
   });
 
   it("rejects markers that only appear as raw transcript text", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "openclaw-live-plugin-tool-"));
-    const sessionsDir = path.join(root, "state", "agents", "main", "sessions");
-
-    try {
-      writeJson(path.join(root, "agent.json"), {
-        payloads: [{ text: "live-plugin-slug" }],
-      });
-      mkdirSync(sessionsDir, { recursive: true });
-      writeFileSync(
-        path.join(sessionsDir, "session.jsonl"),
-        ["e2e_slug_probe", "live-plugin-slug"].join("\n"),
-        "utf8",
-      );
-
-      const result = runAssertion(root);
-
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("missing causal tool-result evidence");
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
+    const { root, sessionsDir } = makeTranscriptRoot();
+    writeSession(sessionsDir, "session.jsonl", ["e2e_slug_probe", "live-plugin-slug"].join("\n"));
+    expectFailure(runAssertion(root), "missing causal tool-result evidence");
   });
 
   it("rejects split transcript evidence across unrelated files", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "openclaw-live-plugin-tool-"));
-    const sessionsDir = path.join(root, "state", "agents", "main", "sessions");
+    const { root, sessionsDir } = makeTranscriptRoot();
+    const { call, nested, result: outerResult } = deferredToolTranscript();
+    writeSession(sessionsDir, "tool.jsonl", JSON.stringify({ message: call }));
+    writeSession(
+      sessionsDir,
+      "reply.jsonl",
+      [nested, outerResult].map((message) => JSON.stringify({ message })).join("\n"),
+    );
 
-    try {
-      writeJson(path.join(root, "agent.json"), {
-        payloads: [{ text: "live-plugin-slug" }],
-      });
-      mkdirSync(sessionsDir, { recursive: true });
-      const { call, nested, result: outerResult } = deferredToolTranscript();
-      writeFileSync(path.join(sessionsDir, "tool.jsonl"), JSON.stringify({ message: call }));
-      writeFileSync(
-        path.join(sessionsDir, "reply.jsonl"),
-        [nested, outerResult].map((message) => JSON.stringify({ message })).join("\n"),
-      );
+    const result = runAssertion(root);
 
-      const result = runAssertion(root);
-
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("session transcript did not show");
-      expect(result.stderr).toContain("0 SQLite event(s) and 2 jsonl file(s)");
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
+    expectFailure(
+      result,
+      "session transcript did not show",
+      "0 SQLite event(s) and 2 jsonl file(s)",
+    );
   });
 
   it("bounds session transcript traversal before scanning unbounded trees", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "openclaw-live-plugin-tool-"));
-    const sessionsDir = path.join(root, "state", "agents", "main", "sessions");
-
-    try {
-      writeJson(path.join(root, "agent.json"), {
-        payloads: [{ text: "live-plugin-slug" }],
-      });
-      mkdirSync(sessionsDir, { recursive: true });
-      for (let index = 0; index < 4; index += 1) {
-        writeFileSync(path.join(sessionsDir, `noise-${index}.jsonl`), "noise\n", "utf8");
-      }
-
-      const result = runAssertion(root, {
-        OPENCLAW_LIVE_PLUGIN_TOOL_SESSION_SCAN_MAX_ENTRIES: "2",
-      });
-
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("session transcript scan exceeded 2 filesystem entries");
-    } finally {
-      rmSync(root, { force: true, recursive: true });
+    const { root, sessionsDir } = makeTranscriptRoot();
+    for (let index = 0; index < 4; index += 1) {
+      writeSession(sessionsDir, `noise-${index}.jsonl`, "noise\n");
     }
+
+    const result = runAssertion(root, {
+      OPENCLAW_LIVE_PLUGIN_TOOL_SESSION_SCAN_MAX_ENTRIES: "2",
+    });
+
+    expectFailure(result, "session transcript scan exceeded 2 filesystem entries");
   });
 
   it("rejects oversized agent output before parsing it", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "openclaw-live-plugin-tool-"));
+    const root = tempDirs.make("openclaw-live-plugin-tool-");
+    writeFileSync(
+      path.join(root, "agent.json"),
+      `DO_NOT_DUMP_OLD_AGENT_OUTPUT${"x".repeat(70 * 1024)}\nrecent oversized stdout tail`,
+      "utf8",
+    );
+    writeFileSync(path.join(root, "agent.err"), "recent stderr tail\n", "utf8");
 
-    try {
-      writeFileSync(
-        path.join(root, "agent.json"),
-        `DO_NOT_DUMP_OLD_AGENT_OUTPUT${"x".repeat(70 * 1024)}\nrecent oversized stdout tail`,
-        "utf8",
-      );
-      writeFileSync(path.join(root, "agent.err"), "recent stderr tail\n", "utf8");
+    const result = runAssertion(root, {
+      OPENCLAW_LIVE_PLUGIN_TOOL_AGENT_OUTPUT_MAX_BYTES: "1024",
+    });
 
-      const result = runAssertion(root, {
-        OPENCLAW_LIVE_PLUGIN_TOOL_AGENT_OUTPUT_MAX_BYTES: "1024",
-      });
-
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("live agent output exceeded 1024 bytes");
-      expect(result.stderr).toContain("recent oversized stdout tail");
-      expect(result.stderr).toContain("recent stderr tail");
-      expect(result.stderr).not.toContain("DO_NOT_DUMP_OLD_AGENT_OUTPUT");
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
+    expectFailure(
+      result,
+      "live agent output exceeded 1024 bytes",
+      "recent oversized stdout tail",
+      "recent stderr tail",
+    );
+    expect(result.stderr).not.toContain("DO_NOT_DUMP_OLD_AGENT_OUTPUT");
   });
 
   it("does not dump session transcript contents when a transcript check fails", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "openclaw-live-plugin-tool-"));
-    const sessionsDir = path.join(root, "state", "agents", "main", "sessions");
+    const { root, sessionsDir } = makeTranscriptRoot();
+    writeSession(
+      sessionsDir,
+      "session.jsonl",
+      `DO_NOT_DUMP_SESSION_CONTENT${"x".repeat(70 * 1024)}\n`,
+    );
 
-    try {
-      writeJson(path.join(root, "agent.json"), {
-        payloads: [{ text: "live-plugin-slug" }],
-      });
-      mkdirSync(sessionsDir, { recursive: true });
-      writeFileSync(
-        path.join(sessionsDir, "session.jsonl"),
-        `DO_NOT_DUMP_SESSION_CONTENT${"x".repeat(70 * 1024)}\n`,
-        "utf8",
-      );
+    const result = runAssertion(root);
 
-      const result = runAssertion(root);
-
-      expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain("session transcript did not show");
-      expect(result.stderr).toContain("0 SQLite event(s) and 1 jsonl file(s)");
-      expect(result.stderr).toContain("session.jsonl");
-      expect(result.stderr).not.toContain("DO_NOT_DUMP_SESSION_CONTENT");
-    } finally {
-      rmSync(root, { force: true, recursive: true });
-    }
+    expectFailure(
+      result,
+      "session transcript did not show",
+      "0 SQLite event(s) and 1 jsonl file(s)",
+      "session.jsonl",
+    );
+    expect(result.stderr).not.toContain("DO_NOT_DUMP_SESSION_CONTENT");
   });
 });

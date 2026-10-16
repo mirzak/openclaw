@@ -1,4 +1,3 @@
-// Live Docker Auth tests cover live docker auth script behavior.
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,6 +17,52 @@ function writeExecutable(filePath: string, contents: string) {
   chmodSync(filePath, 0o755);
 }
 
+function runBash(commands: string[], env: NodeJS.ProcessEnv = {}) {
+  return spawnSync("/bin/bash", ["-c", commands.join("\n")], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  });
+}
+
+const sourceAuth = "source scripts/lib/live-docker-auth.sh";
+const printArgs = "printf '%s\\n' \"${ARGS[@]}\"";
+const initArgs = [sourceAuth, "ARGS=()", "openclaw_live_init_docker_run_args ARGS 42s", printArgs];
+
+function makeTimeoutBin(command = "timeout", plain = false) {
+  const dir = makeTempBin("openclaw-live-docker-auth-timeout-");
+  writeExecutable(
+    path.join(dir, command),
+    [
+      "#!/bin/sh",
+      plain
+        ? 'if [ "$1" = "--kill-after=1s" ]; then'
+        : 'if [ "$1" = "--kill-after=1s" ] && [ "$2" = "1s" ] && [ "$3" = "true" ]; then',
+      plain ? "  exit 1" : "  exit 0",
+      "fi",
+      plain ? "exit 0" : "exit 64",
+      "",
+    ].join("\n"),
+  );
+  return dir;
+}
+
+function expectedRunArgs(wrapper: string[], cpus = "16") {
+  return [
+    ...wrapper,
+    "42s",
+    "docker",
+    "run",
+    "--init",
+    "--memory",
+    "8g",
+    "--cpus",
+    cpus,
+    "--pids-limit",
+    "2048",
+  ];
+}
+
 function runDockerRunArgs(pathPrefix: string) {
   const script = [
     "source scripts/lib/live-docker-auth.sh",
@@ -28,16 +73,8 @@ function runDockerRunArgs(pathPrefix: string) {
     "ARGS=()",
     "openclaw_live_init_docker_run_args ARGS 42s || exit $?",
     "printf '%s\\n' \"${ARGS[@]}\"",
-  ].join("\n");
-
-  return spawnSync("/bin/bash", ["-c", script], {
-    cwd: process.cwd(),
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      PATH: pathPrefix,
-    },
-  });
+  ];
+  return runBash(script, { PATH: pathPrefix });
 }
 
 function resolveDockerRunArgs(pathPrefix: string) {
@@ -56,30 +93,16 @@ afterEach(() => {
 
 describe("scripts/lib/live-docker-auth.sh", () => {
   it("reads positive integer env values before live Docker setup", () => {
-    const result = spawnSync(
-      "/bin/bash",
-      [
-        "-c",
-        [
-          "source scripts/lib/live-docker-auth.sh",
-          'fallback="$(openclaw_live_read_positive_int_env OPENCLAW_LIVE_SAMPLE_SECONDS 180)"',
-          'leading_zero="$(OPENCLAW_LIVE_SAMPLE_SECONDS=008 openclaw_live_read_positive_int_env OPENCLAW_LIVE_SAMPLE_SECONDS 180)"',
-          'printf "%s\\n%s\\n" "$fallback" "$leading_zero"',
-        ].join("\n"),
-      ],
-      { cwd: process.cwd(), encoding: "utf8" },
-    );
-    const invalid = spawnSync(
-      "/bin/bash",
-      [
-        "-c",
-        [
-          "source scripts/lib/live-docker-auth.sh",
-          "OPENCLAW_LIVE_SAMPLE_SECONDS=30s openclaw_live_read_positive_int_env OPENCLAW_LIVE_SAMPLE_SECONDS 180",
-        ].join("\n"),
-      ],
-      { cwd: process.cwd(), encoding: "utf8" },
-    );
+    const result = runBash([
+      sourceAuth,
+      'fallback="$(openclaw_live_read_positive_int_env OPENCLAW_LIVE_SAMPLE_SECONDS 180)"',
+      'leading_zero="$(OPENCLAW_LIVE_SAMPLE_SECONDS=008 openclaw_live_read_positive_int_env OPENCLAW_LIVE_SAMPLE_SECONDS 180)"',
+      'printf "%s\\n%s\\n" "$fallback" "$leading_zero"',
+    ]);
+    const invalid = runBash([
+      sourceAuth,
+      "OPENCLAW_LIVE_SAMPLE_SECONDS=30s openclaw_live_read_positive_int_env OPENCLAW_LIVE_SAMPLE_SECONDS 180",
+    ]);
 
     expect(result.status).toBe(0);
     expect(result.stdout.trimEnd().split("\n")).toEqual(["180", "008"]);
@@ -89,27 +112,23 @@ describe("scripts/lib/live-docker-auth.sh", () => {
 
   it("collects default and provider-filtered auth under Bash 3 nounset", () => {
     const homeDir = makeTempBin("openclaw-live-docker-auth-home-");
-    const result = spawnSync(
-      "/bin/bash",
+    const result = runBash(
       [
-        "-c",
-        [
-          "set -euo pipefail",
-          "source scripts/lib/live-docker-auth.sh",
-          "unset OPENCLAW_DOCKER_AUTH_DIRS DOCKER_HOME_DIR",
-          'openclaw_live_collect_auth_for_providers ","',
-          "openclaw_live_finalize_auth_mounts",
-          'printf "default-dirs=%s\\ndefault-files=%s\\ndefault-mounts=%s\\n" "$AUTH_DIRS_CSV" "$AUTH_FILES_CSV" "${#EXTERNAL_AUTH_MOUNTS[@]}"',
-          'openclaw_live_collect_auth_for_providers "openai, gemini"',
-          "openclaw_live_finalize_auth_mounts",
-          'printf "filtered-dirs=%s\\nfiltered-files=%s\\nfiltered-mounts=%s\\n" "$AUTH_DIRS_CSV" "$AUTH_FILES_CSV" "${#EXTERNAL_AUTH_MOUNTS[@]}"',
-          "OPENCLAW_DOCKER_AUTH_DIRS=none",
-          "openclaw_live_collect_auth_for_providers openai",
-          "openclaw_live_finalize_auth_mounts",
-          'printf "none-dirs=%s\\nnone-files=%s\\nnone-mounts=%s\\n" "$AUTH_DIRS_CSV" "$AUTH_FILES_CSV" "${#EXTERNAL_AUTH_MOUNTS[@]}"',
-        ].join("\n"),
+        "set -euo pipefail",
+        "source scripts/lib/live-docker-auth.sh",
+        "unset OPENCLAW_DOCKER_AUTH_DIRS DOCKER_HOME_DIR",
+        'openclaw_live_collect_auth_for_providers ","',
+        "openclaw_live_finalize_auth_mounts",
+        'printf "default-dirs=%s\\ndefault-files=%s\\ndefault-mounts=%s\\n" "$AUTH_DIRS_CSV" "$AUTH_FILES_CSV" "${#EXTERNAL_AUTH_MOUNTS[@]}"',
+        'openclaw_live_collect_auth_for_providers "openai, gemini"',
+        "openclaw_live_finalize_auth_mounts",
+        'printf "filtered-dirs=%s\\nfiltered-files=%s\\nfiltered-mounts=%s\\n" "$AUTH_DIRS_CSV" "$AUTH_FILES_CSV" "${#EXTERNAL_AUTH_MOUNTS[@]}"',
+        "OPENCLAW_DOCKER_AUTH_DIRS=none",
+        "openclaw_live_collect_auth_for_providers openai",
+        "openclaw_live_finalize_auth_mounts",
+        'printf "none-dirs=%s\\nnone-files=%s\\nnone-mounts=%s\\n" "$AUTH_DIRS_CSV" "$AUTH_FILES_CSV" "${#EXTERNAL_AUTH_MOUNTS[@]}"',
       ],
-      { cwd: process.cwd(), encoding: "utf8", env: { ...process.env, HOME: homeDir } },
+      { HOME: homeDir },
     );
 
     expect(result.status).toBe(0);
@@ -135,26 +154,18 @@ describe("scripts/lib/live-docker-auth.sh", () => {
     writeFileSync(path.join(homeDir, ".gemini", "token"), "gemini-token\n", "utf8");
     writeFileSync(path.join(homeDir, ".codex", "auth.json"), "codex-token\n", "utf8");
 
-    const result = spawnSync(
-      "/bin/bash",
+    const result = runBash(
       [
-        "-c",
-        [
-          "set -euo pipefail",
-          "source scripts/lib/live-docker-auth.sh",
-          "unset OPENCLAW_DOCKER_AUTH_DIRS",
-          "DOCKER_AUTH_PRESTAGED=0",
-          'openclaw_live_collect_auth_for_providers "openai,gemini"',
-          "openclaw_live_finalize_auth_mounts",
-          'printf "dirs=%s\\nfiles=%s\\nprestaged=%s\\n" "$AUTH_DIRS_CSV" "$AUTH_FILES_CSV" "$DOCKER_AUTH_PRESTAGED"',
-          'printf "%s\\n" "${EXTERNAL_AUTH_MOUNTS[@]}"',
-        ].join("\n"),
+        "set -euo pipefail",
+        "source scripts/lib/live-docker-auth.sh",
+        "unset OPENCLAW_DOCKER_AUTH_DIRS",
+        "DOCKER_AUTH_PRESTAGED=0",
+        'openclaw_live_collect_auth_for_providers "openai,gemini"',
+        "openclaw_live_finalize_auth_mounts",
+        'printf "dirs=%s\\nfiles=%s\\nprestaged=%s\\n" "$AUTH_DIRS_CSV" "$AUTH_FILES_CSV" "$DOCKER_AUTH_PRESTAGED"',
+        'printf "%s\\n" "${EXTERNAL_AUTH_MOUNTS[@]}"',
       ],
-      {
-        cwd: process.cwd(),
-        encoding: "utf8",
-        env: { ...process.env, DOCKER_HOME_DIR: dockerHomeDir, HOME: homeDir },
-      },
+      { DOCKER_HOME_DIR: dockerHomeDir, HOME: homeDir },
     );
 
     expect(result.status).toBe(0);
@@ -179,112 +190,29 @@ describe("scripts/lib/live-docker-auth.sh", () => {
   it.each([["8", "6", "8"]])(
     "caps default CPU limits using live=%s and shared=%s capacity",
     (live, shared, expected) => {
-      const binDir = makeTempBin("openclaw-live-docker-auth-cpus-");
-      writeExecutable(
-        path.join(binDir, "timeout"),
-        [
-          "#!/bin/sh",
-          'if [ "$1" = "--kill-after=1s" ] && [ "$2" = "1s" ] && [ "$3" = "true" ]; then',
-          "  exit 0",
-          "fi",
-          "exit 64",
-          "",
-        ].join("\n"),
-      );
-
-      const result = spawnSync(
-        "/bin/bash",
-        [
-          "-c",
-          [
-            "source scripts/lib/live-docker-auth.sh",
-            "ARGS=()",
-            "openclaw_live_init_docker_run_args ARGS 42s",
-            "printf '%s\\n' \"${ARGS[@]}\"",
-          ].join("\n"),
-        ],
-        {
-          cwd: process.cwd(),
-          encoding: "utf8",
-          env: {
-            ...process.env,
-            PATH: binDir,
-            OPENCLAW_LIVE_DOCKER_AVAILABLE_CPUS: live,
-            OPENCLAW_DOCKER_E2E_AVAILABLE_CPUS: shared,
-          },
-        },
-      );
+      const result = runBash(initArgs, {
+        PATH: makeTimeoutBin(),
+        OPENCLAW_LIVE_DOCKER_AVAILABLE_CPUS: live,
+        OPENCLAW_DOCKER_E2E_AVAILABLE_CPUS: shared,
+      });
 
       expect(result.status).toBe(0);
-      expect(result.stdout.trimEnd().split("\n")).toEqual([
-        "timeout",
-        "--kill-after=30s",
-        "42s",
-        "docker",
-        "run",
-        "--init",
-        "--memory",
-        "8g",
-        "--cpus",
-        expected,
-        "--pids-limit",
-        "2048",
-      ]);
+      expect(result.stdout.trimEnd().split("\n")).toEqual(
+        expectedRunArgs(["timeout", "--kill-after=30s"], expected),
+      );
     },
   );
 
   it("falls back to plain timeout when kill-after is unavailable", () => {
-    const binDir = makeTempBin("openclaw-live-docker-auth-plain-");
-    writeExecutable(
-      path.join(binDir, "timeout"),
-      ["#!/bin/sh", 'if [ "$1" = "--kill-after=1s" ]; then', "  exit 1", "fi", "exit 0", ""].join(
-        "\n",
-      ),
+    expect(resolveDockerRunArgs(makeTimeoutBin("timeout", true))).toEqual(
+      expectedRunArgs(["timeout"]),
     );
-
-    expect(resolveDockerRunArgs(binDir)).toEqual([
-      "timeout",
-      "42s",
-      "docker",
-      "run",
-      "--init",
-      "--memory",
-      "8g",
-      "--cpus",
-      "16",
-      "--pids-limit",
-      "2048",
-    ]);
   });
 
   it("uses gtimeout when timeout is unavailable", () => {
-    const binDir = makeTempBin("openclaw-live-docker-auth-gtimeout-");
-    writeExecutable(
-      path.join(binDir, "gtimeout"),
-      [
-        "#!/bin/sh",
-        'if [ "$1" = "--kill-after=1s" ] && [ "$2" = "1s" ] && [ "$3" = "true" ]; then',
-        "  exit 0",
-        "fi",
-        "exit 64",
-        "",
-      ].join("\n"),
+    expect(resolveDockerRunArgs(makeTimeoutBin("gtimeout"))).toEqual(
+      expectedRunArgs(["gtimeout", "--kill-after=30s"]),
     );
-
-    expect(resolveDockerRunArgs(binDir)).toEqual([
-      "gtimeout",
-      "--kill-after=30s",
-      "42s",
-      "docker",
-      "run",
-      "--init",
-      "--memory",
-      "8g",
-      "--cpus",
-      "16",
-      "--pids-limit",
-      "2048",
-    ]);
   });
 
   it.each(["1"])(
@@ -326,38 +254,14 @@ describe("scripts/lib/live-docker-auth.sh", () => {
   );
 
   it("normalizes live Docker pids limits", () => {
-    const binDir = makeTempBin("openclaw-live-docker-auth-pids-");
-    writeExecutable(
-      path.join(binDir, "timeout"),
+    const result = runBash(
       [
-        "#!/bin/sh",
-        'if [ "$1" = "--kill-after=1s" ] && [ "$2" = "1s" ] && [ "$3" = "true" ]; then',
-        "  exit 0",
-        "fi",
-        "exit 64",
-        "",
-      ].join("\n"),
-    );
-
-    const result = spawnSync(
-      "/bin/bash",
-      [
-        "-c",
-        [
-          "source scripts/lib/live-docker-auth.sh",
-          "ARGS=()",
-          "OPENCLAW_LIVE_DOCKER_PIDS_LIMIT=0008 openclaw_live_init_docker_run_args ARGS 42s",
-          "printf '%s\\n' \"${ARGS[@]}\"",
-        ].join("\n"),
+        sourceAuth,
+        "ARGS=()",
+        "OPENCLAW_LIVE_DOCKER_PIDS_LIMIT=0008 openclaw_live_init_docker_run_args ARGS 42s",
+        "printf '%s\\n' \"${ARGS[@]}\"",
       ],
-      {
-        cwd: process.cwd(),
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          PATH: binDir,
-        },
-      },
+      { PATH: makeTimeoutBin() },
     );
 
     expect(result.status).toBe(0);
@@ -367,40 +271,14 @@ describe("scripts/lib/live-docker-auth.sh", () => {
   it.each([["live", "OPENCLAW_LIVE_DOCKER_PIDS_LIMIT"]])(
     "rejects invalid %s Docker pids limits before live Docker setup",
     (_label, envName) => {
-      const binDir = makeTempBin("openclaw-live-docker-auth-invalid-pids-");
-      writeExecutable(
-        path.join(binDir, "timeout"),
-        [
-          "#!/bin/sh",
-          'if [ "$1" = "--kill-after=1s" ] && [ "$2" = "1s" ] && [ "$3" = "true" ]; then',
-          "  exit 0",
-          "fi",
-          "exit 64",
-          "",
-        ].join("\n"),
-      );
-
-      const result = spawnSync(
-        "/bin/bash",
-        [
-          "-c",
-          [
-            "source scripts/lib/live-docker-auth.sh",
-            "ARGS=()",
-            "openclaw_live_init_docker_run_args ARGS 42s",
-          ].join("\n"),
-        ],
+      const result = runBash(
+        [sourceAuth, "ARGS=()", "openclaw_live_init_docker_run_args ARGS 42s"],
         {
-          cwd: process.cwd(),
-          encoding: "utf8",
-          env: {
-            ...process.env,
-            OPENCLAW_DOCKER_E2E_PIDS_LIMIT:
-              envName === "OPENCLAW_DOCKER_E2E_PIDS_LIMIT" ? "many" : "",
-            OPENCLAW_LIVE_DOCKER_PIDS_LIMIT:
-              envName === "OPENCLAW_LIVE_DOCKER_PIDS_LIMIT" ? "many" : "",
-            PATH: binDir,
-          },
+          OPENCLAW_DOCKER_E2E_PIDS_LIMIT:
+            envName === "OPENCLAW_DOCKER_E2E_PIDS_LIMIT" ? "many" : "",
+          OPENCLAW_LIVE_DOCKER_PIDS_LIMIT:
+            envName === "OPENCLAW_LIVE_DOCKER_PIDS_LIMIT" ? "many" : "",
+          PATH: makeTimeoutBin(),
         },
       );
 

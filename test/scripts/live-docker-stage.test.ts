@@ -1,14 +1,5 @@
-// Live Docker Stage tests cover live docker stage script behavior.
 import { execFileSync, spawnSync } from "node:child_process";
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -20,35 +11,44 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../
 const stageScriptPath = path.join(repoRoot, "scripts/lib/live-docker-stage.sh");
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
+function runStage(command: string, root = repoRoot, env: NodeJS.ProcessEnv = {}, timeout?: number) {
+  return spawnSync("bash", ["-c", command, "test", stageScriptPath, root, repoRoot], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    timeout,
+    env: { ...process.env, ...env },
+  });
+}
+
+function writeFixture(root: string, relative: string, content: string, executable = false) {
+  const file = path.join(root, relative);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, content, { mode: executable ? 0o755 : 0o644 });
+  return file;
+}
+
 function committedSourceFixture(files: Record<string, string | null>) {
   const root = tempDirs.make("openclaw-frozen-source-");
   for (const [relative, content] of Object.entries(files)) {
     if (content === null) {
       continue;
     }
-    mkdirSync(path.dirname(path.join(root, relative)), { recursive: true });
-    writeFileSync(path.join(root, relative), content);
+    writeFixture(root, relative, content);
   }
   const git = (...args: string[]) =>
     // Corruption controls own loose objects; automatic packing would move the target first.
     execFileSync(
       "git",
       [
-        "-c",
-        "commit.gpgsign=false",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-c",
-        "maintenance.auto=false",
-        "-c",
-        "gc.auto=0",
+        ...[
+          "commit.gpgsign=false",
+          "core.hooksPath=/dev/null",
+          "maintenance.auto=false",
+          "gc.auto=0",
+        ].flatMap((config) => ["-c", config]),
         ...args,
       ],
-      {
-        cwd: root,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      },
+      { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
     ).trim();
   git("init", "-q");
   git("config", "user.email", "test@example.invalid");
@@ -68,6 +68,14 @@ describe("frozen selected consumer ownership", () => {
     "scripts/e2e/lib/release-scenarios/assertions.mjs",
     "scripts/e2e/lib/fixtures/mock-openai-config.mjs",
   ];
+  const typedSource = () =>
+    committedSourceFixture({
+      "package.json": '{"type":"module","version":"2026.7.33"}\n',
+      [runtimePath]: "unknown runtime-context contract\n",
+      ...Object.fromEntries(
+        typedFiles.map((relative) => [relative, "selected fixture; never execute\n"]),
+      ),
+    });
 
   function runConsumer(
     source: ReturnType<typeof committedSourceFixture>,
@@ -118,13 +126,7 @@ describe("frozen selected consumer ownership", () => {
   ])(
     "runs only the $consumer source contract with $runtime runtime-context source",
     ({ consumer, runtime }) => {
-      const source = committedSourceFixture({
-        "package.json": '{"type":"module","version":"2026.7.33"}\n',
-        [runtimePath]: "unknown runtime-context contract\n",
-        ...Object.fromEntries(
-          typedFiles.map((relative) => [relative, "selected fixture; never execute\n"]),
-        ),
-      });
+      const source = typedSource();
       if (runtime === "missing blob") {
         const object = source.git("rev-parse", `${source.sha}:${runtimePath}`);
         rmSync(path.join(source.root, ".git/objects", object.slice(0, 2), object.slice(2)));
@@ -145,13 +147,7 @@ describe("frozen selected consumer ownership", () => {
     { contract: "shipped tuple", authorized: true },
     { contract: "authorization off", authorized: false },
   ])("mounts the typed onboarding $contract", ({ authorized }) => {
-    const source = committedSourceFixture({
-      "package.json": '{"type":"module","version":"2026.7.33"}\n',
-      [runtimePath]: "unknown runtime-context contract\n",
-      ...Object.fromEntries(
-        typedFiles.map((relative) => [relative, "selected fixture; never execute\n"]),
-      ),
-    });
+    const source = typedSource();
     const { result, args } = runConsumer(source, "release-typed-onboarding", {
       authorized,
       dockerStatus: 0,
@@ -183,61 +179,57 @@ describe("frozen selected consumer ownership", () => {
       expect(result.status, result.stderr).toBe(0);
       const mode = authorized && !supported ? "unsupported" : "required";
       expect(args).toContain(`OPENCLAW_FROZEN_TARGET_SESSION_COLD_STORAGE_MODE=${mode}`);
-      if (consumer === "openai-chat-tools") {
-        const configPath = path.join(source.root, "config.json");
-        const configResult = spawnSync(
-          process.execPath,
-          ["scripts/e2e/lib/openai-chat-tools/write-config.mjs"],
-          {
-            cwd: repoRoot,
-            encoding: "utf8",
-            env: {
-              PATH: process.env.PATH,
-              OPENCLAW_CONFIG_PATH: configPath,
-              OPENCLAW_STATE_DIR: source.root,
-              OPENCLAW_TEST_WORKSPACE_DIR: path.join(source.root, "workspace"),
-              OPENCLAW_OPENAI_CHAT_TOOLS_MODEL: "openai/gpt-5.4-mini",
-              OPENCLAW_GATEWAY_TOKEN: "synthetic-gateway-token",
-              OPENCLAW_FROZEN_TARGET_SESSION_COLD_STORAGE_MODE: mode,
-            },
+      const configPath = path.join(source.root, "config.json");
+      const configResult = spawnSync(
+        process.execPath,
+        ["scripts/e2e/lib/openai-chat-tools/write-config.mjs"],
+        {
+          cwd: repoRoot,
+          encoding: "utf8",
+          env: {
+            PATH: process.env.PATH,
+            OPENCLAW_CONFIG_PATH: configPath,
+            OPENCLAW_STATE_DIR: source.root,
+            OPENCLAW_TEST_WORKSPACE_DIR: path.join(source.root, "workspace"),
+            OPENCLAW_OPENAI_CHAT_TOOLS_MODEL: "openai/gpt-5.4-mini",
+            OPENCLAW_GATEWAY_TOKEN: "synthetic-gateway-token",
+            OPENCLAW_FROZEN_TARGET_SESSION_COLD_STORAGE_MODE: mode,
           },
-        );
-        expect(configResult.status, configResult.stderr).toBe(0);
-        const config = JSON.parse(readFileSync(configPath, "utf8"));
-        expect(config.session).toEqual(
-          mode === "required"
-            ? {
-                maintenance: {
-                  mode: "warn",
-                  pruneAfter: "3650d",
-                  archiveDashboardAfter: false,
-                  maxDiskBytes: false,
-                  coldStorage: { enabled: true, afterDays: 30 },
-                },
-              }
-            : undefined,
-        );
-        expect(config.gateway.http.endpoints.chatCompletions.enabled).toBe(true);
-        expect(config.tools).toEqual({ allow: ["get_weather"] });
-      }
+        },
+      );
+      expect(configResult.status, configResult.stderr).toBe(0);
+      const config = JSON.parse(readFileSync(configPath, "utf8"));
+      expect(config.session).toEqual(
+        mode === "required"
+          ? {
+              maintenance: {
+                mode: "warn",
+                pruneAfter: "3650d",
+                archiveDashboardAfter: false,
+                maxDiskBytes: false,
+                coldStorage: { enabled: true, afterDays: 30 },
+              },
+            }
+          : undefined,
+      );
+      expect(config.gateway.http.endpoints.chatCompletions.enabled).toBe(true);
+      expect(config.tools).toEqual({ allow: ["get_weather"] });
     },
   );
 
-  it.each(["scripts/e2e/lib/release-typed-onboarding/scenario.sh"])(
-    "rejects an unreadable typed companion %s before Docker",
-    (relative) => {
-      const source = committedSourceFixture({
-        "package.json": '{"type":"module","version":"2026.7.33"}\n',
-        ...Object.fromEntries(typedFiles.map((file) => [file, `${file}\n`])),
-      });
-      const object = source.git("rev-parse", `${source.sha}:${relative}`);
-      rmSync(path.join(source.root, ".git/objects", object.slice(0, 2), object.slice(2)));
-      const { result, args } = runConsumer(source, "release-typed-onboarding", { dockerStatus: 0 });
-      expect(result.status, result.stderr).toBe(2);
-      expect(result.stderr).toContain("unable to read selected source");
-      expect(args).toEqual([]);
-    },
-  );
+  it("rejects an unreadable typed companion before Docker", () => {
+    const relative = typedFiles[0]!;
+    const source = committedSourceFixture({
+      "package.json": '{"type":"module","version":"2026.7.33"}\n',
+      ...Object.fromEntries(typedFiles.map((file) => [file, `${file}\n`])),
+    });
+    const object = source.git("rev-parse", `${source.sha}:${relative}`);
+    rmSync(path.join(source.root, ".git/objects", object.slice(0, 2), object.slice(2)));
+    const { result, args } = runConsumer(source, "release-typed-onboarding", { dockerStatus: 0 });
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.stderr).toContain("unable to read selected source");
+    expect(args).toEqual([]);
+  });
 });
 
 describe("frozen committed source errors", () => {
@@ -248,28 +240,16 @@ describe("frozen committed source errors", () => {
     command: string,
     env: Record<string, string> = {},
   ) {
-    return spawnSync(
-      "bash",
-      [
-        "-c",
-        `set -euo pipefail; source "$1"; ${command}`,
-        "test",
-        stageScriptPath,
-        source.root,
-        repoRoot,
-      ],
+    return runStage(
+      `set -euo pipefail; source "$1"; ${command}`,
+      source.root,
       {
-        cwd: repoRoot,
-        encoding: "utf8",
-        timeout: 10_000,
-        env: {
-          ...process.env,
-          OPENCLAW_ALLOW_FROZEN_TARGET_SCENARIO_OMISSIONS: "1",
-          OPENCLAW_SELECTED_SHA: source.sha,
-          OPENCLAW_TOOLING_SHA: "b".repeat(40),
-          ...env,
-        },
+        OPENCLAW_ALLOW_FROZEN_TARGET_SCENARIO_OMISSIONS: "1",
+        OPENCLAW_SELECTED_SHA: source.sha,
+        OPENCLAW_TOOLING_SHA: "b".repeat(40),
+        ...env,
       },
+      10_000,
     );
   }
 
@@ -406,25 +386,21 @@ describe("frozen committed source errors", () => {
     expect(missing.stdout).toBe("");
   });
 
-  it.each(["../package.json"])(
-    "rejects unsafe path %s instead of treating it as absent",
-    (relative) => {
-      const source = committedSourceFixture({ "package.json": "{}\n" });
-      const result = invoke(
-        source,
-        `status=0; openclaw_frozen_target_source_has_path "$2" "${relative}" || status=$?; exit "$status"`,
-      );
-      expect(result.status, result.stderr).toBe(2);
-    },
-  );
+  it("rejects an unsafe path instead of treating it as absent", () => {
+    const source = committedSourceFixture({ "package.json": "{}\n" });
+    const result = invoke(
+      source,
+      'status=0; openclaw_frozen_target_source_has_path "$2" "../package.json" || status=$?; exit "$status"',
+    );
+    expect(result.status, result.stderr).toBe(2);
+  });
 });
 
 describe("live Docker state staging", () => {
   function writeFixturePackageSpecParser(root: string) {
-    const parserPath = path.join(root, "src", "infra", "npm-registry-spec.ts");
-    mkdirSync(path.dirname(parserPath), { recursive: true });
-    writeFileSync(
-      parserPath,
+    writeFixture(
+      root,
+      "src/infra/npm-registry-spec.ts",
       String.raw`
 export function parseRegistryNpmSpec(spec: string) {
   return /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*(?:@[a-z0-9][a-z0-9._-]*)?$/u.test(spec)
@@ -437,87 +413,65 @@ export function parseRegistryNpmSpec(spec: string) {
 
   function stagedPackageMetadataFixture(metadata: string) {
     const root = tempDirs.make("openclaw-live-stage-packages-");
-    mkdirSync(path.join(root, "scripts"), { recursive: true });
     symlinkSync(path.join(repoRoot, "node_modules"), path.join(root, "node_modules"));
     writeFixturePackageSpecParser(root);
-    writeFileSync(path.join(root, "scripts", "print-cli-backend-live-metadata.ts"), metadata);
+    writeFixture(root, "scripts/print-cli-backend-live-metadata.ts", metadata);
     return root;
   }
 
-  it.each([{ geminiKey: "test-gemini-key", googleKey: "", expectedType: "gemini-api-key" }])(
-    "selects $expectedType from the supplied Gemini credentials",
-    (testCase) => {
-      const home = tempDirs.make("openclaw-live-stage-gemini-");
-      const settingsPath = path.join(home, ".gemini", "settings.json");
-      mkdirSync(path.dirname(settingsPath));
-      writeFileSync(
-        settingsPath,
-        JSON.stringify({
-          security: { auth: { selectedType: "oauth-personal" } },
-          privacy: { usageStatisticsEnabled: false },
-        }),
-      );
+  it("selects gemini-api-key from the supplied Gemini credentials", () => {
+    const home = tempDirs.make("openclaw-live-stage-gemini-");
+    const settingsPath = writeFixture(
+      home,
+      ".gemini/settings.json",
+      JSON.stringify({
+        security: { auth: { selectedType: "oauth-personal" } },
+        privacy: { usageStatisticsEnabled: false },
+      }),
+    );
 
-      const result = spawnSync(
-        "bash",
-        ["-c", 'source "$1"; openclaw_live_stage_gemini_auth', "bash", stageScriptPath],
-        {
-          encoding: "utf8",
-          env: {
-            ...process.env,
-            HOME: home,
-            GEMINI_API_KEY: testCase.geminiKey,
-            GOOGLE_API_KEY: testCase.googleKey,
-            GOOGLE_GENAI_USE_VERTEXAI: "",
-          },
-        },
-      );
+    const result = runStage('source "$1"; openclaw_live_stage_gemini_auth', repoRoot, {
+      HOME: home,
+      GEMINI_API_KEY: "test-gemini-key",
+      GOOGLE_API_KEY: "",
+      GOOGLE_GENAI_USE_VERTEXAI: "",
+    });
 
-      expect(result.status, result.stderr).toBe(0);
-      const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
-      expect(settings.security.auth.selectedType).toBe(testCase.expectedType);
-      expect(settings.security.auth.enforcedType).toBe(
-        testCase.geminiKey || testCase.googleKey ? testCase.expectedType : undefined,
-      );
-      expect(settings.privacy).toEqual({ usageStatisticsEnabled: false });
-      expect(readFileSync(settingsPath, "utf8")).not.toContain("test-gemini-key");
-      expect(readFileSync(settingsPath, "utf8")).not.toContain("test-google-key");
-    },
-  );
+    expect(result.status, result.stderr).toBe(0);
+    const settings = readFileSync(settingsPath, "utf8");
+    const parsed = JSON.parse(settings);
+    expect(parsed.security.auth).toMatchObject({
+      selectedType: "gemini-api-key",
+      enforcedType: "gemini-api-key",
+    });
+    expect(parsed.privacy).toEqual({ usageStatisticsEnabled: false });
+    expect(settings).not.toContain("test-gemini-key");
+    expect(settings).not.toContain("test-google-key");
+  });
 
   it("installs missing CLI executables and refreshes pinned packages", () => {
     const root = tempDirs.make("openclaw-live-stage-cli-");
     const binDir = path.join(root, "bin");
-    mkdirSync(binDir);
-    const npmPath = path.join(binDir, "npm");
-    const timeoutPath = path.join(binDir, "timeout");
-    writeFileSync(
-      npmPath,
+    writeFixture(
+      root,
+      "bin/npm",
       '#!/usr/bin/env bash\nset -eu\nprintf "%s\\n" "$3" >> "$INSTALL_LOG"\nprintf "#!/usr/bin/env bash\\nprintf fixture-ok" > "$CLI_PATH"\nchmod +x "$CLI_PATH"\n',
+      true,
     );
-    chmodSync(npmPath, 0o755);
-    writeFileSync(
-      timeoutPath,
+    writeFixture(
+      root,
+      "bin/timeout",
       '#!/usr/bin/env bash\nset -euo pipefail\nwhile [[ "$1" == --* ]]; do shift; done\nshift\nexec "$@"\n',
+      true,
     );
-    chmodSync(timeoutPath, 0o755);
     const installLog = path.join(root, "installs.log");
-    const result = spawnSync(
-      "bash",
-      [
-        "-c",
-        'set -euo pipefail; source "$1"; openclaw_live_prepare_cli_backend "$CLI_PATH" @fixture/backend 10; "$CLI_PATH"; openclaw_live_prepare_cli_backend "$CLI_PATH" @fixture/backend 10; openclaw_live_prepare_cli_backend "$CLI_PATH" @fixture/backend@1.0.0 10',
-        "test",
-        stageScriptPath,
-      ],
+    const result = runStage(
+      'set -euo pipefail; source "$1"; openclaw_live_prepare_cli_backend "$CLI_PATH" @fixture/backend 10; "$CLI_PATH"; openclaw_live_prepare_cli_backend "$CLI_PATH" @fixture/backend 10; openclaw_live_prepare_cli_backend "$CLI_PATH" @fixture/backend@1.0.0 10',
+      root,
       {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          PATH: `${binDir}:${process.env.PATH}`,
-          CLI_PATH: path.join(binDir, "fixture"),
-          INSTALL_LOG: installLog,
-        },
+        PATH: `${binDir}:${process.env.PATH}`,
+        CLI_PATH: path.join(binDir, "fixture"),
+        INSTALL_LOG: installLog,
       },
     );
     expect(result.status, result.stderr).toBe(0);
@@ -528,40 +482,27 @@ export function parseRegistryNpmSpec(spec: string) {
     ]);
   });
 
-  it.each([{ entrypoint: "scripts/test-live.mjs", expected: "scripts/test-live.mjs -- target" }])(
-    "runs the staged $entrypoint live runner",
-    ({ entrypoint, expected }) => {
-      const root = tempDirs.make("openclaw-live-stage-entrypoint-");
-      const binDir = path.join(root, "bin");
-      const callsPath = path.join(root, "calls");
-      mkdirSync(path.join(root, path.dirname(entrypoint)), { recursive: true });
-      mkdirSync(binDir);
-      writeFileSync(path.join(root, entrypoint), "");
-      writeFileSync(
-        path.join(binDir, "node"),
-        '#!/usr/bin/env bash\nset -eu\nprintf "%s\\n" "$*" > "$CALLS_PATH"\n',
-        { mode: 0o755 },
-      );
+  it("runs the staged scripts/test-live.mjs live runner", () => {
+    const root = tempDirs.make("openclaw-live-stage-entrypoint-");
+    const binDir = path.join(root, "bin");
+    const callsPath = path.join(root, "calls");
+    writeFixture(root, "scripts/test-live.mjs", "");
+    writeFixture(
+      root,
+      "bin/node",
+      '#!/usr/bin/env bash\nset -eu\nprintf "%s\\n" "$*" > "$CALLS_PATH"\n',
+      true,
+    );
 
-      const result = spawnSync(
-        "bash",
-        [
-          "-c",
-          'set -euo pipefail; cd "$1"; source "$2"; openclaw_live_run_staged_script scripts/test-live -- target',
-          "test",
-          root,
-          stageScriptPath,
-        ],
-        {
-          encoding: "utf8",
-          env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, CALLS_PATH: callsPath },
-        },
-      );
+    const result = runStage(
+      'set -euo pipefail; cd "$2"; source "$1"; openclaw_live_run_staged_script scripts/test-live -- target',
+      root,
+      { PATH: `${binDir}:${process.env.PATH}`, CALLS_PATH: callsPath },
+    );
 
-      expect(result.status, result.stderr).toBe(0);
-      expect(readFileSync(callsPath, "utf8").trim()).toBe(expected);
-    },
-  );
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(callsPath, "utf8").trim()).toBe("scripts/test-live.mjs -- target");
+  });
 
   it("rejects malformed staged package metadata before npm runs", () => {
     const root = stagedPackageMetadataFixture(
@@ -576,23 +517,10 @@ export function parseRegistryNpmSpec(spec: string) {
       { mode: 0o755 },
     );
 
-    const result = spawnSync(
-      "bash",
-      [
-        "-c",
-        'set -euo pipefail; cd "$1"; source "$2"; openclaw_live_prepare_cli_backend_docker_packages "" ""',
-        "test",
-        root,
-        stageScriptPath,
-      ],
-      {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          INSTALL_LOG: installLog,
-          PATH: `${binDir}:${process.env.PATH}`,
-        },
-      },
+    const result = runStage(
+      'set -euo pipefail; cd "$2"; source "$1"; openclaw_live_prepare_cli_backend_docker_packages "" ""',
+      root,
+      { INSTALL_LOG: installLog, PATH: `${binDir}:${process.env.PATH}` },
     );
 
     expect(result.status).not.toBe(0);
@@ -601,15 +529,12 @@ export function parseRegistryNpmSpec(spec: string) {
   });
 
   it("falls back without frozen context but fails malformed authorization", () => {
-    const command = [
-      "-c",
-      'set -euo pipefail; source "$1"; openclaw_resolve_frozen_target_file "$2" missing/path fallback',
-      "test",
-      stageScriptPath,
-      repoRoot,
-    ];
     const run = (env: Record<string, string>) =>
-      spawnSync("bash", command, { encoding: "utf8", env: { ...process.env, ...env } });
+      runStage(
+        'set -euo pipefail; source "$1"; openclaw_resolve_frozen_target_file "$2" missing/path fallback',
+        repoRoot,
+        env,
+      );
 
     const absent = run({});
     expect(absent.status).toBe(0);
@@ -625,22 +550,10 @@ export function parseRegistryNpmSpec(spec: string) {
       "scripts/e2e/lib/plugins/assertions.mjs": `function assertPluginTgzRemoved()\n${"x\n".repeat(100_000)}`,
     });
 
-    const result = spawnSync(
-      "bash",
-      [
-        "-c",
-        'set -euo pipefail; source "$1"; openclaw_frozen_target_source_contains "$2" scripts/e2e/lib/plugins/assertions.mjs "function assertPluginTgzRemoved()"',
-        "test",
-        stageScriptPath,
-        root,
-      ],
-      {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          OPENCLAW_SELECTED_SHA: selectedSha,
-        },
-      },
+    const result = runStage(
+      'set -euo pipefail; source "$1"; openclaw_frozen_target_source_contains "$2" scripts/e2e/lib/plugins/assertions.mjs "function assertPluginTgzRemoved()"',
+      root,
+      { OPENCLAW_SELECTED_SHA: selectedSha },
     );
 
     expect(result.status, result.stderr).toBe(0);
@@ -658,23 +571,13 @@ export function parseRegistryNpmSpec(spec: string) {
       "src/agents/embedded-agent-runner/run/runtime-context-prompt.ts": source,
     });
 
-    const result = spawnSync(
-      "bash",
-      [
-        "-c",
-        'set -euo pipefail; source "$1"; openclaw_resolve_frozen_runtime_context_contract "$2"; printf "%s\\n" "$OPENCLAW_FROZEN_TARGET_RUNTIME_CONTEXT_INPUT_MODE"',
-        "test",
-        stageScriptPath,
-        root,
-      ],
+    const result = runStage(
+      'set -euo pipefail; source "$1"; openclaw_resolve_frozen_runtime_context_contract "$2"; printf "%s\\n" "$OPENCLAW_FROZEN_TARGET_RUNTIME_CONTEXT_INPUT_MODE"',
+      root,
       {
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          OPENCLAW_ALLOW_FROZEN_TARGET_SCENARIO_OMISSIONS: "1",
-          OPENCLAW_SELECTED_SHA: selectedSha,
-          OPENCLAW_TOOLING_SHA: "b".repeat(40),
-        },
+        OPENCLAW_ALLOW_FROZEN_TARGET_SCENARIO_OMISSIONS: "1",
+        OPENCLAW_SELECTED_SHA: selectedSha,
+        OPENCLAW_TOOLING_SHA: "b".repeat(40),
       },
     );
 
@@ -689,16 +592,9 @@ export function parseRegistryNpmSpec(spec: string) {
       mkdirSync(path.join(root, path.dirname(relativePath)), { recursive: true });
       writeFileSync(path.join(root, relativePath), "");
 
-      const result = spawnSync(
-        "bash",
-        [
-          "-c",
-          'set -euo pipefail; source "$2"; relative="$(openclaw_live_resolve_unique_staged_file "$1/src/agents" subagent-announce.live.test.ts)"; printf "src/agents/%s\\n" "$relative"',
-          "test",
-          root,
-          stageScriptPath,
-        ],
-        { encoding: "utf8" },
+      const result = runStage(
+        'set -euo pipefail; source "$1"; relative="$(openclaw_live_resolve_unique_staged_file "$2/src/agents" subagent-announce.live.test.ts)"; printf "src/agents/%s\\n" "$relative"',
+        root,
       );
 
       expect(result.status, result.stderr).toBe(0);
