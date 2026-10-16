@@ -4,18 +4,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { createChatAttachmentHandoff } from "../../app/chat-attachment-handoff.ts";
 import { canReloadControlUiDocument } from "../../app/document-reload-guard.ts";
+import type * as Durable from "../../lib/chat/composer-draft-store.runtime.ts";
 import { reviewPrivateComposerDraft } from "../chat/components/private-composer-recovery-dialog.tsx";
+import type * as Composer from "../chat/durable-composer-persistence.ts";
 import type { DraftGatewayState } from "./draft-gateway-state.ts";
 import { restoreDraft, retainDraft } from "./draft-navigation-handoff.ts";
 import type { DraftPlaceState } from "./draft-place-state.ts";
 import { createDraftFixture } from "./draft-submission-flow.test-support.ts";
 import { DraftSubmissionFlow } from "./draft-submission-flow.ts";
 
-type StoreReadResult = Awaited<
-  ReturnType<
-    typeof import("../../lib/chat/composer-draft-store.runtime.ts").readDurableComposerDraft
-  >
->;
+type StoreReadResult = Awaited<ReturnType<typeof Durable.readDurableComposerDraft>>;
 
 function storedDraft(
   text: string,
@@ -27,26 +25,24 @@ function storedDraft(
 }
 
 const store = vi.hoisted(() => {
-  const pendingReads: Array<(result: unknown) => void> = [];
+  const pendingReads: Array<(result: StoreReadResult) => void> = [];
   return {
     pendingReads,
-    hydrateDurableComposerAttachments:
-      vi.fn<
-        typeof import("../chat/durable-composer-persistence.ts").hydrateDurableComposerAttachments
-      >(),
+    hydrateDurableComposerAttachments: vi.fn<typeof Composer.hydrateDurableComposerAttachments>(),
     readDurableComposerDraft: vi.fn(
       () =>
-        new Promise((resolve) => {
-          pendingReads.push(resolve as (result: unknown) => void);
+        new Promise<StoreReadResult>((resolve) => {
+          pendingReads.push(resolve);
         }),
     ),
     writeDurableComposerDraft: vi.fn(async () => ({ status: "persisted" as const })),
-    retireDurableComposerDraft: vi.fn<
-      typeof import("../../lib/chat/composer-draft-store.runtime.ts").retireDurableComposerDraft
-    >(async () => ({ status: "persisted" as const })),
-    writeDurableComposerSnapshot: vi.fn<
-      typeof import("../chat/durable-composer-persistence.ts").writeDurableComposerSnapshot
-    >(async () => ({ result: { status: "persisted" as const }, payloadUnavailable: false })),
+    retireDurableComposerDraft: vi.fn<typeof Durable.retireDurableComposerDraft>(async () => ({
+      status: "persisted" as const,
+    })),
+    writeDurableComposerSnapshot: vi.fn<typeof Composer.writeDurableComposerSnapshot>(async () => ({
+      result: { status: "persisted" as const },
+      payloadUnavailable: false,
+    })),
   };
 });
 
@@ -56,14 +52,10 @@ vi.mock("../../lib/chat/composer-draft-store.runtime.ts", () => ({
   retireDurableComposerDraft: store.retireDurableComposerDraft,
 }));
 
-// The store runtime above is only dynamically imported, so a shared module
-// graph could reuse a draft-persistence.ts evaluated without the mock.
-// Mocking this statically imported helper forces a fresh evaluation and gives
-// a deterministic write seam; the file also runs in the isolated ui lane
-// (vitest.ui-isolated-paths.mjs) so the re-evaluation cannot perturb sibling
-// files' module singletons.
+// Mock the static helper to refresh the lazily imported store seam. This file's
+// isolated UI lane prevents that refresh from perturbing sibling singletons.
 vi.mock("../chat/durable-composer-persistence.ts", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../chat/durable-composer-persistence.ts")>();
+  const actual = await importOriginal<typeof Composer>();
   store.hydrateDurableComposerAttachments.mockImplementation(
     actual.hydrateDurableComposerAttachments,
   );
@@ -79,6 +71,10 @@ const retireDraft = store.retireDurableComposerDraft;
 const hydrateAttachments = store.hydrateDurableComposerAttachments;
 type Retirement = { status: "persisted"; revision: number; writeId: string };
 type SnapshotResult = Awaited<ReturnType<typeof writeSnapshot>>;
+
+function expectLastWrite(snapshot: Partial<Parameters<typeof writeSnapshot>[0]>) {
+  expect(writeSnapshot).toHaveBeenLastCalledWith(expect.objectContaining(snapshot));
+}
 
 function holdWrite() {
   const pending = createDeferred<SnapshotResult>();
@@ -166,8 +162,7 @@ describe("NewSessionDraftPersistence restore race", () => {
       hydration.resolve([]);
       // The restore registered its continuation before this await.
       await hydration.promise;
-      expect(flow.message).toBe("@Alex newer edit");
-      expect(flow.mentions).toEqual(mentions);
+      expect(flow).toMatchObject({ message: "@Alex newer edit", mentions });
       expect(restoreSelection).not.toHaveBeenCalled();
     } finally {
       hydration.resolve([]);
@@ -209,9 +204,7 @@ describe("NewSessionDraftPersistence restore race", () => {
       await vi.waitFor(() => expect(flow.message).toBe("Keep saved content"));
       flow.draftPersistence.persistNow();
       await vi.waitFor(() =>
-        expect(writeSnapshot).toHaveBeenLastCalledWith(
-          expect.objectContaining({ text: "Keep saved content", modelSelection: selection }),
-        ),
+        expectLastWrite({ text: "Keep saved content", modelSelection: selection }),
       );
       flow.disconnect();
     },
@@ -231,12 +224,10 @@ describe("NewSessionDraftPersistence restore race", () => {
     flow.draftPersistence.noteModelSelectionMutation();
     flow.draftPersistence.persistNow();
     await vi.waitFor(() =>
-      expect(writeSnapshot).toHaveBeenLastCalledWith(
-        expect.objectContaining({
-          text: "Still unsent",
-          modelSelection: expect.objectContaining({ model: selected }),
-        }),
-      ),
+      expectLastWrite({
+        text: "Still unsent",
+        modelSelection: expect.objectContaining({ model: selected }),
+      }),
     );
     flow.disconnect();
   });
@@ -360,10 +351,9 @@ describe("NewSessionDraftPersistence restore race", () => {
     persistence.activateRoute(route);
     finishWrite?.();
     await settle();
-    await resolvePendingRead(
+    await restore(
       storedDraft("newer stored draft", "another-tab", outcome === "conflict" ? 8 : revision + 1),
     );
-    await settle();
     expect(target.message).toBe(
       outcome === "conflict" ? "latest unsent edit" : "newer stored draft",
     );
@@ -458,8 +448,7 @@ describe("NewSessionDraftPersistence restore race", () => {
     await settle();
     expect(store.pendingReads).toHaveLength(0);
     finishWrite();
-    const snapshot = writeSnapshot.mock
-      .calls[0]![0] as import("../chat/durable-composer-persistence.ts").DurableChatComposerSnapshot;
+    const snapshot = writeSnapshot.mock.calls[0]![0];
     await resolvePendingRead(storedDraft("submitted prompt", snapshot.writeId, snapshot.revision));
     await clearing;
     expect(writeSnapshot.mock.calls.at(-1)?.[0]).toMatchObject({
@@ -482,28 +471,20 @@ describe("NewSessionDraftPersistence restore race", () => {
       }
       flow.draftPersistence.setOwner("ws://gateway.test", "recovery-a");
       flow.draftPersistence.activateRoute("agent:main");
-      await resolvePendingRead(
+      await restore(
         state === "missing"
           ? { status: "not-found" }
-          : {
-              status: "found",
-              draft: {
-                revision: 7,
-                text: state === "newer text" ? "stored draft" : "@Alex",
-                ...(state === "pristine" || state === "recipient"
-                  ? {
-                      mentions:
-                        state === "pristine"
-                          ? mentions
-                          : [{ profileId: "old-alex", start: 0, end: 5 }],
-                    }
-                  : {}),
-                attachments: [],
-                writeId: "w-1",
-              },
-            },
+          : storedDraft(
+              state === "newer text" ? "stored draft" : "@Alex",
+              "w-1",
+              7,
+              state === "pristine"
+                ? { mentions }
+                : state === "recipient"
+                  ? { mentions: [{ profileId: "old-alex", start: 0, end: 5 }] }
+                  : {},
+            ),
       );
-      await settle();
       expect(flow.message).toBe(expectedText);
       if (state === "pristine" || state === "recipient") {
         expect(flow.mentions).toEqual(mentions);

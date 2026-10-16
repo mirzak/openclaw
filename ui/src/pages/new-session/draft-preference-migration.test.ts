@@ -73,15 +73,12 @@ function migration(extraAgents = 0, entries: Record<string, unknown> = {}) {
     baseRef: "main",
     worktreeName: "first-task",
   };
-  expect(replaceBrowserPreference("ws://gateway.example", "main", preference)).toBe(true);
-  for (let index = 0; index < extraAgents; index += 1) {
-    expect(
-      replaceBrowserPreference(
-        "ws://gateway.example",
-        `agent-${String(index).padStart(2, "0")}`,
-        preference,
-      ),
-    ).toBe(true);
+  const agents = [
+    "main",
+    ...Array.from({ length: extraAgents }, (_, index) => `agent-${String(index).padStart(2, "0")}`),
+  ];
+  for (const agent of agents) {
+    expect(replaceBrowserPreference("ws://gateway.example", agent, preference)).toBe(true);
   }
   return { ...identityPreferences(true, undefined, entries), preference };
 }
@@ -128,22 +125,45 @@ it("honors another completed marker before a later non-final import batch", asyn
   expect(first.gateway.readPreference("main")).not.toHaveProperty("worktreeName");
 });
 
-it.each([false, true])(
-  "rebases migration conflicts on authoritative values (exhausted: %s)",
-  async (exhausted) => {
-    const prefs = migration(1);
+it.each(["recover", "exhaust", "reread failure", "partial failure"] as const)(
+  "preserves authoritative migration state after %s",
+  async (scenario) => {
+    const exhausted = scenario === "exhaust";
+    const partial = scenario === "partial failure";
+    const reread = scenario === "reread failure";
+    const prefs = migration(partial ? 33 : reread ? 0 : 1);
     let attempts = 0;
     prefs.beforeSave.mockImplementation(async (params) => {
       if (params.entries[migrationKey] === true && (exhausted || attempts === 0)) {
+        if (partial) {
+          throw new Error("preference save unavailable");
+        }
         attempts += 1;
         await setEntries(first, {
-          ...(exhausted ? { [migrationKey]: attempts } : {}),
-          [mainKey]: { ...prefs.preference, worktreeName: `newer-${attempts}` },
+          ...(exhausted || reread ? { [migrationKey]: reread || attempts } : {}),
+          [mainKey]: { ...prefs.preference, worktreeName: reread ? "" : `newer-${attempts}` },
         });
+        if (reread) {
+          prefs.beforeRead.mockRejectedValue(new Error("preference read unavailable"));
+        }
       }
     });
     const first = prefs.make();
     await prefs.ready(first);
+    if (partial) {
+      expect(prefs.stored("agent-00")).toMatchObject({ worktreeName: "first-task" });
+      expect(prefs.stored()).toBeUndefined();
+      expect(first.gateway.readPreference("main")).toMatchObject({ worktreeName: "first-task" });
+      expect(await getEntries(first)).toMatchObject({
+        entries: { "new-session.v1:agent-00": expect.any(Object) },
+      });
+      return;
+    }
+    if (reread) {
+      expect(prefs.stored()).toMatchObject({ worktreeName: "" });
+      expect(first.gateway.readPreference("main")).toBeNull();
+      return;
+    }
     expect(attempts).toBe(exhausted ? 3 : 1);
     expect(prefs.stored()).toMatchObject({ worktreeName: exhausted ? "newer-3" : "newer-1" });
     if (exhausted) {
@@ -156,38 +176,6 @@ it.each([false, true])(
     }
   },
 );
-
-it("does not publish browser fallback when a conflict reread fails", async () => {
-  const prefs = migration();
-  prefs.beforeSave.mockImplementationOnce(async () => {
-    await setEntries(first, {
-      [migrationKey]: true,
-      [mainKey]: { ...prefs.preference, worktreeName: "" },
-    });
-    prefs.beforeRead.mockRejectedValue(new Error("preference read unavailable"));
-  });
-  const first = prefs.make();
-  await prefs.ready(first);
-  expect(prefs.stored()).toMatchObject({ worktreeName: "" });
-  expect(first.gateway.readPreference("main")).toBeNull();
-});
-
-it("keeps browser fallback after a non-conflict partial migration failure", async () => {
-  const prefs = migration(33);
-  prefs.beforeSave.mockImplementation(async (params) => {
-    if (params.entries[migrationKey] === true) {
-      throw new Error("preference save unavailable");
-    }
-  });
-  const first = prefs.make();
-  await prefs.ready(first);
-  expect(prefs.stored("agent-00")).toMatchObject({ worktreeName: "first-task" });
-  expect(prefs.stored()).toBeUndefined();
-  expect(first.gateway.readPreference("main")).toMatchObject({ worktreeName: "first-task" });
-  expect(await getEntries(first)).toMatchObject({
-    entries: { "new-session.v1:agent-00": expect.any(Object) },
-  });
-});
 
 it("does not publish a rejected old migration into a replacement identity scope", async () => {
   const prefs = migration();
