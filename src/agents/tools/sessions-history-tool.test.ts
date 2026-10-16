@@ -1,5 +1,3 @@
-// sessions_history tool tests cover recall fidelity and input validation for
-// session transcript history returned to models.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,9 +9,9 @@ import {
 } from "../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import { replaceSessionEntrySync } from "../../config/sessions/session-accessor.js";
 import { createSessionVisibilityChecker } from "../../plugin-sdk/session-visibility.js";
-import { deleteTestEnvValue, setTestEnvValue } from "../../test-utils/env.js";
 import { describeSessionLinkRule } from "../tool-description-presets.js";
 import { compactToolOutputHint } from "../tool-schema-hints.js";
+import { createSessionsHistoryTool } from "./sessions-history-tool.js";
 import {
   type CallGatewayRequest,
   readHistoryDetails,
@@ -21,20 +19,9 @@ import {
   requireGatewayRequest,
 } from "./sessions-history-tool.test-support.js";
 
-let createSessionsHistoryTool: typeof import("./sessions-history-tool.js").createSessionsHistoryTool;
-let previousConfigPath: string | undefined;
 let tempDir: string | undefined;
 const SESSION_LINK_BASE = "http://127.0.0.1:18789/control";
 const SESSION_LINK_RULE = describeSessionLinkRule(SESSION_LINK_BASE);
-
-function useLoggingConfig(name: string, logging: Record<string, unknown>): void {
-  if (!tempDir) {
-    throw new Error("tempDir not initialized");
-  }
-  const configPath = path.join(tempDir, name);
-  fs.writeFileSync(configPath, `${JSON.stringify({ logging })}\n`, "utf8");
-  setTestEnvValue("OPENCLAW_CONFIG_PATH", configPath);
-}
 
 function writeSessionStore(
   name: string,
@@ -154,19 +141,11 @@ function childHistoryFixture(name: string, replace = false) {
 }
 
 describe("sessions_history", () => {
-  beforeAll(async () => {
-    previousConfigPath = process.env.OPENCLAW_CONFIG_PATH;
+  beforeAll(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-sessions-history-redact-"));
-    useLoggingConfig("redaction-off.json", { redactSensitive: "off" });
-    ({ createSessionsHistoryTool } = await import("./sessions-history-tool.js"));
   });
 
   afterAll(() => {
-    if (previousConfigPath === undefined) {
-      deleteTestEnvValue("OPENCLAW_CONFIG_PATH");
-    } else {
-      setTestEnvValue("OPENCLAW_CONFIG_PATH", previousConfigPath);
-    }
     if (tempDir) {
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
@@ -271,8 +250,7 @@ describe("sessions_history", () => {
     expect(requests.map((request) => request.method)).toEqual(["sessions.resolve", "chat.history"]);
   });
 
-  it("preserves recalled session text independently of log redaction", async () => {
-    useLoggingConfig("redaction-off.json", { redactSensitive: "off" });
+  it("preserves recalled secret-shaped session text", async () => {
     const tool = createHistoryToolWithMessage("OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789");
 
     const result = await tool.execute("call-1", { sessionKey: "main" });
@@ -288,7 +266,6 @@ describe("sessions_history", () => {
   });
 
   it("keeps accepted inputs separate, bounded, and addressable by their own cursor", async () => {
-    useLoggingConfig("pending-redaction-off.json", { redactSensitive: "off" });
     const items = Array.from({ length: 20 }, (_, index) => ({
       id: `00000000-0000-0000-0000-${String(index).padStart(12, "0")}`,
       runId: "do-not-expose-correlation",
@@ -339,29 +316,14 @@ describe("sessions_history", () => {
     expect((result.details as { contentRedacted?: unknown }).contentRedacted).toBe(false);
   });
 
-  it.each([0])("rejects invalid limit value %s", async (limit) => {
-    const tool = createHistoryToolWithMessage("hello");
-
-    await expect(tool.execute("call-1", { sessionKey: "main", limit })).rejects.toThrow(
-      "limit must be a positive integer",
-    );
-  });
-
-  it.each(["1abc"])("rejects invalid offset value %s", async (offset) => {
+  it.each([
+    { args: { limit: 0 }, error: "limit must be a positive integer" },
+    { args: { offset: "1abc" }, error: "offset must be a non-negative integer" },
+    { args: { sessionId: "session-1" }, error: "sessionId requires messageId" },
+  ])("rejects invalid history arguments: $error", async ({ args, error }) => {
     const { tool, requests } = historyFixture({ messages: [] });
-
-    await expect(tool.execute("call-1", { sessionKey: "main", offset })).rejects.toThrow(
-      "offset must be a non-negative integer",
-    );
+    await expect(tool.execute("call-1", { sessionKey: "main", ...args })).rejects.toThrow(error);
     expect(requests).toEqual([]);
-  });
-
-  it("rejects sessionId without messageId", async () => {
-    const tool = createHistoryToolWithMessage("hello");
-
-    await expect(
-      tool.execute("call-1", { sessionKey: "main", sessionId: "session-1" }),
-    ).rejects.toThrow("sessionId requires messageId");
   });
 
   it("requests explicit offset pages and returns continuation metadata", async () => {
@@ -524,45 +486,30 @@ describe("sessions_history", () => {
     expect(withTools.nextOffset).toBe(7);
   });
 
-  it("preserves the Gateway replay cursor for projected siblings from the same row", async () => {
-    const { tool } = historyFixture({
+  it.each([
+    {
+      name: "projected siblings from the same row",
+      offset: 0,
+      nextOffset: 2,
       messages: [
         { role: "assistant", content: "projected sibling", __openclaw: { seq: 8 } },
         { role: "assistant", content: "latest", __openclaw: { seq: 9 } },
       ],
-      offset: 0,
-      nextOffset: 2,
-      hasMore: true,
-      totalMessages: 10,
-    });
-
-    const result = await tool.execute("projected-replay", { sessionKey: "main", offset: 0 });
-
-    expect(result.details).toMatchObject({
-      offset: 0,
-      nextOffset: 2,
-      hasMore: true,
-      totalMessages: 10,
-    });
-  });
-
-  it("keeps history pagination advancing past an already-returned row", async () => {
-    const { tool } = historyFixture({
+    },
+    {
+      name: "advancing past an already-returned row",
+      offset: 4,
+      nextOffset: 5,
       messages: [{ role: "assistant", content: "visible", __openclaw: { seq: 7 } }],
-      offset: 4,
-      nextOffset: 5,
-      hasMore: true,
-      totalMessages: 10,
+    },
+  ])("preserves the Gateway replay cursor: $name", async ({ messages, offset, nextOffset }) => {
+    const pagination = { offset, nextOffset, hasMore: true, totalMessages: 10 };
+    const { tool } = historyFixture({
+      messages,
+      ...pagination,
     });
-
-    const result = await tool.execute("cursor-progress", { sessionKey: "main", offset: 4 });
-
-    expect(result.details).toMatchObject({
-      offset: 4,
-      nextOffset: 5,
-      hasMore: true,
-      totalMessages: 10,
-    });
+    const result = await tool.execute("cursor-progress", { sessionKey: "main", offset });
+    expect(result.details).toMatchObject(pagination);
   });
 
   it("reads an old child from its exact durable lineage row", async () => {
@@ -608,15 +555,13 @@ describe("sessions_history", () => {
     }
   });
 
-  it("rejects a scoped grant when the target incarnation changes before the read", async () => {
+  it.each([
+    { name: "incarnation", patch: { sessionId: "replacement-incarnation", updatedAt: 2 } },
+    { name: "archived", patch: { sessionId: "main-incarnation", updatedAt: 2, archivedAt: 2 } },
+  ])("rejects a scoped grant when the target is $name before the read", async ({ name, patch }) => {
     const { tool, requests, unregister, targetSessionKey } = scopedHistoryFixture(
-      "scoped-grant-race",
-      (storePath) => {
-        replaceSessionEntrySync(
-          { storePath, sessionKey: "agent:main:main" },
-          { sessionId: "replacement-incarnation", updatedAt: 2 },
-        );
-      },
+      `scoped-grant-${name}-race`,
+      (storePath) => replaceSessionEntrySync({ storePath, sessionKey: "agent:main:main" }, patch),
     );
     try {
       await expect(
@@ -628,73 +573,41 @@ describe("sessions_history", () => {
     }
   });
 
-  it("rejects a scoped grant when the target is archived before the read", async () => {
-    const { tool, requests, unregister, targetSessionKey } = scopedHistoryFixture(
-      "scoped-grant-archive-race",
-      (storePath) => {
-        replaceSessionEntrySync(
-          { storePath, sessionKey: "agent:main:main" },
-          { sessionId: "main-incarnation", updatedAt: 2, archivedAt: 2 },
-        );
-      },
-    );
-    try {
-      await expect(
-        tool.execute("scoped-grant-archive-race", { sessionKey: targetSessionKey }),
-      ).rejects.toThrow(`Session "${targetSessionKey}" changed after access was granted.`);
-      expect(requests.some((request) => request.method === "chat.history")).toBe(false);
-    } finally {
-      unregister();
-    }
-  });
-
-  it("carries the persisted fixed-store owner for a bare history key", async () => {
-    const { tool, requests } = historyFixture(
-      { messages: [] },
-      {
-        agentSessionKey: "global",
-        config: {
-          session: { store: path.join(tempDir!, "owned-shared.sqlite"), scope: "global" },
-          agents: {
-            ownership: "explicit",
-            defaults: { sessionStore: { agentId: "ops" } },
-            entries: { ops: {}, research: {} },
+  it.each([
+    { requested: "global", requester: "global", agentId: "ops", resolved: "global" },
+    {
+      requested: "current",
+      requester: "agent:research:main",
+      agentId: "research",
+      resolved: "agent:research:main",
+    },
+  ])(
+    "resolves $requested history under $agentId",
+    async ({ requested, requester, agentId, resolved }) => {
+      const { tool, requests } = historyFixture(
+        { messages: [] },
+        {
+          agentSessionKey: requester,
+          ...(requested === "current" ? { requesterAgentIdOverride: "research" } : {}),
+          config: {
+            session: { store: path.join(tempDir!, `owned-${requested}.sqlite`), scope: "global" },
+            agents: {
+              ownership: "explicit",
+              defaults: { sessionStore: { agentId: "ops" } },
+              entries: { ops: {}, research: {} },
+            },
           },
         },
-      },
-    );
+      );
 
-    await tool.execute("owned-global", { sessionKey: "global" });
-
-    expect(requests).toContainEqual({
-      method: "chat.history",
-      params: expect.objectContaining({ sessionKey: "global", agentId: "ops" }),
-    });
-  });
-
-  it("resolves current history under the requester instead of the fixed-store owner", async () => {
-    const { tool, requests } = historyFixture(
-      { messages: [] },
-      {
-        agentSessionKey: "agent:research:main",
-        requesterAgentIdOverride: "research",
-        config: {
-          session: { store: path.join(tempDir!, "owned-current.sqlite"), scope: "global" },
-          agents: {
-            ownership: "explicit",
-            defaults: { sessionStore: { agentId: "ops" } },
-            entries: { ops: {}, research: {} },
-          },
-        },
-      },
-    );
-
-    await tool.execute("research-current-history", { sessionKey: "current" });
-
-    expect(requests).toContainEqual({
-      method: "chat.history",
-      params: expect.objectContaining({ sessionKey: "agent:research:main", agentId: "research" }),
-    });
-    expect(requests.some((request) => request.method === "sessions.resolve")).toBe(false);
-  });
+      await tool.execute("owned-history", { sessionKey: requested });
+      expect(requests).toContainEqual({
+        method: "chat.history",
+        params: expect.objectContaining({ sessionKey: resolved, agentId }),
+      });
+      if (requested === "current") {
+        expect(requests.some((request) => request.method === "sessions.resolve")).toBe(false);
+      }
+    },
+  );
 });
