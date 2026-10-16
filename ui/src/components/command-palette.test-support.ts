@@ -20,7 +20,7 @@ import {
 import { installDialogPolyfill } from "../test-helpers/modal-dialog.ts";
 import type { CommandPalette } from "./command-palette.tsx";
 
-export function registerCommandPaletteTestHooks() {
+export function registerCommandPaletteTestHooks({ mockScroll = true } = {}) {
   let restoreDialogPolyfill: () => void;
   let scrollIntoViewDescriptor: PropertyDescriptor | undefined;
 
@@ -28,10 +28,12 @@ export function registerCommandPaletteTestHooks() {
     vi.useFakeTimers();
     restoreDialogPolyfill = installDialogPolyfill();
     scrollIntoViewDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, "scrollIntoView");
-    Object.defineProperty(Element.prototype, "scrollIntoView", {
-      configurable: true,
-      value: vi.fn(),
-    });
+    if (mockScroll) {
+      Object.defineProperty(Element.prototype, "scrollIntoView", {
+        configurable: true,
+        value: vi.fn(),
+      });
+    }
   });
 
   afterEach(() => {
@@ -57,13 +59,10 @@ export function createGateway(
     ((method: string) =>
       method === "sessions.search" ? { results: [], sessions: [] } : { models: [] });
   const client = createTestGatewayClient((...args) => {
-    // Creation targeting has its own catalog. Search fixtures provide an empty
-    // valid destination response without consuming their scripted search replies.
+    // Creation catalogs must not consume scripted search replies.
     if (args[0] === "environments.list") {
       return { environments: [], profiles: [] };
     }
-    // The roster carries the placement policy. Keep these fixtures focused on
-    // search traffic and provide the canonical empty roster and policy.
     if (
       args[0] === "agents.list" &&
       args[1] &&
@@ -88,14 +87,7 @@ export function createGateway(
   });
   Object.assign(gateway, {
     connection: { gatewayUrl: "ws://localhost", token: "", bootstrapToken: "", password: "" },
-    connectionRevision: 0,
-    eventLog: [],
-    eventLogRevision: 0,
-    loadSelfProfile: async () => null,
     setSessionKey: () => undefined,
-    start: () => undefined,
-    stop: () => undefined,
-    subscribeEventLog: () => () => undefined,
   });
   return {
     gateway,
@@ -127,8 +119,7 @@ export function createContext(
   list: ApplicationContext["sessions"]["list"] = vi.fn(async () => null),
 ): ApplicationContext {
   const agents = createAgentCapability(gateway);
-  // Search scenarios control catalog acquisition independently of creation.
-  // Keep the canonical empty roster and subscription lifecycle, not a fabricated agent.
+  // Search scenarios acquire their own roster without triggering creation reads.
   agents.ensureList = async () => null;
   const agentSelection = createAgentSelectionCapability(gateway, agents);
   onTestFinished(() => {

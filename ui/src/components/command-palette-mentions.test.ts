@@ -71,65 +71,73 @@ async function mount(createdSessionKey = "agent:main:dashboard:mentioned") {
   );
   const mounted = await mountPalette(context);
   const { palette, query, queryAll } = mounted;
-  const getInput = () => paletteInput(palette);
   await openPalette(palette);
-  getInput().focus();
-  const edit = async (start: number, end: number, text: string, inputType = "insertText") => {
-    const input = getInput();
-    input.setSelectionRange(start, end);
-    const event = {
-      bubbles: true,
-      inputType,
-      data: inputType.startsWith("delete") ? null : text,
-    };
-    input.dispatchEvent(new InputEvent("beforeinput", { ...event, cancelable: true }));
-    input.setRangeText(text, start, end, "end");
-    input.dispatchEvent(new InputEvent("input", event));
-    await palette.updateComplete;
-  };
-  const append = (text: string) => edit(getInput().value.length, getInput().value.length, text);
-  const replace = (text: string, inputType = "insertText") =>
-    edit(0, getInput().value.length, text, inputType);
-  const key = async (pressedKey: string, extra: KeyboardEventInit = {}) => {
-    const event = pressKey(getInput(), pressedKey, { cancelable: true, ...extra });
-    await palette.updateComplete;
-    return event;
-  };
-  const search = async (text = "@") => {
-    await append(text);
-    await settlePalette(palette, 150);
-  };
-  const menu = () => query(".mention-menu");
-  const recipients = () => [...queryAll(".composer-context-strip__person")];
-  const send = async () => {
-    await vi.advanceTimersByTimeAsync(0);
-    await key("Enter", { ctrlKey: true });
-    await settlePalette(palette, 0);
-  };
+  paletteInput(palette).focus();
   return {
     ...fixture,
     ...mounted,
     get input() {
-      return getInput();
+      return paletteInput(palette);
     },
     directory,
     directoryParams: () =>
       fixture.request.mock.calls
         .filter(([method]) => method === "users.mentionable")
         .map(([, params]) => params),
-    select: async (start: number, end: number) => {
-      getInput().setSelectionRange(start, end);
-      getInput().dispatchEvent(new Event("select", { bubbles: true }));
+    async select(start: number, end: number) {
+      this.input.setSelectionRange(start, end);
+      this.input.dispatchEvent(new Event("select", { bubbles: true }));
       await palette.updateComplete;
     },
-    edit,
-    append,
-    replace,
-    key,
-    search,
-    menu,
-    recipients,
-    send,
+    async edit(start: number, end: number, text: string, inputType = "insertText") {
+      const input = this.input;
+      input.setSelectionRange(start, end);
+      const event = {
+        bubbles: true,
+        inputType,
+        data: inputType.startsWith("delete") ? null : text,
+      };
+      input.dispatchEvent(new InputEvent("beforeinput", { ...event, cancelable: true }));
+      input.setRangeText(text, start, end, "end");
+      input.dispatchEvent(new InputEvent("input", event));
+      await palette.updateComplete;
+    },
+    append(text: string) {
+      return this.edit(this.input.value.length, this.input.value.length, text);
+    },
+    replace(text: string, inputType = "insertText") {
+      return this.edit(0, this.input.value.length, text, inputType);
+    },
+    async key(pressedKey: string, extra: KeyboardEventInit = {}) {
+      const event = pressKey(this.input, pressedKey, { cancelable: true, ...extra });
+      await palette.updateComplete;
+      return event;
+    },
+    async search(text = "@") {
+      await this.append(text);
+      await settlePalette(palette, 150);
+    },
+    menu: () => query(".mention-menu"),
+    recipients: () => [...queryAll(".composer-context-strip__person")],
+    async send() {
+      await vi.advanceTimersByTimeAsync(0);
+      await this.key("Enter", { ctrlKey: true });
+      await settlePalette(palette, 0);
+    },
+    async mention(text = "@", move?: string) {
+      await this.search(text);
+      if (move) {
+        await this.key(move);
+      }
+      await this.key("Enter");
+    },
+    expectCreate: (params: object) =>
+      expect(fixture.request).toHaveBeenCalledWith(
+        "sessions.create",
+        expect.objectContaining(params),
+      ),
+    createParams: () =>
+      fixture.request.mock.calls.find(([method]) => method === "sessions.create")?.[1],
     publish,
   };
 }
@@ -151,9 +159,7 @@ describe("command palette people mentions", () => {
     await f.key("End");
     await f.key("Tab");
     expect(f.recipients()).toHaveLength(2);
-    await f.search();
-    await f.key("ArrowDown");
-    await f.key("Enter");
+    await f.mention("@", "ArrowDown");
     expect(f.recipients()).toHaveLength(2);
     expect(f.context.sessions.createResult).not.toHaveBeenCalled();
     const expected = [
@@ -162,10 +168,7 @@ describe("command palette people mentions", () => {
       { profileId: "alex-two", start: 24, end: 29 },
     ];
     await f.send();
-    expect(f.request).toHaveBeenCalledWith(
-      "sessions.create",
-      expect.objectContaining({ message: "🙂 @Alex @Jordan Rivera @Alex", mentions: expected }),
-    );
+    f.expectCreate({ message: "🙂 @Alex @Jordan Rivera @Alex", mentions: expected });
     const retained = f.context.chatSubmissions.readInitial(
       "agent:main:dashboard:mentioned",
       f.context.gateway.snapshot.client,
@@ -182,11 +185,8 @@ describe("command palette people mentions", () => {
     "preserves recipient identity after deleting %s",
     async (change) => {
       const f = await mount();
-      await f.search();
-      await f.key("Enter");
-      await f.search();
-      await f.key(change === "same-name token" ? "ArrowDown" : "End");
-      await f.key("Enter");
+      await f.mention();
+      await f.mention("@", change === "same-name token" ? "ArrowDown" : "End");
       await f.edit(
         change === "same-name token" ? 0 : 3,
         change === "same-name token" ? 6 : 4,
@@ -206,15 +206,12 @@ describe("command palette people mentions", () => {
           selectionStart: 28,
         });
         await f.send();
-        expect(f.request).toHaveBeenCalledWith(
-          "sessions.create",
-          expect.objectContaining({
-            mentions: [
-              { profileId: "alex-two", start: 7, end: 12 },
-              { profileId: "jordan", start: 13, end: 27 },
-            ],
-          }),
-        );
+        f.expectCreate({
+          mentions: [
+            { profileId: "alex-two", start: 7, end: 12 },
+            { profileId: "jordan", start: 13, end: 27 },
+          ],
+        });
       } else {
         const value = f.input.value;
         vi.mocked(f.context.sessions.list).mockClear();
@@ -227,8 +224,7 @@ describe("command palette people mentions", () => {
           expect.objectContaining({ search: value.trim() }),
         );
         await f.send();
-        const create = f.request.mock.calls.find(([method]) => method === "sessions.create")?.[1];
-        expect(create).not.toHaveProperty("mentions");
+        expect(f.createParams()).not.toHaveProperty("mentions");
       }
     },
   );
@@ -267,12 +263,8 @@ describe("command palette people mentions", () => {
         expect(f.directory).not.toHaveBeenCalled();
       }
       await f.send();
-      expect(f.request).toHaveBeenCalledWith(
-        "sessions.create",
-        expect.objectContaining({ message }),
-      );
-      const create = f.request.mock.calls.find(([method]) => method === "sessions.create")?.[1];
-      expect(create).not.toHaveProperty("mentions");
+      f.expectCreate({ message });
+      expect(f.createParams()).not.toHaveProperty("mentions");
       expect(f.palette.isOpen).toBe(false);
     },
   );
@@ -325,8 +317,7 @@ describe("command palette people mentions", () => {
       key: "agent:main:dashboard:rejected",
       initialRun: { status: "rejected", error: "First turn rejected" },
     });
-    await f.search();
-    await f.key("Enter");
+    await f.mention();
     await f.send();
     expect(f.query('[role="alert"]')?.textContent).toContain("First turn rejected");
     expect(f.recipients()).toHaveLength(1);
@@ -343,8 +334,7 @@ describe("command palette people mentions", () => {
     const f = await mount();
     const submission = createDeferred<Awaited<ReturnType<typeof requestSessionCreate>>>();
     vi.mocked(f.context.sessions.createResult).mockReturnValueOnce(submission.promise);
-    await f.search();
-    await f.key("Enter");
+    await f.mention();
     await f.send();
     expect(f.input.disabled).toBe(true);
     expect(f.query(".cmd-palette__mentions")?.hasAttribute("inert")).toBe(true);
@@ -479,14 +469,11 @@ describe("command palette people mentions", () => {
       await f.key("Enter");
       expect(f.input.value).toBe("@New Person ");
       await f.send();
-      expect(f.request).toHaveBeenCalledWith(
-        "sessions.create",
-        expect.objectContaining({
-          agentId: destination,
-          message: "@New Person",
-          mentions: [{ profileId: "new-person", start: 0, end: 11 }],
-        }),
-      );
+      f.expectCreate({
+        agentId: destination,
+        message: "@New Person",
+        mentions: [{ profileId: "new-person", start: 0, end: 11 }],
+      });
       expect(f.context.gateway.snapshot.sessionKey).toBe(foreground);
       expect(f.context.agentSelection.state.selectedId).toBe("main");
     },

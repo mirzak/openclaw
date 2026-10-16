@@ -71,28 +71,20 @@ describe("CommandPalette search", () => {
       }
       throw new Error(`Unexpected method: ${method}`);
     });
-    const { gateway, emit, setConnected } = createGateway(true, {
-      methods: ["cron.list"],
-      request,
-    });
     const empty = { ...createSessionResult("agent:main:none", "None"), sessions: [] };
-    const { palette } = await mountPalette(
-      createContext(
-        gateway,
-        vi.fn(async () => empty),
-      ),
+    const { palette, emit, setConnected } = await mountSearch(
+      { methods: ["cron.list"], request },
+      vi.fn(async () => empty),
     );
 
-    await enterQuery(palette, "nightly");
-    await vi.advanceTimersByTimeAsync(200);
+    await searchPalette(palette, "nightly");
     await vi.waitFor(() => expect(palette.textContent).toContain("Nightly invoices"));
     const item = findPaletteOption(palette, "Nightly invoices");
     item?.click();
     expect(palette.onNavigate).toHaveBeenCalledWith("cron");
 
     await vi.advanceTimersByTimeAsync(60_000);
-    await enterQuery(palette, "invoices");
-    await vi.advanceTimersByTimeAsync(200);
+    await searchPalette(palette, "invoices");
     await vi.waitFor(() => expect(palette.textContent).toContain("Nightly invoices"));
     expect(request.mock.calls.filter(([method]) => method === "cron.list")).toHaveLength(1);
 
@@ -107,7 +99,7 @@ describe("CommandPalette search", () => {
 
   it("shows model results while another catalog is still pending", async () => {
     const automations = createDeferred<{ jobs: { id: string; name: string }[] }>();
-    const { gateway } = createGateway(true, {
+    const { palette } = await mountSearch({
       methods: ["cron.list", "models.list"],
       request: vi.fn(async (method: string) => {
         if (method === "cron.list") {
@@ -119,17 +111,14 @@ describe("CommandPalette search", () => {
         throw new Error(`Unexpected method: ${method}`);
       }),
     });
-    const { palette } = await mountPalette(createContext(gateway));
 
-    await enterQuery(palette, "needle");
-    await vi.advanceTimersByTimeAsync(200);
+    await searchPalette(palette, "needle");
     await vi.waitFor(() => expect(findPaletteOption(palette, "Needle model")).toBeDefined());
     expect(palette.textContent).toContain("Searching commands");
     findPaletteOption(palette, "Needle model")?.click();
     expect(palette.onNavigate).toHaveBeenCalledWith("model-providers");
 
-    await enterQuery(palette, "needle");
-    await vi.advanceTimersByTimeAsync(200);
+    await searchPalette(palette, "needle");
     automations.resolve({ jobs: [{ id: "needle-job", name: "Needle automation" }] });
     await vi.waitFor(() => expect(findPaletteOption(palette, "Needle automation")).toBeDefined());
     expect(findPaletteOption(palette, "Needle model")).toBeDefined();
@@ -143,8 +132,7 @@ describe("CommandPalette search", () => {
       .mockResolvedValueOnce(modelResult("needle", "Needle"));
     const { gateway } = modelGateway(request);
     const { palette, query } = await mountPalette(createContext(gateway, async () => null));
-    await enterQuery(palette, "needle");
-    await vi.advanceTimersByTimeAsync(200);
+    await searchPalette(palette, "needle");
     await vi.waitFor(() =>
       expect(query(".cmd-palette__source-error")?.textContent).toContain(
         "Model search unavailable",
@@ -268,24 +256,18 @@ describe("CommandPalette search", () => {
     { name: "an internal newline", prompt: "plugins\nsettings" },
   ])("preserves $name as a prompt without sending searches", async ({ prompt }) => {
     const request = vi.fn(async (_method: string) => ({ models: [], results: [] }));
-    const { gateway } = createGateway(true, { methods: ["sessions.search"], request });
     const list = vi.fn(async () => null);
-    const { palette, query } = await mountPalette(createContext(gateway, list));
+    const { palette, query } = await mountSearch({ methods: ["sessions.search"], request }, list);
 
     await searchPalette(palette, prompt);
 
     const input = paletteInput(palette);
-    expect(input.value).toBe(prompt);
     expect([list.mock.calls, request.mock.calls]).toEqual([[], []]);
     expectPalettePromptMode(palette);
     for (const key of ["ArrowUp", "ArrowDown"]) {
-      const arrow = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
-      input.dispatchEvent(arrow);
-      expect(arrow.defaultPrevented).toBe(false);
+      expect(pressKey(input, key, { cancelable: true }).defaultPrevented).toBe(false);
     }
-    const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
-    input.dispatchEvent(enter);
-    expect(enter.defaultPrevented).toBe(true);
+    expect(pressKey(input, "Enter", { cancelable: true }).defaultPrevented).toBe(true);
     expect(palette.onNavigate).not.toHaveBeenCalled();
     expect(palette.onSelectSession).not.toHaveBeenCalled();
     expect(input.value).toBe(prompt);
@@ -299,11 +281,9 @@ describe("CommandPalette search", () => {
   });
   it("keeps the current mode between 50 and 60 Unicode code points", async () => {
     const character = "🦞";
-    const { gateway } = createGateway(true, { methods: ["sessions.search"] });
     const list = vi.fn(async () => null);
-    const { palette, query } = await mountPalette(createContext(gateway, list));
-    await enterQuery(palette, character.repeat(59));
-    await vi.advanceTimersByTimeAsync(200);
+    const { palette, query } = await mountSearch({ methods: ["sessions.search"] }, list);
+    await searchPalette(palette, character.repeat(59));
     expect(list).toHaveBeenCalledOnce();
     const input = paletteInput(palette);
     for (const length of [60, 59, 51, 55, 60]) {
@@ -336,12 +316,10 @@ describe("CommandPalette search", () => {
     expect(list).toHaveBeenCalledTimes(4);
   });
   it("waits for two characters before searching sessions", async () => {
-    const { gateway } = createGateway(true, { methods: ["sessions.search"] });
     const list = vi.fn(async () => createSessionResult("agent:main:test", "Test"));
-    const { palette, query } = await mountPalette(createContext(gateway, list));
+    const { palette, query } = await mountSearch({ methods: ["sessions.search"] }, list);
 
-    await enterQuery(palette, "n");
-    await vi.advanceTimersByTimeAsync(200);
+    await searchPalette(palette, "n");
 
     expect(list).not.toHaveBeenCalled();
     expect(query('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
@@ -517,7 +495,7 @@ describe("CommandPalette search", () => {
     expect(palette.isOpen).toBe(false);
   });
   it("distinguishes model choices with hyphenated provider and model IDs", async () => {
-    const { gateway } = createGateway(true, {
+    const { palette, query } = await mountSearch({
       methods: ["models.list"],
       request: vi.fn(async () => ({
         models: [
@@ -526,7 +504,6 @@ describe("CommandPalette search", () => {
         ],
       })),
     });
-    const { palette, query } = await mountPalette(createContext(gateway));
     await searchPalette(palette, "needle");
     pressKey(paletteInput(palette), "ArrowDown");
     await palette.updateComplete;
@@ -535,28 +512,22 @@ describe("CommandPalette search", () => {
 
   it("keeps the active descendant bound for a surrogate-containing session key", async () => {
     const key = "agent:main:topic:\ud800";
-    const { gateway } = createGateway(true);
     const colon = createSessionResult(key, "Needle colon");
     const hyphen = createSessionResult("agent:main:topic-thread", "Needle hyphen");
-    const { palette, query } = await mountPalette(
-      createContext(
-        gateway,
-        vi.fn(async () => ({
-          ...colon,
-          count: 2,
-          sessions: [...colon.sessions, ...hyphen.sessions],
-        })),
-      ),
+    const { palette, query } = await mountSearch(
+      {},
+      vi.fn(async () => ({
+        ...colon,
+        count: 2,
+        sessions: [...colon.sessions, ...hyphen.sessions],
+      })),
     );
     await searchPalette(palette, "Needle");
-    query<HTMLTextAreaElement>(".cmd-palette__input")?.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true }),
-    );
+    pressKey(paletteInput(palette), "ArrowDown");
     await palette.updateComplete;
     const active = query('[aria-selected="true"]');
     expect(active?.textContent).toContain("Needle hyphen");
-    const activeId =
-      query<HTMLTextAreaElement>(".cmd-palette__input")?.getAttribute("aria-activedescendant");
+    const activeId = paletteInput(palette).getAttribute("aria-activedescendant");
     expect(document.getElementById(activeId ?? "")).toBe(active);
   });
   it("shows category metadata matches from the Gateway search", async () => {
@@ -566,11 +537,7 @@ describe("CommandPalette search", () => {
     const request = vi.fn(async (method: string) =>
       method === "models.list" ? { models: [] } : ({ results: [] } satisfies SessionsSearchResult),
     );
-    const { gateway } = createGateway(true, {
-      methods: ["sessions.search"],
-      request,
-    });
-    const { palette } = await mountPalette(createContext(gateway, list));
+    const { palette } = await mountSearch({ methods: ["sessions.search"], request }, list);
 
     await enterQuery(palette, "tak");
     await vi.advanceTimersByTimeAsync(200);
@@ -584,12 +551,11 @@ describe("CommandPalette search", () => {
 
   it("shows a chat search failure for plugins and retries after shortening a prompt", async () => {
     const query = "plugins";
-    const { gateway } = createGateway(true);
     const list = vi
       .fn<ApplicationContext["sessions"]["list"]>()
       .mockRejectedValueOnce(new Error("store needs doctor migration"))
       .mockResolvedValueOnce(createSessionResult("agent:main:zz", "Recovered chat"));
-    const { palette } = await mountPalette(createContext(gateway, list));
+    const { palette } = await mountSearch({}, list);
     await searchPalette(palette, query);
 
     expect(list).toHaveBeenCalledOnce();
@@ -603,7 +569,6 @@ describe("CommandPalette search", () => {
     expectPalettePromptMode(palette);
     expect(list).toHaveBeenCalledOnce();
 
-    // Shortening the prompt restores search and retries cleanly.
     setInputValue(input, "zz");
     await palette.updateComplete;
     expect(palette.textContent).not.toContain("Chat search failed");
