@@ -51,10 +51,33 @@ async function invoke(
   return respond;
 }
 
+const withProfiles = (run: () => Promise<void>) =>
+  withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
+    await captureRuntimeConfigAsyncReader()();
+    await run();
+  });
+function expectError(respond: ReturnType<typeof vi.fn>, code: string, details = {}) {
+  expect(respond).toHaveBeenCalledWith(
+    false,
+    undefined,
+    expect.objectContaining({ code, ...details }),
+  );
+}
+function createDraft(sessionKey: string, sessionId: string, profileId: string | undefined) {
+  return upsertSessionEntryCore(
+    { agentId: "main", sessionKey },
+    {
+      sessionId,
+      updatedAt: 1,
+      visibility: "draft",
+      createdActor: { type: "human", source: "profile", id: profileId },
+    },
+  );
+}
+
 describe("session companion RPC", () => {
   it("keeps a memory incognito source current through operator authority for durable side chat writes", async () => {
-    await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
-      await captureRuntimeConfigAsyncReader()();
+    await withProfiles(async () => {
       const profile = ensureProfileForEmail("incognito-companion@example.test");
       const client = {
         ...sharingPolicyClient({ user: profile.id, scopes: ["operator.admin"] }),
@@ -116,8 +139,7 @@ describe("session companion RPC", () => {
 
   it("carries the authenticated model policy and releases it after answering", async () => {
     const controller = new AbortController();
-    await withOpenClawTestState({ scenario: "minimal", prepareProfileCatalog: true }, async () => {
-      await captureRuntimeConfigAsyncReader()();
+    await withProfiles(async () => {
       const client = { ...roleClient("view", "companion-policy"), connId: "policy-connection" };
       using _ = {
         [Symbol.dispose]: (await profileReader.prepareUserProfileCatalog()).release,
@@ -133,19 +155,7 @@ describe("session companion RPC", () => {
       }
       role.modelPolicy = { sourceAgent: "main" };
       const sessionKey = "agent:main:policy";
-      await upsertSessionEntryCore(
-        { agentId: "main", sessionKey },
-        {
-          sessionId: "policy-session",
-          updatedAt: 1,
-          visibility: "draft",
-          createdActor: {
-            type: "human",
-            source: "profile",
-            id: client.authenticatedUserProfile?.profileId,
-          },
-        },
-      );
+      await createDraft(sessionKey, "policy-session", client.authenticatedUserProfile?.profileId);
       let captured: AdmittedRunOperatorAuthority | undefined;
       const ask = vi.fn(async (request: Parameters<SessionCompanionService["ask"]>[0]) => {
         captured = request.operatorAuthority;
@@ -175,73 +185,65 @@ describe("session companion RPC", () => {
   it.each(["params", "connection"] as const)(
     "retains the original side chat request while profile preparation waits for %s",
     async (change) => {
-      await withOpenClawTestState(
-        { scenario: "minimal", prepareProfileCatalog: true },
-        async () => {
-          await captureRuntimeConfigAsyncReader()();
-          const client = {
-            ...roleClient("view", `companion-await-${change}`),
-            connId: "original-connection",
-          };
-          const attachment = { mimeType: "image/png", content: "b3JpZ2luYWw=" };
-          const params = {
-            sessionKey: "agent:main:original",
-            question: "Original question",
-            attachments: [attachment],
-          };
-          const entered = createDeferredCore();
-          const resume = createDeferredCore();
-          const originalPrepare = profileReader.prepareUserProfileIdentity;
-          const release = vi.fn();
-          const spy = vi
-            .spyOn(profileReader, "prepareUserProfileIdentity")
-            .mockImplementation(async (...args) => {
-              const prepared = await originalPrepare(...args);
-              release.mockImplementation(prepared.release);
-              prepared.release = release;
-              entered.resolve();
-              await resume.promise;
-              return prepared;
-            });
-          const ask = vi.fn(async () => ({ answer: "Original answer", ts: 1 }));
-          const running = invoke("sessions.companion.ask", params, { ask }, client);
-          try {
-            await entered.promise;
-            if (change === "params") {
-              params.sessionKey = "agent:main:replacement";
-              params.question = "Replacement question";
-              attachment.content = "cmVwbGFjZW1lbnQ=";
-            } else {
-              client.connId = "replacement-connection";
-            }
-            resume.resolve();
-            const respond = await running;
-            if (change === "params") {
-              expect(ask).toHaveBeenCalledExactlyOnceWith(
-                expect.objectContaining({
-                  sessionKey: "agent:main:original",
-                  question: "Original question",
-                  connId: "original-connection",
-                  attachments: [{ mimeType: "image/png", content: "b3JpZ2luYWw=" }],
-                }),
-              );
-              expect(respond).toHaveBeenCalledWith(true, { answer: "Original answer", ts: 1 });
-            } else {
-              expect(ask).not.toHaveBeenCalled();
-              expect(respond).toHaveBeenCalledWith(
-                false,
-                undefined,
-                expect.objectContaining({ code: "UNAVAILABLE" }),
-              );
-            }
-            expect(release).toHaveBeenCalledOnce();
-          } finally {
-            resume.resolve();
-            await running;
-            spy.mockRestore();
+      await withProfiles(async () => {
+        const client = {
+          ...roleClient("view", `companion-await-${change}`),
+          connId: "original-connection",
+        };
+        const attachment = { mimeType: "image/png", content: "b3JpZ2luYWw=" };
+        const params = {
+          sessionKey: "agent:main:original",
+          question: "Original question",
+          attachments: [attachment],
+        };
+        const entered = createDeferredCore();
+        const resume = createDeferredCore();
+        const originalPrepare = profileReader.prepareUserProfileIdentity;
+        const release = vi.fn();
+        const spy = vi
+          .spyOn(profileReader, "prepareUserProfileIdentity")
+          .mockImplementation(async (...args) => {
+            const prepared = await originalPrepare(...args);
+            release.mockImplementation(prepared.release);
+            prepared.release = release;
+            entered.resolve();
+            await resume.promise;
+            return prepared;
+          });
+        const ask = vi.fn(async () => ({ answer: "Original answer", ts: 1 }));
+        const running = invoke("sessions.companion.ask", params, { ask }, client);
+        try {
+          await entered.promise;
+          if (change === "params") {
+            params.sessionKey = "agent:main:replacement";
+            params.question = "Replacement question";
+            attachment.content = "cmVwbGFjZW1lbnQ=";
+          } else {
+            client.connId = "replacement-connection";
           }
-        },
-      );
+          resume.resolve();
+          const respond = await running;
+          if (change === "params") {
+            expect(ask).toHaveBeenCalledExactlyOnceWith(
+              expect.objectContaining({
+                sessionKey: "agent:main:original",
+                question: "Original question",
+                connId: "original-connection",
+                attachments: [{ mimeType: "image/png", content: "b3JpZ2luYWw=" }],
+              }),
+            );
+            expect(respond).toHaveBeenCalledWith(true, { answer: "Original answer", ts: 1 });
+          } else {
+            expect(ask).not.toHaveBeenCalled();
+            expectError(respond, "UNAVAILABLE");
+          }
+          expect(release).toHaveBeenCalledOnce();
+        } finally {
+          resume.resolve();
+          await running;
+          spy.mockRestore();
+        }
+      });
     },
   );
 
@@ -262,7 +264,7 @@ describe("session companion RPC", () => {
     const ask = vi.fn();
     const respond = await invoke("sessions.companion.ask", params, { ask }, client);
     expect(ask).not.toHaveBeenCalled();
-    expect(respond).toHaveBeenCalledWith(false, undefined, expect.objectContaining({ code }));
+    expectError(respond, code);
   });
 
   it.each([
@@ -277,15 +279,7 @@ describe("session companion RPC", () => {
       { sessionKey: "agent:main:main", question: "Why?" },
       { ask },
     );
-    expect(respond).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({
-        code: "UNAVAILABLE",
-        retryable: true,
-        details,
-      }),
-    );
+    expectError(respond, "UNAVAILABLE", { retryable: true, details });
   });
 
   it.each(["state", "reset"] as const)(
@@ -306,11 +300,7 @@ describe("session companion RPC", () => {
         operation === "state" ? {} : { sessionKey: "agent:main:main", extra: true },
         companion,
       );
-      expect(invalid).toHaveBeenCalledWith(
-        false,
-        undefined,
-        expect.objectContaining({ code: "INVALID_REQUEST" }),
-      );
+      expectError(invalid, "INVALID_REQUEST");
     },
   );
 
@@ -357,11 +347,7 @@ describe("session companion RPC", () => {
         reads.push(...keys.map(read));
         const [visible, hidden] = await withinTest(Promise.all(reads), signal);
         expect(visible).toHaveBeenCalledWith(true, { exchanges });
-        expect(hidden).toHaveBeenCalledWith(
-          false,
-          undefined,
-          expect.objectContaining({ code: "INVALID_REQUEST" }),
-        );
+        expectError(hidden, "INVALID_REQUEST");
         expect(state).toHaveBeenCalledExactlyOnceWith({
           agentId: "main",
           sessionKey: keys[0],
@@ -376,44 +362,28 @@ describe("session companion RPC", () => {
   it.each(["sessions.companion.ask", "sessions.companion.state"] as const)(
     "hides a foreign draft before dispatching %s",
     async (method) => {
-      await withOpenClawTestState(
-        { scenario: "minimal", prepareProfileCatalog: true },
-        async () => {
-          await captureRuntimeConfigAsyncReader()();
-          const owner = ensureProfileForEmail("owner@example.test");
-          using _ = {
-            [Symbol.dispose]: (await profileReader.prepareUserProfileCatalog()).release,
-          };
-          const sessionKey = "agent:main:owner-private";
-          await upsertSessionEntryCore(
-            { agentId: "main", sessionKey },
-            {
-              sessionId: "owner-private-session",
-              updatedAt: 1,
-              visibility: "draft",
-              createdActor: { type: "human", source: "profile", id: owner.id },
-            },
-          );
-          const ask = vi.fn(async () => ({ answer: "private", ts: 1 }));
-          const state = vi.fn(() => ({ exchanges: [] }));
-          const respond = await invoke(
-            method,
-            { sessionKey, ...(method === "sessions.companion.ask" ? { question: "Why?" } : {}) },
-            { ask, state },
-            { ...roleClient("view", "foreign-viewer"), connId: "viewer-connection" },
-            undefined,
-            rolePolicyConfig(),
-          );
+      await withProfiles(async () => {
+        const owner = ensureProfileForEmail("owner@example.test");
+        using _ = {
+          [Symbol.dispose]: (await profileReader.prepareUserProfileCatalog()).release,
+        };
+        const sessionKey = "agent:main:owner-private";
+        await createDraft(sessionKey, "owner-private-session", owner.id);
+        const ask = vi.fn(async () => ({ answer: "private", ts: 1 }));
+        const state = vi.fn(() => ({ exchanges: [] }));
+        const respond = await invoke(
+          method,
+          { sessionKey, ...(method === "sessions.companion.ask" ? { question: "Why?" } : {}) },
+          { ask, state },
+          { ...roleClient("view", "foreign-viewer"), connId: "viewer-connection" },
+          undefined,
+          rolePolicyConfig(),
+        );
 
-          expect(ask).not.toHaveBeenCalled();
-          expect(state).not.toHaveBeenCalled();
-          expect(respond).toHaveBeenCalledWith(
-            false,
-            undefined,
-            expect.objectContaining({ code: "INVALID_REQUEST" }),
-          );
-        },
-      );
+        expect(ask).not.toHaveBeenCalled();
+        expect(state).not.toHaveBeenCalled();
+        expectError(respond, "INVALID_REQUEST");
+      });
     },
   );
 
@@ -441,10 +411,6 @@ describe("session companion RPC", () => {
       config,
     );
     expect(state).not.toHaveBeenCalled();
-    expect(ambiguous).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ code: "INVALID_REQUEST" }),
-    );
+    expectError(ambiguous, "INVALID_REQUEST");
   });
 });

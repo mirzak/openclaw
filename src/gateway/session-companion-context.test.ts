@@ -43,6 +43,36 @@ function createScope(prefix: string) {
   };
 }
 
+async function seedScope(prefix: string) {
+  const scope = createScope(prefix);
+  await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+  return scope;
+}
+
+function turn(
+  eventId: string,
+  parentId: string | null,
+  role: "user" | "assistant" | "toolResult",
+  content: string,
+  timestamp: number,
+) {
+  return { eventId, parentId, message: { role, content, timestamp } };
+}
+
+const persist = (
+  scope: ReturnType<typeof createScope>,
+  messages: Parameters<typeof persistSessionTranscriptTurn>[1]["messages"],
+) => persistSessionTranscriptTurn(scope, { messages, touchSessionEntry: true });
+
+async function readReady(scope: ReturnType<typeof createScope>) {
+  const result = await defaultSessionCompanionContextReader.read(scope);
+  expect(result.kind).toBe("ready");
+  if (result.kind !== "ready") {
+    throw new Error("Expected ready companion context");
+  }
+  return result.context.messages;
+}
+
 describe("session companion context", () => {
   it("reads replaced session identities without host SQL", async () => {
     const scope = createScope("companion-context-identity");
@@ -70,8 +100,7 @@ describe("session companion context", () => {
   )(
     "cancels $cancellation before prepared context resumes (warm=$warm)",
     async ({ warm, cancellation }) => {
-      const scope = createScope(`companion-cancel-${cancellation}-${warm}`);
-      await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+      const scope = await seedScope(`companion-cancel-${cancellation}-${warm}`);
       const run = vi.fn(async () => "Existing answer.");
       const service = createSessionCompanion({
         scheduler: createTestGatewayScheduler(),
@@ -170,15 +199,12 @@ describe("session companion context", () => {
       scope.sessionId,
     );
     for (const [index, text] of ["First question", "Latest question"].entries()) {
-      await persistSessionTranscriptTurn(scope, {
-        messages: [
-          {
-            eventId: `question-${index}`,
-            message: { role: "user", content: text, timestamp: index },
-          },
-        ],
-        touchSessionEntry: true,
-      });
+      await persist(scope, [
+        {
+          eventId: `question-${index}`,
+          message: { role: "user", content: text, timestamp: index },
+        },
+      ]);
       const result = await defaultSessionCompanionContextReader.read(scope);
       expect(result).toMatchObject({
         kind: "ready",
@@ -194,37 +220,31 @@ describe("session companion context", () => {
   });
 
   it("reads a bounded active SQLite tail without decoding old transcript rows", async () => {
-    const scope = createScope("companion-context-tail");
-    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-    const messages = Array.from({ length: 201 }, (_, index) => ({
-      eventId: `message-${index}`,
-      parentId: index === 0 ? null : `message-${index - 1}`,
-      message: {
-        role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
-        content: `message ${index}`,
-        timestamp: index,
-      },
-    }));
-    await persistSessionTranscriptTurn(scope, { messages, touchSessionEntry: true });
+    const scope = await seedScope("companion-context-tail");
+    const transcript = Array.from({ length: 201 }, (_, index) =>
+      turn(
+        `message-${index}`,
+        index === 0 ? null : `message-${index - 1}`,
+        index % 2 === 0 ? "user" : "assistant",
+        `message ${index}`,
+        index,
+      ),
+    );
+    await persist(scope, transcript);
 
     const database = openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env });
     database.db
       .prepare("UPDATE transcript_events SET event_json = '{' WHERE session_id = ? AND seq = 1")
       .run(scope.sessionId);
 
-    const result = await defaultSessionCompanionContextReader.read(scope);
-
-    expect(result.kind).toBe("ready");
-    if (result.kind !== "ready") {
-      return;
-    }
-    expect(result.context.messages).toHaveLength(40);
-    expect(result.context.messages.at(0)).toEqual({
+    const messages = await readReady(scope);
+    expect(messages).toHaveLength(40);
+    expect(messages.at(0)).toEqual({
       role: "assistant",
       text: "message 161",
       ts: 161,
     });
-    expect(result.context.messages.at(-1)).toEqual({
+    expect(messages.at(-1)).toEqual({
       role: "user",
       text: "message 200",
       ts: 200,
@@ -232,8 +252,7 @@ describe("session companion context", () => {
   });
 
   it("pages past a tool-heavy tail while retaining the selected session's latest user turn", async () => {
-    const scope = createScope("companion-context-tools");
-    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+    const scope = await seedScope("companion-context-tools");
     const usefulMessages = Array.from({ length: 50 }, (_, index) => ({
       role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
       content: `useful ${index}`,
@@ -253,58 +272,35 @@ describe("session companion context", () => {
       parentId: index === 0 ? null : `message-${index - 1}`,
       message,
     }));
-    await persistSessionTranscriptTurn(scope, {
-      messages: transcriptMessages,
-      touchSessionEntry: true,
-    });
+    await persist(scope, transcriptMessages);
 
-    const result = await defaultSessionCompanionContextReader.read(scope);
-
-    expect(result.kind).toBe("ready");
-    if (result.kind !== "ready") {
-      return;
-    }
-    expect(result.context.messages).toHaveLength(40);
-    expect(result.context.messages.at(-1)?.text).toBe("visible latest question");
-    expect(result.context.messages.some((message) => message.text.startsWith("tool result"))).toBe(
-      false,
-    );
+    const messages = await readReady(scope);
+    expect(messages).toHaveLength(40);
+    expect(messages.at(-1)?.text).toBe("visible latest question");
+    expect(messages.some((message) => message.text.startsWith("tool result"))).toBe(false);
   });
 
   it("keeps complete recent context when older tool rows exhaust the scan byte budget", async () => {
-    const scope = createScope("companion-context-byte-budget");
-    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-    const recentMessages = Array.from({ length: 128 }, (_, index) => {
-      const isContextMessage = index % 9 === 0;
-      return {
-        eventId: `recent-${index}`,
-        parentId: index === 0 ? "older-tool" : `recent-${index - 1}`,
-        message: isContextMessage
-          ? { role: "user" as const, content: `useful ${index}`, timestamp: index }
-          : { role: "toolResult" as const, content: "x".repeat(7800), timestamp: index },
-      };
-    });
-    const messages = [
-      {
-        eventId: "older-tool",
-        parentId: null,
-        message: { role: "toolResult" as const, content: "x".repeat(200_000), timestamp: -1 },
-      },
+    const scope = await seedScope("companion-context-byte-budget");
+    const recentMessages = Array.from({ length: 128 }, (_, index) =>
+      turn(
+        `recent-${index}`,
+        index === 0 ? "older-tool" : `recent-${index - 1}`,
+        index % 9 === 0 ? "user" : "toolResult",
+        index % 9 === 0 ? `useful ${index}` : "x".repeat(7800),
+        index,
+      ),
+    );
+    const transcript = [
+      turn("older-tool", null, "toolResult", "x".repeat(200_000), -1),
       ...recentMessages,
     ];
-    await persistSessionTranscriptTurn(scope, { messages, touchSessionEntry: true });
+    await persist(scope, transcript);
 
-    const result = await defaultSessionCompanionContextReader.read(scope);
-
-    expect(result.kind).toBe("ready");
-    if (result.kind !== "ready") {
-      return;
-    }
-    expect(result.context.messages.length).toBeGreaterThan(0);
-    expect(result.context.messages.at(-1)?.text).toBe("useful 126");
-    expect(result.context.messages.every((message) => message.text.startsWith("useful"))).toBe(
-      true,
-    );
+    const messages = await readReady(scope);
+    expect(messages.length).toBeGreaterThan(0);
+    expect(messages.at(-1)?.text).toBe("useful 126");
+    expect(messages.every((message) => message.text.startsWith("useful"))).toBe(true);
   });
 
   it.each([
@@ -313,14 +309,9 @@ describe("session companion context", () => {
   ] as const)(
     "fails closed only when unsupported roles exceed the bounded scan ($unsupportedCount)",
     async ({ expectedKind, unsupportedCount }) => {
-      const scope = createScope(`companion-context-unsupported-${unsupportedCount}`);
-      await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+      const scope = await seedScope(`companion-context-unsupported-${unsupportedCount}`);
       const messages = [
-        {
-          eventId: "visible-user",
-          parentId: null,
-          message: { role: "user" as const, content: "authoritative question", timestamp: 1 },
-        },
+        turn("visible-user", null, "user", "authoritative question", 1),
         ...Array.from({ length: unsupportedCount }, (_, index) => ({
           eventId: `custom-${index}`,
           parentId: index === 0 ? "visible-user" : `custom-${index - 1}`,
@@ -332,7 +323,7 @@ describe("session companion context", () => {
           },
         })),
       ];
-      await persistSessionTranscriptTurn(scope, { messages, touchSessionEntry: true });
+      await persist(scope, messages);
 
       const result = await defaultSessionCompanionContextReader.read(scope);
 
@@ -346,27 +337,11 @@ describe("session companion context", () => {
   );
 
   it("returns unavailable instead of backfilling past an oversized latest user message", async () => {
-    const scope = createScope("companion-context-oversized-latest");
-    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-    await persistSessionTranscriptTurn(scope, {
-      messages: [
-        {
-          eventId: "older",
-          parentId: null,
-          message: { role: "user" as const, content: "stale older question", timestamp: 1 },
-        },
-        {
-          eventId: "oversized",
-          parentId: "older",
-          message: {
-            role: "user" as const,
-            content: "x".repeat(1024 * 1024),
-            timestamp: 2,
-          },
-        },
-      ],
-      touchSessionEntry: true,
-    });
+    const scope = await seedScope("companion-context-oversized-latest");
+    await persist(scope, [
+      turn("older", null, "user", "stale older question", 1),
+      turn("oversized", "older", "user", "x".repeat(1024 * 1024), 2),
+    ]);
 
     await expect(defaultSessionCompanionContextReader.read(scope)).resolves.toEqual({
       kind: "unavailable",
@@ -374,37 +349,13 @@ describe("session companion context", () => {
   });
 
   it("uses the contiguous newest suffix when an older message exceeds the read budget", async () => {
-    const scope = createScope("companion-context-oversized-older");
-    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-    await persistSessionTranscriptTurn(scope, {
-      messages: [
-        {
-          eventId: "stale",
-          parentId: null,
-          message: { role: "user" as const, content: "stale older question", timestamp: 1 },
-        },
-        {
-          eventId: "oversized",
-          parentId: "stale",
-          message: {
-            role: "assistant" as const,
-            content: "x".repeat(1024 * 1024),
-            timestamp: 2,
-          },
-        },
-        {
-          eventId: "recent-question",
-          parentId: "oversized",
-          message: { role: "user" as const, content: "recent question", timestamp: 3 },
-        },
-        {
-          eventId: "recent-answer",
-          parentId: "recent-question",
-          message: { role: "assistant" as const, content: "recent answer", timestamp: 4 },
-        },
-      ],
-      touchSessionEntry: true,
-    });
+    const scope = await seedScope("companion-context-oversized-older");
+    await persist(scope, [
+      turn("stale", null, "user", "stale older question", 1),
+      turn("oversized", "stale", "assistant", "x".repeat(1024 * 1024), 2),
+      turn("recent-question", "oversized", "user", "recent question", 3),
+      turn("recent-answer", "recent-question", "assistant", "recent answer", 4),
+    ]);
 
     const hostSql = observeHostDataSql();
     const result = await defaultSessionCompanionContextReader
@@ -425,23 +376,11 @@ describe("session companion context", () => {
   });
 
   it("keeps transcript-visible messages across compaction", async () => {
-    const scope = createScope("companion-context-compaction");
-    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-    await persistSessionTranscriptTurn(scope, {
-      messages: [
-        {
-          eventId: "discarded",
-          parentId: null,
-          message: { role: "user" as const, content: "discarded context", timestamp: 1 },
-        },
-        {
-          eventId: "retained",
-          parentId: "discarded",
-          message: { role: "user" as const, content: "retained context", timestamp: 2 },
-        },
-      ],
-      touchSessionEntry: true,
-    });
+    const scope = await seedScope("companion-context-compaction");
+    await persist(scope, [
+      turn("discarded", null, "user", "discarded context", 1),
+      turn("retained", "discarded", "user", "retained context", 2),
+    ]);
     await appendTranscriptEvent(scope, {
       type: "compaction",
       id: "compaction",
@@ -451,29 +390,13 @@ describe("session companion context", () => {
       firstKeptEntryId: "retained",
       tokensBefore: 100,
     });
-    await persistSessionTranscriptTurn(scope, {
-      messages: [
-        {
-          eventId: "answer",
-          parentId: "compaction",
-          message: { role: "assistant" as const, content: "recent answer", timestamp: 3 },
-        },
-        {
-          eventId: "question",
-          parentId: "answer",
-          message: { role: "user" as const, content: "visible current question", timestamp: 4 },
-        },
-      ],
-      touchSessionEntry: true,
-    });
+    await persist(scope, [
+      turn("answer", "compaction", "assistant", "recent answer", 3),
+      turn("question", "answer", "user", "visible current question", 4),
+    ]);
 
-    const result = await defaultSessionCompanionContextReader.read(scope);
-
-    expect(result.kind).toBe("ready");
-    if (result.kind !== "ready") {
-      return;
-    }
-    expect(result.context.messages.map((message) => [message.role, message.text])).toEqual([
+    const messages = await readReady(scope);
+    expect(messages.map((message) => [message.role, message.text])).toEqual([
       ["user", "discarded context"],
       ["user", "retained context"],
       ["assistant", "recent answer"],
@@ -482,18 +405,8 @@ describe("session companion context", () => {
   });
 
   it("ignores oversized non-message compaction details", async () => {
-    const scope = createScope("companion-context-oversized-boundary");
-    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-    await persistSessionTranscriptTurn(scope, {
-      messages: [
-        {
-          eventId: "retained",
-          parentId: null,
-          message: { role: "user" as const, content: "retained context", timestamp: 1 },
-        },
-      ],
-      touchSessionEntry: true,
-    });
+    const scope = await seedScope("companion-context-oversized-boundary");
+    await persist(scope, [turn("retained", null, "user", "retained context", 1)]);
     await appendTranscriptEvent(scope, {
       type: "compaction",
       id: "oversized-compaction",
@@ -516,18 +429,8 @@ describe("session companion context", () => {
   });
 
   it("returns unavailable rather than an empty context while the active projection is stale", async () => {
-    const scope = createScope("companion-context-unavailable");
-    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-    await persistSessionTranscriptTurn(scope, {
-      messages: [
-        {
-          eventId: "question",
-          parentId: null,
-          message: { role: "user" as const, content: "visible question", timestamp: 1 },
-        },
-      ],
-      touchSessionEntry: true,
-    });
+    const scope = await seedScope("companion-context-unavailable");
+    await persist(scope, [turn("question", null, "user", "visible question", 1)]);
     const database = openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env });
     database.db
       .prepare("UPDATE session_transcript_index_state SET needs_rebuild = 1 WHERE session_id = ?")
