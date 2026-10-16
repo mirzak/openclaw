@@ -1,4 +1,4 @@
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -37,7 +37,6 @@ import {
   validateDockerCandidateEnvironment,
   writeRunSummary,
 } from "../../scripts/test-docker-all.mts";
-import { resolveRuntimeWorkerUrl } from "../../src/infra/runtime-worker-url.js";
 import {
   fixtureReceiptClientSource,
   openFixtureReceiptChannel,
@@ -46,7 +45,6 @@ import {
 import { withinTest } from "../helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 import { copyDockerSchedulerHarness } from "./docker-all-harness.test-support.js";
-import { toolingMtsEntrypoints } from "./tooling-mts-runtime.test-support.mts";
 
 const { createPrepublishPluginRegistryArtifact } = vi.hoisted(() => ({
   createPrepublishPluginRegistryArtifact: vi.fn(),
@@ -56,13 +54,7 @@ vi.mock("../../scripts/prepublish-plugin-registry-artifact.mjs", async (importOr
   createPrepublishPluginRegistryArtifact,
 }));
 
-const limits = {
-  resourceLimits: {
-    docker: 2,
-    npm: 2,
-  },
-  weightLimit: 2,
-};
+const limits = { resourceLimits: { docker: 2, npm: 2 }, weightLimit: 2 };
 const posixIt = process.platform === "win32" ? it.skip : it;
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const createTempDir = tempDirs.make;
@@ -132,22 +124,6 @@ function expectDeclaredDispatchInputs(command: string): void {
   for (const input of emitted) {
     expect(declared.has(input), `undeclared workflow_dispatch input: ${input}`).toBe(true);
   }
-}
-
-function activePool({
-  count = 0,
-  resources = {},
-  weight = 0,
-}: {
-  count?: number;
-  resources?: Record<string, number>;
-  weight?: number;
-} = {}) {
-  return {
-    count,
-    resources: new Map(Object.entries(resources)),
-    weight,
-  };
 }
 
 function sha256(file: string) {
@@ -266,14 +242,6 @@ function addRegistry(
   };
 }
 
-function readyPublication(readyPath: string) {
-  return [
-    `fs.writeFileSync(${JSON.stringify(readyPath + ".tmp")}, 'ready');`,
-    `fs.renameSync(${JSON.stringify(readyPath + ".tmp")}, ${JSON.stringify(readyPath)});`,
-    `sendReceipt(${JSON.stringify(readyPath)}, "ready");`,
-  ];
-}
-
 function writeLeader(file: string, childScript: string) {
   writeFileSync(
     file,
@@ -288,7 +256,7 @@ setInterval(() => {}, 1000);
   );
 }
 
-function childFixture({ graceful = false, ignoreHangup = false } = {}) {
+function childFixture({ graceful = false } = {}) {
   const root = createTempDir("docker-command-");
   const leaderPath = path.join(root, "leader.mjs");
   const pidPath = path.join(root, "child.pid");
@@ -303,20 +271,38 @@ function childFixture({ graceful = false, ignoreHangup = false } = {}) {
       "import fs from 'node:fs';",
       fixtureReceiptClientSource(receipts.endpoint),
       `process.on('SIGTERM', () => { ${onTerm} });`,
-      ...(ignoreHangup ? ["process.on('SIGHUP', () => {});"] : []),
       `fs.writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));`,
-      ...readyPublication(readyPath),
+      `fs.writeFileSync(${JSON.stringify(readyPath + ".tmp")}, 'ready');`,
+      `fs.renameSync(${JSON.stringify(readyPath + ".tmp")}, ${JSON.stringify(readyPath)});`,
+      `sendReceipt(${JSON.stringify(readyPath)}, "ready");`,
       "setInterval(() => {}, 1000);",
     ].join("\n"),
   );
   return {
-    root,
-    leaderPath,
-    pidPath,
-    readyPath,
     donePath,
-    command: `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(leaderPath)}`,
     pid: () => Number(readFileSync(pidPath, "utf8")),
+    timeout(
+      run: typeof runShellCommand | typeof runShellCaptureCommand,
+      timeoutMs: number,
+      timeoutKillGraceMs: number,
+      signal: AbortSignal,
+      ready?: () => void,
+    ) {
+      return runReadyTimedCommand(
+        async () =>
+          run({
+            command: `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(leaderPath)}`,
+            env: process.env,
+            label: "timeout-fixture",
+            timeoutMs,
+            timeoutKillGraceMs,
+          }),
+        readyPath,
+        timeoutMs,
+        signal,
+        ready,
+      );
+    },
     kill() {
       if (existsSync(pidPath)) {
         const pid = Number(readFileSync(pidPath, "utf8"));
@@ -443,9 +429,7 @@ describe("scripts/test-docker-all scheduler", () => {
       upgradeSurvivorBaselines: "openclaw@2026.7.1-2",
       upgradeSurvivorScenarios: "configured-plugin-installs",
     }).plan;
-    createPrepublishPluginRegistryArtifact.mockReturnValue({
-      manifestSha256: "b".repeat(64),
-    });
+    createPrepublishPluginRegistryArtifact.mockReturnValue({ manifestSha256: "b".repeat(64) });
 
     const registry = preparePrepublishPluginRegistry(plan, root, "a".repeat(40), "2026.8.1");
 
@@ -683,11 +667,7 @@ describe("scripts/test-docker-all scheduler", () => {
     const selectedSha = "c".repeat(40);
     await writeRunSummary(
       logDir,
-      {
-        failures: [{ name: "install-e2e", status: 1 }],
-        lanes: [],
-        status: "failed",
-      },
+      { failures: [{ name: "install-e2e", status: 1 }], lanes: [], status: "failed" },
       {
         ...process.env,
         OPENCLAW_DOCKER_E2E_ALLOW_UNRELEASED_CHANGELOG: "true",
@@ -847,20 +827,14 @@ process.exit(0);
     expect(summary.lanes.some((lane: { name?: string }) => lane.name === "cleanup-smoke")).toBe(
       false,
     );
-    expect(summary.phases.at(-1)).toMatchObject({
-      name: "cleanup-smoke",
-      status: "failed",
-    });
+    expect(summary.phases.at(-1)).toMatchObject({ name: "cleanup-smoke", status: "failed" });
 
     const failureIndex = readJson(path.join(logDir, "failures.json"));
     expect(failureIndex).not.toHaveProperty("status");
     expect(failureIndex.combinedGhWorkflowCommand).toBeUndefined();
     expect(failureIndex.lanes[0]?.ghWorkflowCommand).toBeUndefined();
     expect(failureIndex.lanes).toEqual([
-      expect.objectContaining({
-        lane: "cleanup-smoke",
-        ...failure,
-      }),
+      expect.objectContaining({ lane: "cleanup-smoke", ...failure }),
     ]);
     const cleanupLog = readFileSync(path.join(logDir, "cleanup-smoke.log"), "utf8");
     expect(cleanupLog).toContain("cleanup smoke failed intentionally");
@@ -881,7 +855,7 @@ process.exit(0);
         ...hops.slice(0, firstHops),
         ...orderedLanes.filter((lane) => survivor && lane.name === "upgrade-survivor"),
       ];
-      const active = activePool();
+      const active = { count: 0, weight: 0, resources: new Map<string, number>() };
       for (const lane of running) {
         active.count += 1;
         active.weight += lane.weight;
@@ -906,7 +880,7 @@ process.exit(0);
 
   it("preserves the parallelism count cap", () => {
     const lane = { name: "package-update", resources: ["npm"], weight: 1 };
-    const active = activePool({ count: 2, resources: { docker: 1, npm: 1 }, weight: 1 });
+    const active = { count: 2, weight: 0, resources: new Map<string, number>() };
     expect(canStartSchedulerLane(lane, active, 2, limits)).toBe(false);
   });
 
@@ -1055,11 +1029,7 @@ postgres Created
       timeoutMs: 5_000,
     });
 
-    expect(result).toMatchObject({
-      noOutputTimedOut: false,
-      status: 0,
-      timedOut: false,
-    });
+    expect(result).toMatchObject({ noOutputTimedOut: false, status: 0, timedOut: false });
   });
 
   posixIt("clamps oversized shell capture timers before scheduling", async () => {
@@ -1086,23 +1056,10 @@ postgres Created
       let grandchildPid = 0;
 
       try {
-        const result = await runReadyTimedCommand(
-          () =>
-            runShellCommand({
-              command: child.command,
-              env: process.env,
-              label: "timeout-leader-exits",
-              timeoutKillGraceMs: 25,
-              timeoutMs: 250,
-            }),
-          child.readyPath,
-          250,
-          signal,
-          () => {
-            grandchildPid = child.pid();
-            expect(isProcessAlive(grandchildPid)).toBe(true);
-          },
-        );
+        const result = await child.timeout(runShellCommand, 250, 25, signal, () => {
+          grandchildPid = child.pid();
+          expect(isProcessAlive(grandchildPid)).toBe(true);
+        });
 
         expect(result).toMatchObject({ timedOut: true });
         await waitForReaped(grandchildPid, signal);
@@ -1125,96 +1082,8 @@ postgres Created
     },
   ])("$title", async ({ run, grace }, { signal }) => {
     const child = childFixture({ graceful: true });
-    const result = await runReadyTimedCommand(
-      async () =>
-        run({
-          command: child.command,
-          env: process.env,
-          label: "timeout-grace",
-          timeoutKillGraceMs: grace,
-          timeoutMs: 500,
-        }),
-      child.readyPath,
-      500,
-      signal,
-    );
+    const result = await child.timeout(run, 500, grace, signal);
     expect(result).toMatchObject({ timedOut: true });
     expect(readFileSync(child.donePath, "utf8")).toBe("done");
-  });
-
-  posixIt("cleans active shell command groups before parent signal exit", async ({ signal }) => {
-    const child = childFixture({ ignoreHangup: true });
-    const runnerPath = path.join(child.root, "runner.mjs");
-    const second = childFixture();
-    let runner: ReturnType<typeof spawn> | undefined;
-    let closed: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | undefined;
-    // Preserve the production 10s grace while accelerating only this spawned proof's clock.
-    writeFileSync(
-      runnerPath,
-      `
-const realNow = Date.now.bind(Date);
-const startedAt = realNow();
-Date.now = () => startedAt + (realNow() - startedAt) * 100;
-
-const { runShellCommand } = await import(${JSON.stringify(
-        resolveRuntimeWorkerUrl(toolingMtsEntrypoints.dockerAll).href,
-      )});
-
-for (const [command, label] of ${JSON.stringify([
-        [child.command, "parent-signal-cleanup"],
-        [second.command, "parent-signal-second-command"],
-      ])}) {
-  await runShellCommand({ command, label, env: process.env, timeoutKillGraceMs: 100, timeoutMs: 30_000 });
-}
-`,
-      "utf8",
-    );
-
-    try {
-      runner = spawn(process.execPath, ["--import", "tsx", runnerPath], {
-        cwd: process.cwd(),
-        stdio: ["ignore", "ignore", "pipe"],
-      });
-      let runnerStderr = "";
-      runner.stderr?.setEncoding("utf8").on("data", (chunk: string) => {
-        runnerStderr += chunk;
-      });
-      closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-        (resolve, reject) => {
-          runner!.once("error", reject);
-          runner!.once("close", (code, receivedSignal) =>
-            resolve({ code, signal: receivedSignal }),
-          );
-        },
-      );
-      await withinTest(
-        fixtureReadyBeforeSettlement(
-          child.readyPath,
-          closed.then(() => {
-            throw new Error(`runner exited before readiness:\n${runnerStderr}`);
-          }),
-        ),
-        signal,
-      );
-      const grandchildPid = child.pid();
-      expect(isProcessAlive(grandchildPid)).toBe(true);
-
-      runner.kill("SIGTERM");
-
-      await expect(withinTest(closed, signal)).resolves.toEqual({
-        code: 143,
-        signal: null,
-      });
-      await waitForReaped(grandchildPid, signal);
-      expect(existsSync(second.readyPath)).toBe(false);
-      expect(existsSync(second.pidPath)).toBe(false);
-    } finally {
-      if (runner?.exitCode === null && runner.signalCode === null) {
-        runner.kill("SIGTERM");
-      }
-      await closed;
-      child.kill();
-      second.kill();
-    }
   });
 });
