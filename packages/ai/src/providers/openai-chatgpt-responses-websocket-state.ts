@@ -4,7 +4,11 @@ import type {
   ResponseInput,
 } from "openai/resources/responses/responses.js";
 import type { AiTransportHost } from "../host.js";
-import type { CodexWebSocketAuthority } from "./openai-chatgpt-responses-websocket-authority.js";
+import {
+  clearCodexWebSocketSseFallback,
+  type CodexWebSocketAuthority,
+  type CodexWebSocketSseFallbacks,
+} from "./openai-chatgpt-responses-websocket-authority.js";
 
 const SESSION_WEBSOCKET_CACHE_TTL_MS = 5 * 60 * 1000;
 const SESSION_WEBSOCKET_MAX_AGE_MS = 55 * 60 * 1000;
@@ -56,8 +60,7 @@ export interface CachedWebSocketConnection {
 
 export interface OpenAICodexWebSocketRuntimeState {
   sessionCache: Map<string, CachedWebSocketConnection>;
-  // Auto mode keeps working SSE across header changes until the endpoint changes or cleanup.
-  sseFallbacks: Map<string, string>;
+  sseFallbacks: CodexWebSocketSseFallbacks;
 }
 
 const runtimeStates = new WeakMap<AiTransportHost, OpenAICodexWebSocketRuntimeState>();
@@ -142,7 +145,7 @@ function closeRuntimeState(state: OpenAICodexWebSocketRuntimeState, sessionId?: 
     closeWebSocketSilently(entry.socket, 1000, "debug_close");
   };
   if (sessionId) {
-    state.sseFallbacks.delete(sessionId);
+    clearCodexWebSocketSseFallback(state.sseFallbacks, sessionId);
     const entry = state.sessionCache.get(sessionId);
     if (entry) {
       closeEntry(entry);
@@ -154,7 +157,7 @@ function closeRuntimeState(state: OpenAICodexWebSocketRuntimeState, sessionId?: 
     closeEntry(entry);
   }
   state.sessionCache.clear();
-  state.sseFallbacks.clear();
+  clearCodexWebSocketSseFallback(state.sseFallbacks);
 }
 
 export function closeOpenAICodexWebSocketState(

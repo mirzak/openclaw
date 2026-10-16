@@ -374,6 +374,24 @@ export function captureRetainedNativeWorkerSource(options?: {
   return source;
 }
 
+/** Existing execution owners retain their queues; this capability owns only physical Worker lifetime. */
+export function createRetainedNativeWorker(
+  filename: string | URL,
+  options: WorkerOptions = {},
+  source?: RetainedNativeWorkerSource,
+  resource?: NativeWorkerResourceDescriptor,
+  taskPorts?: NativeWorkerTaskPorts,
+): RetainedNativeWorker {
+  try {
+    const owner = source ?? captureRetainedNativeWorkerSource({ runtimeGeneration: undefined });
+    return owner.create(filename, options, resource, taskPorts);
+  } catch (error) {
+    taskPorts?.host.close();
+    taskPorts?.worker.close();
+    throw error;
+  }
+}
+
 function startNativeWorker(
   runtime: NativeRuntime,
   filename: string | URL,

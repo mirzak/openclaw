@@ -20,7 +20,7 @@ import { startTranscripts } from "./capture.js";
 import { clearTranscriptCapturesForTest } from "./capture.test-support.js";
 import { getTranscriptLibrary, listTranscriptLibrary } from "./library.js";
 import type { TranscriptStartRequest } from "./provider-types.js";
-import type { TranscriptsStore } from "./store.js";
+import { TranscriptsStore } from "./store.js";
 import { summarizeTranscripts, type TranscriptsSummary } from "./summary.js";
 
 const { complete, select, loadRuntime } = vi.hoisted(() => ({
@@ -225,6 +225,20 @@ describe("live meeting summaries", () => {
     expectCalls(0);
     expect(await fixture.saved()).toEqual(final);
   });
+  it("retires failed snapshot initialization and permits capture retry", async () => {
+    const stateDir = tempDirs.make("transcript-summary-start-retry-");
+    const read = vi
+      .spyOn(TranscriptsStore.prototype, "readSummarySnapshot")
+      .mockRejectedValueOnce(new Error("Snapshot unavailable"));
+    await expect(capture(undefined, stateDir)).rejects.toThrow("Snapshot unavailable");
+    read.mockRestore();
+    const store = createTranscriptsStore({ stateDir, logger: console });
+    expect((await store.readSession("meeting"))?.stoppedAt).toBeTruthy();
+    const fixture = await capture("Recovered capture", stateDir);
+    await fixture.advance();
+    await fixture.expectSummary({ source: "model", utteranceCount: 1 }, 1);
+  });
+
   it("stops pending snapshot input before final inference", async () => {
     const fixture = await capture("Saved speech");
     const snapshot = await fixture.store.readSummarySnapshot(fixture.source.session, 2_000);

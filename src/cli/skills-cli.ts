@@ -385,6 +385,11 @@ export function registerSkillsCli(program: Command) {
               }),
               logger: skillInstallLogger,
             });
+            if (!result.ok) {
+              defaultRuntime.error(result.error);
+              defaultRuntime.exit(1);
+              return;
+            }
             await refreshLocalGatewaySkills(target);
             defaultRuntime.log(
               `Installed ${result.slug} from ${result.source} -> ${result.targetDir}`,

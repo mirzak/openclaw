@@ -12,7 +12,10 @@ import {
   withRuntimeWorkerGeneration,
 } from "./runtime-worker-generation.js";
 import { getTrackedWorkerLifecycleSnapshot } from "./worker-cpu.js";
-import { captureRetainedNativeWorkerSource } from "./worker-native-lifecycle.js";
+import {
+  captureRetainedNativeWorkerSource,
+  createRetainedNativeWorker,
+} from "./worker-native-lifecycle.js";
 import {
   assertNativeWorkerDiagnosticMatches,
   runNativeResourceLifecycle,
@@ -156,10 +159,7 @@ async function runCallbackContext() {
   let exited = false;
   let exitCode: number | undefined;
   const retained = context.run("constructor-A", () =>
-    captureRetainedNativeWorkerSource({ runtimeGeneration: undefined }).create(source, {
-      eval: true,
-      execArgv: [],
-    }),
+    createRetainedNativeWorker(source, { eval: true, execArgv: [] }),
   );
   context.run("service-B", () => {
     retained.on("message", (value) => {
@@ -215,8 +215,7 @@ async function runCallbackContext() {
 }
 
 async function runBlockedLifecycle(ending: "terminate" | "natural-exit", databasePath: string) {
-  const source = captureRetainedNativeWorkerSource({ runtimeGeneration: undefined });
-  const worker = source.create(workerSource, {
+  const worker = createRetainedNativeWorker(workerSource, {
     eval: true,
     execArgv: [],
     workerData: { childSource: sqliteChild, databasePath },
@@ -347,11 +346,15 @@ async function runGenerationLifecycle(directory: string, databasePath: string) {
           order.push("owner-close-start");
           await nextTurn();
           assert.equal(getTrackedWorkerLifecycleSnapshot().workerCount, initialWorkers);
-          const worker = queuedOwner.source.create(workerSource, {
-            eval: true,
-            execArgv: [],
-            workerData: { childSource: sqliteChild, databasePath },
-          });
+          const worker = createRetainedNativeWorker(
+            workerSource,
+            {
+              eval: true,
+              execArgv: [],
+              workerData: { childSource: sqliteChild, databasePath },
+            },
+            queuedOwner.source,
+          );
           let reply = createDeferredCore<unknown>();
           worker.on("message", (value) => reply.resolve(value));
           worker.on("error", (error) => reply.reject(error));
@@ -393,7 +396,11 @@ async function runGenerationLifecycle(directory: string, databasePath: string) {
         assert.equal(nativeJoined, true);
         assert.equal(getTrackedWorkerLifecycleSnapshot().workerCount, initialWorkers + 1);
         order.push("sibling-owner-close");
-        const sibling = siblingOwner.source.create(echoWorkerSource, { eval: true, execArgv: [] });
+        const sibling = createRetainedNativeWorker(
+          echoWorkerSource,
+          { eval: true, execArgv: [] },
+          siblingOwner.source,
+        );
         const reply = createDeferredCore<unknown>();
         sibling.on("message", reply.resolve);
         sibling.on("error", reply.reject);
@@ -460,7 +467,7 @@ async function runExplicitUnboundLifecycle() {
   );
   assert.equal(ambientReleased, true);
   process.stderr.write(`native lifecycle fixture pid=${process.pid}: explicit unbound source\n`);
-  const worker = source.create(echoWorkerSource, { eval: true, execArgv: [] });
+  const worker = createRetainedNativeWorker(echoWorkerSource, { eval: true, execArgv: [] }, source);
   const reply = createDeferredCore<unknown>();
   worker.on("message", reply.resolve);
   worker.on("error", reply.reject);
@@ -479,7 +486,11 @@ async function runExplicitUnboundLifecycle() {
   let ownerClosed = false;
   source.retain({}, async () => {
     // Already admitted owners may finish queued work while shutdown drains them.
-    const queued = idleSource.create(echoWorkerSource, { eval: true, execArgv: [] });
+    const queued = createRetainedNativeWorker(
+      echoWorkerSource,
+      { eval: true, execArgv: [] },
+      idleSource,
+    );
     const queuedReply = createDeferredCore<unknown>();
     queued.on("message", queuedReply.resolve);
     queued.on("error", queuedReply.reject);

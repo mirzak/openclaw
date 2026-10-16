@@ -162,13 +162,12 @@ describe("update report shared transport boundary", () => {
     async (change) => {
       const fixture = await setup();
       let current = true;
-      const finalizeReceipt = vi.fn(
-        async (...args: Parameters<typeof finalizeUpdateFailureReportReceipt>) => {
-          const finalized = await finalizeUpdateFailureReportReceipt(...args);
+      const finalizeReceipt = vi
+        .fn(finalizeUpdateFailureReportReceipt)
+        .mockImplementationOnce(async () => {
           current = false;
-          return finalized;
-        },
-      );
+          return false;
+        });
       const result = await fixture
         .submit({
           publicationMode: "browser",

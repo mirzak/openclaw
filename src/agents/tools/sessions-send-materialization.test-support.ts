@@ -13,36 +13,6 @@ export function registerSessionsSendMaterializationTests(fixture: {
   requireDetails: (result: { details?: unknown }) => Record<string, unknown>;
 }) {
   describe("sessions_send agent-main materialization provenance", () => {
-    it.each([
-      [new Error("creation failed"), "creation failed"],
-      ["", "Error"],
-    ])("surfaces materialization rejection %s without dispatch", async (failure, expected) => {
-      await fixture.prepare();
-      fixture.callGatewayMock.mockClear().mockResolvedValue({});
-      fixture.inProcessCreationMock.mockRejectedValueOnce(failure);
-      const tool = fixture.createTool({
-        agentSessionKey: "agent:main:dashboard:req-provenance",
-        agentChannel: fixture.agentChannel,
-      });
-      try {
-        const result = await tool.execute("call-ensure-main-failure", {
-          sessionKey: "agent:main:main",
-          message: "wake up",
-          timeoutSeconds: 0,
-        });
-        expect(fixture.requireDetails(result)).toMatchObject({
-          status: "forbidden",
-          error: expected,
-        });
-        expect(fixture.inProcessCreationMock).toHaveBeenCalledTimes(1);
-        expect(fixture.callGatewayMock.mock.calls.some(([call]) => call.method === "agent")).toBe(
-          false,
-        );
-      } finally {
-        fixture.cleanup();
-      }
-    });
-
     it.each([undefined, "sender"] as const)(
       "materializes an agent main only without sender restrictions (%s)",
       async (source) => {

@@ -43,21 +43,25 @@ export function parseOffsetlessIsoDateTimeInTimeZone(
     pruneMapToMaxSize(zonedParseFormatters, ZONED_PARSE_FORMATTER_CACHE_MAX - 1);
     zonedParseFormatters.set(timeZone, formatter);
   }
-  // Probe both sides of the local day so non-hour DST folds use their first
-  // real occurrence while nonexistent spring-forward times remain rejected.
-  // At Date-range endpoints, one side of the probe window may be out of range.
-  const matchingInstants = [-86_400_000, 0, 86_400_000]
-    .map((shiftMs) => asDateTimestampMs(naiveMs + shiftMs))
-    .filter((probeMs) => probeMs !== undefined)
-    .map((probeMs) => naiveMs - (getZonedWallTimeMs(probeMs, formatter) - probeMs))
-    .filter(
-      (candidateMs) =>
-        asDateTimestampMs(candidateMs) !== undefined &&
-        getZonedWallTimeMs(candidateMs, formatter) === naiveMs,
-    );
-  return matchingInstants.length > 0
-    ? { ok: true, iso: new Date(Math.min(...matchingInstants)).toISOString() }
-    : { ok: false, reason: "invalid-datetime" };
+  try {
+    // Probe both sides of the local day so non-hour DST folds use their first
+    // real occurrence while nonexistent spring-forward times remain rejected.
+    // At Date-range endpoints, one side of the probe window may be out of range.
+    const matchingInstants = [-86_400_000, 0, 86_400_000]
+      .map((shiftMs) => asDateTimestampMs(naiveMs + shiftMs))
+      .filter((probeMs) => probeMs !== undefined)
+      .map((probeMs) => naiveMs - (getZonedWallTimeMs(probeMs, formatter) - probeMs))
+      .filter(
+        (candidateMs) =>
+          asDateTimestampMs(candidateMs) !== undefined &&
+          getZonedWallTimeMs(candidateMs, formatter) === naiveMs,
+      );
+    return matchingInstants.length > 0
+      ? { ok: true, iso: new Date(Math.min(...matchingInstants)).toISOString() }
+      : { ok: false, reason: "invalid-datetime" };
+  } catch {
+    return { ok: false, reason: "invalid-datetime" };
+  }
 }
 
 function getZonedWallTimeMs(utcMs: number, formatter: Intl.DateTimeFormat): number {

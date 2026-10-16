@@ -60,8 +60,11 @@ export async function runNativeResourceLifecycle(
     import("../shared/deferred.js"),
     import("./runtime-worker-url.js"),
   ]);
-  const { captureRetainedNativeWorkerSource, closeDefaultRetainedNativeWorkerSource } =
-    await import("./worker-native-lifecycle.js");
+  const {
+    captureRetainedNativeWorkerSource,
+    closeDefaultRetainedNativeWorkerSource,
+    createRetainedNativeWorker,
+  } = await import("./worker-native-lifecycle.js");
   const { assertNativeResourceCustody, createIdleBrokerRetirementProof } =
     await import("./worker-native-lifecycle.custody.test-support.js");
   const databasePath = path.join(directory, "native-child.sqlite");
@@ -148,9 +151,10 @@ export async function runNativeResourceLifecycle(
     port.on("message", (value) => parentPort.postMessage(value, []));
     parentPort.on("message", (value) => port.postMessage(value, []));
     port.postMessage({ open: true }, []);`;
-  const target = source.create(
+  const target = createRetainedNativeWorker(
     resourceWorkerSource,
     { eval: true, execArgv: [], workerData: {} },
+    source,
     resource,
   );
   const replies: unknown[] = [];
@@ -191,9 +195,10 @@ export async function runNativeResourceLifecycle(
         { databasePath: path.join(directory, "late-native-child.sqlite") },
         siblingControl.connect,
       );
-      const sibling = source.create(
+      const sibling = createRetainedNativeWorker(
         resourceWorkerSource,
         { eval: true, execArgv: [], workerData: {} },
+        source,
         siblingResource,
       );
       const ready = createDeferredCore<unknown>();

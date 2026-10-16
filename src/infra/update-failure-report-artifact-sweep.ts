@@ -12,7 +12,7 @@ import {
   listRetiredUpdateFailureReportArtifacts,
   removeRetiredUpdateFailureReportArtifacts,
 } from "./update-failure-report-artifact.js";
-import { tryUpdateReportStateWrite } from "./update-failure-report-precreate.js";
+import { retryUpdateReportStateWrite } from "./update-failure-report-precreate.js";
 import type { PreparedUpdateFailureReport } from "./update-failure-report-prepare.js";
 
 export type UpdateFailureReportSweepHooks = {
@@ -36,7 +36,7 @@ export async function cleanRetiredUpdateFailureReportArtifacts(
 ): Promise<boolean> {
   const sweepOwnerId = randomUUID();
   const sweepGeneration = randomUUID();
-  const claimed = await tryUpdateReportStateWrite(() =>
+  const claimed = await retryUpdateReportStateWrite(() =>
     claimUpdateFailureReportArtifactSweep(
       prepared.attemptId,
       receipt.reservationId,
@@ -80,7 +80,7 @@ export async function cleanRetiredUpdateFailureReportArtifacts(
     await removeRetiredUpdateFailureReportArtifacts(candidates);
     swept = true;
   } finally {
-    const released = await tryUpdateReportStateWrite(() =>
+    const released = await retryUpdateReportStateWrite(() =>
       releaseUpdateFailureReportArtifactSweep(
         prepared.attemptId,
         receipt.reservationId,

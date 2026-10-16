@@ -131,440 +131,453 @@ export async function buildPreparedCompactionRuntime(
   };
   onCleanupReady({ disposeToolRuntimes, restoreSkillEnvironment });
 
-  const preparedSkills = await prepareEmbeddedSkills({
-    assertCurrent: () => params.abortSignal?.throwIfAborted(),
-    attempt: {
-      config: params.config,
-      bootstrapWorkspaceDir: params.bootstrapWorkspaceDir,
-      skillsSnapshot: params.skillsSnapshot,
-    },
-    effectiveWorkspace,
-    sandbox,
-    sessionAgentId,
-    includeCodeModeSkills: false,
-  });
-  restoreSkillEnv = preparedSkills.restoreSkillEnv;
-  const { skillsSnapshotForRun, skillReadResources, skillUsagePaths, skillsPrompt } =
-    preparedSkills;
+  try {
+    const preparedSkills = await prepareEmbeddedSkills({
+      assertCurrent: () => params.abortSignal?.throwIfAborted(),
+      attempt: {
+        config: params.config,
+        bootstrapWorkspaceDir: params.bootstrapWorkspaceDir,
+        skillsSnapshot: params.skillsSnapshot,
+      },
+      effectiveWorkspace,
+      sandbox,
+      sessionAgentId,
+      includeCodeModeSkills: false,
+    });
+    restoreSkillEnv = preparedSkills.restoreSkillEnv;
+    const { skillsSnapshotForRun, skillReadResources, skillUsagePaths, skillsPrompt } =
+      preparedSkills;
 
-  const sessionLabel = params.sessionKey ?? params.sessionId;
-  const resolvedMessageProvider = params.messageChannel ?? params.messageProvider;
-  const contextInjectionMode = resolveContextInjectionMode(params.config, sessionAgentId);
-  const { bootstrapFiles, contextFiles } =
-    contextInjectionMode === "never"
-      ? { bootstrapFiles: [], contextFiles: [] }
-      : await resolveBootstrapContextForRun({
-          workspaceDir: effectiveWorkspace,
-          config: params.config,
-          sessionKey: params.sessionKey,
-          sessionId: params.sessionId,
-          chatType: params.chatType,
-          agentId: sessionAgentId,
-          warn: makeBootstrapWarn({
-            sessionLabel,
-            warn: (message) => log.warn(message),
-          }),
-        });
-  // Mirror ordinary-turn bootstrap disclosure so compaction summaries do not
-  // silently omit later workspace files when the aggregate budget is spent.
-  // Resolved once per prepared attempt so thinking-level retries reuse the same
-  // admitted files and notice.
-  const bootstrapInjectionStats = buildBootstrapInjectionStats({
-    bootstrapFiles,
-    injectedFiles: contextFiles,
-  });
-  const bootstrapBudget = buildBootstrapBudgetState({
-    config: params.config,
-    agentId: sessionAgentId,
-    files: bootstrapInjectionStats,
-  });
-  const bootstrapTruncationNotice = buildBootstrapPromptWarningNotice(
-    bootstrapBudget.bootstrapPromptWarning.lines,
-  );
-  // Keep session sizing separate from the summarizer's native request window.
-  const contextTokenBudget = resolveCompactionContextTokenBudget({
-    config: params.config,
-    provider: contextConfigProvider,
-    modelId,
-    model: runtimeModel,
-    requestedTokenBudget: params.contextTokenBudget,
-    fallbackTokenBudget: params.tokenBudget,
-  });
-  const modelWithAuth = applyAuthHeaderOverride(
-    applyLocalNoAuthHeaderOverride(runtimeModel, { apiKey: runtimeApiKey }),
-    // Skip header injection when runtime auth exchange produced a
-    // different credential — the SDK reads the exchanged token from
-    // authStorage automatically.
-    hasRuntimeAuthExchange ? null : apiKeyInfo,
-    params.config,
-  );
-  const providerRuntimeHandle = resolvePreparedProviderRuntimeHandle({
-    provider,
-    modelId,
-    config: params.config,
-    workspaceDir: effectiveWorkspace,
-    providerRuntimeHandle: params.runtimePlan?.providerRuntimeHandle,
-    metadataSnapshot: params.preparedModelRuntime.metadataSnapshot,
-  });
-  const effectiveModel = attachModelProviderRuntimePluginHandle(
-    modelWithAuth,
-    providerRuntimeHandle,
-  );
-  const reuseFullRuntimePlan = params.runtimePlan?.auth === resolvedRuntimeAuthPlan;
-  const preparedRuntimePlan =
-    (reuseFullRuntimePlan ? params.runtimePlan : undefined) ??
-    buildAgentRuntimePlan({
+    const sessionLabel = params.sessionKey ?? params.sessionId;
+    const resolvedMessageProvider = params.messageChannel ?? params.messageProvider;
+    const contextInjectionMode = resolveContextInjectionMode(params.config, sessionAgentId);
+    const { bootstrapFiles, contextFiles } =
+      contextInjectionMode === "never"
+        ? { bootstrapFiles: [], contextFiles: [] }
+        : await resolveBootstrapContextForRun({
+            workspaceDir: effectiveWorkspace,
+            config: params.config,
+            sessionKey: params.sessionKey,
+            sessionId: params.sessionId,
+            chatType: params.chatType,
+            agentId: sessionAgentId,
+            warn: makeBootstrapWarn({
+              sessionLabel,
+              warn: (message) => log.warn(message),
+            }),
+          });
+    // Mirror ordinary-turn bootstrap disclosure so compaction summaries do not
+    // silently omit later workspace files when the aggregate budget is spent.
+    // Resolved once per prepared attempt so thinking-level retries reuse the same
+    // admitted files and notice.
+    const bootstrapInjectionStats = buildBootstrapInjectionStats({
+      bootstrapFiles,
+      injectedFiles: contextFiles,
+    });
+    const bootstrapBudget = buildBootstrapBudgetState({
+      config: params.config,
+      agentId: sessionAgentId,
+      files: bootstrapInjectionStats,
+    });
+    const bootstrapTruncationNotice = buildBootstrapPromptWarningNotice(
+      bootstrapBudget.bootstrapPromptWarning.lines,
+    );
+    // Keep session sizing separate from the summarizer's native request window.
+    const contextTokenBudget = resolveCompactionContextTokenBudget({
+      config: params.config,
+      provider: contextConfigProvider,
+      modelId,
+      model: runtimeModel,
+      requestedTokenBudget: params.contextTokenBudget,
+      fallbackTokenBudget: params.tokenBudget,
+    });
+    const modelWithAuth = applyAuthHeaderOverride(
+      applyLocalNoAuthHeaderOverride(runtimeModel, { apiKey: runtimeApiKey }),
+      // Skip header injection when runtime auth exchange produced a
+      // different credential — the SDK reads the exchanged token from
+      // authStorage automatically.
+      hasRuntimeAuthExchange ? null : apiKeyInfo,
+      params.config,
+    );
+    const providerRuntimeHandle = resolvePreparedProviderRuntimeHandle({
       provider,
       modelId,
-      model: effectiveModel,
-      modelApi: effectiveModel.api,
-      providerRuntimeHandle,
-      harnessId: preparedHarnessRuntime,
-      harnessRuntime: preparedHarnessRuntime,
-      authProfileMode: resolvedRuntimeAuthPlan.selectedAuthMode,
-      sessionAuthProfileId: resolvedRuntimeAuthPlan.forwardedAuthProfileId,
-      sessionAuthProfileSource: resolvedRuntimeAuthPlan.forwardedAuthProfileSource,
-      sessionAuthProfileCandidateIds: resolvedRuntimeAuthPlan.forwardedAuthProfileCandidateIds,
-      modelRoute: resolvedRuntimeAuthPlan.modelRoute,
       config: params.config,
       workspaceDir: effectiveWorkspace,
-      agentDir,
-      agentId: sessionAgentId,
-      thinkingLevel: mapThinkingLevelForProvider(thinkLevel, effectiveModel),
+      providerRuntimeHandle: params.runtimePlan?.providerRuntimeHandle,
+      metadataSnapshot: params.preparedModelRuntime.metadataSnapshot,
     });
-  const runtimePlan = reuseFullRuntimePlan
-    ? preparedRuntimePlan
-    : { ...preparedRuntimePlan, auth: resolvedRuntimeAuthPlan };
-  const runAbortController = new AbortController();
-  const spawnWorkspaceDir =
-    effectiveCwd !== effectiveWorkspace
-      ? resolvedWorkspace
-      : resolveAttemptSpawnWorkspaceDir({
-          sandbox,
-          resolvedWorkspace,
-        });
-  // Policy and tool construction share facts, while their distinct agent owners stay explicit.
-  const conversationContext = {
-    config: params.config,
-    sessionKey: sandboxSessionKey,
-    runSessionKey: params.sessionKey?.trim() || params.sessionId,
-    sessionId: params.sessionId,
-    runId: params.runId,
-    agentDir,
-    agentAccountId: params.agentAccountId,
-    messageProvider: resolvedMessageProvider,
-    chatType: params.chatType,
-    groupId: params.groupId,
-    groupChannel: params.groupChannel,
-    groupSpace: params.groupSpace,
-    spawnedBy: params.spawnedBy,
-    senderId: params.senderId,
-    senderName: params.senderName,
-    senderUsername: params.senderUsername,
-    senderE164: params.senderE164,
-    modelProvider: effectiveModel.provider,
-    modelId,
-    modelApi: effectiveModel.api,
-    modelContextWindowTokens: contextTokenBudget,
-    workspaceDir: effectiveWorkspace,
-    cwd: effectiveCwd,
-    spawnWorkspaceDir,
-    skillsSnapshot: skillsSnapshotForRun,
-  };
-  const runtimeCapabilityProfile = await prepareConversationCapabilityProfile({
-    ...conversationContext,
-    agentId: sandboxAgentId,
-    conversationToolPolicy: params.conversationToolPolicy,
-    senderIsOwner: params.senderIsOwner,
-    sandboxToolPolicy: sandbox?.tools,
-    inputProvenance: params.inputProvenance,
-    trustedInternalHandoff: params.trustedInternalHandoff,
-    pluginMetadataSnapshot: params.preparedModelRuntime.metadataSnapshot,
-  });
-  const toolsEnabled = supportsModelTools(effectiveModel);
-  const authProfileStore = toolsEnabled
-    ? (getPreparedModelRuntimeAuthStore(params.preparedModelRuntime) ??
-      (await ensureAuthProfileStoreWithoutExternalProfilesAsync(agentDir)))
-    : undefined;
-  params.abortSignal?.throwIfAborted();
-  const skillInstructionDeliveryCache = createSkillInstructionDeliveryCache();
-  const toolsRaw = toolsEnabled
-    ? await createOpenClawCodingToolsInternalAsync(
-        {
-          ...conversationContext,
-          authProfileStore,
-          agentId: sessionAgentId,
-          exec: {
-            ...execOverrides,
-            config: params.config,
-            elevated: params.bashElevated,
-          },
-          sandbox,
-          sessionPermissionPolicy,
-          requireWorkspaceOnly: params.requireWorkspaceOnly,
-          clientCaps: params.clientCaps,
-          pinnedWidgetAuthoring: params.pinnedWidgetAuthoring,
-          oneShotCliRun: params.oneShotCliRun,
-          allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
-          webSearchEnabled: params.toolOverrides?.webSearch !== false,
-          abortSignal: runAbortController.signal,
-          sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
-          modelHasVision: effectiveModel.input?.includes("image") ?? false,
-          modelCompat: extractModelCompat(effectiveModel),
-          skillUsagePaths,
-          skillInstructionDeliveryCache,
-          conversationCapabilityProfile: runtimeCapabilityProfile,
-          preparedModelRuntime: params.preparedModelRuntime,
-          modelAuthMode: await resolveModelAuthModeAsync(
-            effectiveModel.provider,
-            params.config,
-            authProfileStore,
-            {
-              workspaceDir: effectiveWorkspace,
-            },
-          ),
-        },
-        skillReadResources,
-      )
-    : [];
-  const runtimePlanModelContext = {
-    workspaceDir: effectiveWorkspace,
-    modelApi: effectiveModel.api,
-    model: effectiveModel,
-  };
-  const toolDiagnosticContext = {
-    runId,
-    agentId: sessionAgentId,
-    sessionKey: params.sessionKey,
-    sessionId: params.sessionId,
-  };
-  const normalizeToolSchemas = async (sourceTools: typeof toolsRaw, source: "core" | "bundle") => {
-    const projection = filterProviderNormalizableTools(sourceTools);
-    // Core preparation reports healthy empty sets; absent bundles remain untouched.
-    if (source === "core" || projection.diagnostics.length > 0) {
-      await logRuntimeToolSchemaQuarantine({
-        ...toolDiagnosticContext,
-        diagnostics: projection.diagnostics,
-        tools: sourceTools,
-      });
-    }
-    return source === "core" || sourceTools.length > 0
-      ? runtimePlan.tools.normalize([...projection.tools], runtimePlanModelContext)
-      : sourceTools;
-  };
-  const tools = await normalizeToolSchemas(toolsRaw, "core");
-  bundleMcpRuntime = toolsEnabled
-    ? await createBundleMcpToolRuntime({
-        workspaceDir: effectiveWorkspace,
-        cfg: params.config,
-        reservedToolNames: tools.map((tool) => tool.name),
-      })
-    : undefined;
-  bundleLspRuntime = toolsEnabled
-    ? await createBundleLspToolRuntime({
-        workspaceDir: effectiveWorkspace,
-        cfg: params.config,
-        abortSignal: params.abortSignal,
-        reservedToolNames: [
-          ...tools.map((tool) => tool.name),
-          ...(bundleMcpRuntime?.tools.map((tool) => tool.name) ?? []),
-        ],
-      })
-    : undefined;
-  const filteredBundledTools = applyFinalEffectiveToolPolicy({
-    bundledTools: [...(bundleMcpRuntime?.tools ?? []), ...(bundleLspRuntime?.tools ?? [])],
-    config: params.config,
-    // Reuse the core tool profile so bundled tools share its policy owner.
-    conversationCapabilityProfile: runtimeCapabilityProfile,
-    warn: (message) => log.warn(message),
-  });
-  const normalizedBundledTools = await normalizeToolSchemas(filteredBundledTools, "bundle");
-  const projectedEffectiveTools = [...tools, ...normalizedBundledTools];
-  const toolSchemaProjection = filterRuntimeCompatibleTools(projectedEffectiveTools);
-  await logRuntimeToolSchemaQuarantine({
-    ...toolDiagnosticContext,
-    diagnostics: toolSchemaProjection.diagnostics,
-    tools: projectedEffectiveTools,
-  });
-  const effectiveTools = [...toolSchemaProjection.tools];
-  const allowedToolNames = collectAllowedToolNames({ tools: effectiveTools });
-  const promptPolicyRestricted = toolPolicyRestrictsTools({ allow: params.toolsAllow });
-  // Compaction execution retains its existing tool objects. Only the model-visible endpoint
-  // prompt is narrowed to the caller's policy so private capability guidance cannot leak.
-  const promptTools = applyEmbeddedAttemptToolsAllow(effectiveTools, params.toolsAllow, {
-    toolMeta: (tool) => getPluginToolMeta(tool),
-  });
-  const promptAllowedToolNames = collectAllowedToolNames({ tools: promptTools });
-  runtimePlan.tools.logDiagnostics(effectiveTools, runtimePlanModelContext);
-  const machineName = await getMachineDisplayName();
-  const {
-    runtimeChannel,
-    runtimeCapabilities,
-    reactionGuidance,
-    messageToolHints,
-    customInlineButtonHint,
-  } = resolveRuntimeChannelPromptContext({
-    cfg: params.config,
-    channel: params.messageChannel ?? params.messageProvider,
-    accountId: params.agentAccountId,
-    requester: params,
-  });
-
-  const runtimeInfo = {
-    agentId: sessionAgentId,
-    agentName: params.config ? resolveRuntimeAgentName(params.config, sessionAgentId) : undefined,
-    sessionKey: params.sessionKey,
-    host: machineName,
-    os: resolveRuntimeOsLabel(),
-    arch: os.arch(),
-    node: process.version,
-    model: `${provider}/${modelId}`,
-    shell: detectRuntimeShell(),
-    channel: runtimeChannel,
-    chatType: params.chatType,
-    capabilities: runtimeCapabilities,
-    customInlineButtonHint,
-    activeProcessSessions: listActiveProcessSessionReferences({
-      scopeKey: resolveProcessToolScopeKey({
-        sessionKey: params.sessionKey,
-        sessionId: params.sessionId,
-        agentId: sessionAgentId,
-      }),
-    }),
-  };
-  if (sandbox?.enabled) {
-    params.abortSignal?.throwIfAborted();
-  }
-  const sandboxInfoExecPolicy =
-    sandbox?.enabled && params.bashElevated?.enabled === true
-      ? await resolveEmbeddedSandboxInfoExecPolicy(
-          {
-            config: params.config,
-            agentId: sessionAgentId,
-            sessionKey: params.sessionKey,
-            permissionMode: sessionPermissionPolicy?.mode,
-            sandboxAvailable: sandbox.enabled,
-            execOverrides,
-          },
-          { signal: params.abortSignal },
-        )
-      : undefined;
-  const sandboxInfo = buildEmbeddedSandboxInfo(sandbox, params.bashElevated, sandboxInfoExecPolicy);
-  const reasoningTagHint = isReasoningTagProvider(provider, {
-    config: params.config,
-    workspaceDir: effectiveWorkspace,
-    env: process.env,
-    modelId,
-    modelApi: effectiveModel.api,
-    model: effectiveModel,
-  });
-  const promptSurface = resolveAgentPromptSurfaceForSessionKey(params.sessionKey);
-  const promptMode = promptPolicyRestricted
-    ? "minimal"
-    : resolvePromptModeForSession(params.sessionKey);
-  const nativeCommandGuidanceLines = listRegisteredPluginAgentPromptGuidance({
-    surface: promptSurface,
-  });
-  const openClawReferences = await resolveOpenClawReferencePaths({
-    workspaceDir: effectiveWorkspace,
-    argv1: process.argv[1],
-    cwd: effectiveCwd,
-    moduleUrl: import.meta.url,
-  });
-  const buildPromptContributionContext = () => ({
-    config: params.config,
-    agentDir,
-    workspaceDir: effectiveWorkspace,
-    provider,
-    modelId,
-    promptMode,
-    runtimeChannel,
-    runtimeCapabilities,
-    agentId: sessionAgentId,
-  });
-  const promptContribution = runtimePlan.prompt.resolveSystemPromptContribution(
-    buildPromptContributionContext(),
-  );
-  const preparedMemoryPrompt = await prepareAgentMemoryPrompt({
-    enabled: promptMode === "full",
-    toolNames: promptTools.map((tool) => tool.name),
-    citationsMode: params.config?.memory?.citations,
-    agentId: runtimeInfo.agentId,
-    agentSessionKey: runtimeInfo.sessionKey,
-    sandboxed: sandboxInfo?.enabled === true,
-  });
-  // Match live-turn policy gates so restricted endpoint compaction cannot disclose
-  // private ambient sections through its model-visible developer prompt.
-  const preparedWatchedSessions = await prepareWatchedSessionsPromptAsync({
-    enabled: promptMode === "full",
-    config: params.config,
-    sessionKey: params.sessionKey,
-    sandboxed: sandboxInfo?.enabled === true,
-    toolNames: promptTools.map((tool) => tool.name),
-    capabilityToolNames: promptAllowedToolNames,
-    assertCurrent: () => params.abortSignal?.throwIfAborted(),
-  });
-  const activeProjectKeys = params.preparedModelRuntime?.activeProjectKeys ?? [];
-  const { prepareTtsPreferences } = await import("../../tts/tts-preferences.js");
-  const preparedTtsPreferences = promptMode === "full" ? await prepareTtsPreferences() : undefined;
-  const buildSystemPromptText = () => {
-    const builtSystemPrompt = buildConfiguredAgentSystemPrompt({
-      preparedTtsPreferences,
-      config: params.config,
-      preparedModelRuntime: params.preparedModelRuntime,
-      agentId: sessionAgentId,
-      workspaceDir: effectiveWorkspace,
-      runtimeCwd: effectiveCwd,
-      reasoningLevel: params.reasoningLevel ?? "off",
-      extraSystemPrompt: params.extraSystemPrompt,
-      ownerNumbers: params.ownerNumbers,
-      reasoningTagHint,
-      skillsPrompt: promptPolicyRestricted ? undefined : skillsPrompt,
-      docsPath: openClawReferences.docsPath ?? undefined,
-      sourcePath: openClawReferences.sourcePath ?? undefined,
-      promptMode,
-      promptSurface,
-      sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
-      acpEnabled: isAcpRuntimeSpawnAvailable({
+    const effectiveModel = attachModelProviderRuntimePluginHandle(
+      modelWithAuth,
+      providerRuntimeHandle,
+    );
+    const reuseFullRuntimePlan = params.runtimePlan?.auth === resolvedRuntimeAuthPlan;
+    const preparedRuntimePlan =
+      (reuseFullRuntimePlan ? params.runtimePlan : undefined) ??
+      buildAgentRuntimePlan({
+        provider,
+        modelId,
+        model: effectiveModel,
+        modelApi: effectiveModel.api,
+        providerRuntimeHandle,
+        harnessId: preparedHarnessRuntime,
+        harnessRuntime: preparedHarnessRuntime,
+        authProfileMode: resolvedRuntimeAuthPlan.selectedAuthMode,
+        sessionAuthProfileId: resolvedRuntimeAuthPlan.forwardedAuthProfileId,
+        sessionAuthProfileSource: resolvedRuntimeAuthPlan.forwardedAuthProfileSource,
+        sessionAuthProfileCandidateIds: resolvedRuntimeAuthPlan.forwardedAuthProfileCandidateIds,
+        modelRoute: resolvedRuntimeAuthPlan.modelRoute,
         config: params.config,
-        sandboxed: sandboxInfo?.enabled === true,
-      }),
-      runtimeInfo,
+        workspaceDir: effectiveWorkspace,
+        agentDir,
+        agentId: sessionAgentId,
+        thinkingLevel: mapThinkingLevelForProvider(thinkLevel, effectiveModel),
+      });
+    const runtimePlan = reuseFullRuntimePlan
+      ? preparedRuntimePlan
+      : { ...preparedRuntimePlan, auth: resolvedRuntimeAuthPlan };
+    const runAbortController = new AbortController();
+    const spawnWorkspaceDir =
+      effectiveCwd !== effectiveWorkspace
+        ? resolvedWorkspace
+        : resolveAttemptSpawnWorkspaceDir({
+            sandbox,
+            resolvedWorkspace,
+          });
+    // Policy and tool construction share facts, while their distinct agent owners stay explicit.
+    const conversationContext = {
+      config: params.config,
+      sessionKey: sandboxSessionKey,
+      runSessionKey: params.sessionKey?.trim() || params.sessionId,
+      sessionId: params.sessionId,
+      runId: params.runId,
+      agentDir,
+      agentAccountId: params.agentAccountId,
+      messageProvider: resolvedMessageProvider,
+      chatType: params.chatType,
+      groupId: params.groupId,
+      groupChannel: params.groupChannel,
+      groupSpace: params.groupSpace,
+      spawnedBy: params.spawnedBy,
+      senderId: params.senderId,
+      senderName: params.senderName,
+      senderUsername: params.senderUsername,
+      senderE164: params.senderE164,
+      modelProvider: effectiveModel.provider,
+      modelId,
+      modelApi: effectiveModel.api,
+      modelContextWindowTokens: contextTokenBudget,
+      workspaceDir: effectiveWorkspace,
+      cwd: effectiveCwd,
+      spawnWorkspaceDir,
+      skillsSnapshot: skillsSnapshotForRun,
+    };
+    const runtimeCapabilityProfile = await prepareConversationCapabilityProfile({
+      ...conversationContext,
+      agentId: sandboxAgentId,
+      conversationToolPolicy: params.conversationToolPolicy,
+      senderIsOwner: params.senderIsOwner,
+      sandboxToolPolicy: sandbox?.tools,
+      inputProvenance: params.inputProvenance,
+      trustedInternalHandoff: params.trustedInternalHandoff,
+      pluginMetadataSnapshot: params.preparedModelRuntime.metadataSnapshot,
+    });
+    const toolsEnabled = supportsModelTools(effectiveModel);
+    const authProfileStore = toolsEnabled
+      ? (getPreparedModelRuntimeAuthStore(params.preparedModelRuntime) ??
+        (await ensureAuthProfileStoreWithoutExternalProfilesAsync(agentDir)))
+      : undefined;
+    params.abortSignal?.throwIfAborted();
+    const skillInstructionDeliveryCache = createSkillInstructionDeliveryCache();
+    const toolsRaw = toolsEnabled
+      ? await createOpenClawCodingToolsInternalAsync(
+          {
+            ...conversationContext,
+            authProfileStore,
+            agentId: sessionAgentId,
+            exec: {
+              ...execOverrides,
+              config: params.config,
+              elevated: params.bashElevated,
+            },
+            sandbox,
+            sessionPermissionPolicy,
+            requireWorkspaceOnly: params.requireWorkspaceOnly,
+            clientCaps: params.clientCaps,
+            pinnedWidgetAuthoring: params.pinnedWidgetAuthoring,
+            oneShotCliRun: params.oneShotCliRun,
+            allowGatewaySubagentBinding: params.allowGatewaySubagentBinding,
+            webSearchEnabled: params.toolOverrides?.webSearch !== false,
+            abortSignal: runAbortController.signal,
+            sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
+            modelHasVision: effectiveModel.input?.includes("image") ?? false,
+            modelCompat: extractModelCompat(effectiveModel),
+            skillUsagePaths,
+            skillInstructionDeliveryCache,
+            conversationCapabilityProfile: runtimeCapabilityProfile,
+            preparedModelRuntime: params.preparedModelRuntime,
+            modelAuthMode: await resolveModelAuthModeAsync(
+              effectiveModel.provider,
+              params.config,
+              authProfileStore,
+              {
+                workspaceDir: effectiveWorkspace,
+              },
+            ),
+          },
+          skillReadResources,
+        )
+      : [];
+    const runtimePlanModelContext = {
+      workspaceDir: effectiveWorkspace,
+      modelApi: effectiveModel.api,
+      model: effectiveModel,
+    };
+    const toolDiagnosticContext = {
+      runId,
+      agentId: sessionAgentId,
+      sessionKey: params.sessionKey,
+      sessionId: params.sessionId,
+    };
+    const normalizeToolSchemas = async (
+      sourceTools: typeof toolsRaw,
+      source: "core" | "bundle",
+    ) => {
+      const projection = filterProviderNormalizableTools(sourceTools);
+      // Core preparation reports healthy empty sets; absent bundles remain untouched.
+      if (source === "core" || projection.diagnostics.length > 0) {
+        await logRuntimeToolSchemaQuarantine({
+          ...toolDiagnosticContext,
+          diagnostics: projection.diagnostics,
+          tools: sourceTools,
+        });
+      }
+      return source === "core" || sourceTools.length > 0
+        ? runtimePlan.tools.normalize([...projection.tools], runtimePlanModelContext)
+        : sourceTools;
+    };
+    const tools = await normalizeToolSchemas(toolsRaw, "core");
+    bundleMcpRuntime = toolsEnabled
+      ? await createBundleMcpToolRuntime({
+          workspaceDir: effectiveWorkspace,
+          cfg: params.config,
+          reservedToolNames: tools.map((tool) => tool.name),
+        })
+      : undefined;
+    bundleLspRuntime = toolsEnabled
+      ? await createBundleLspToolRuntime({
+          workspaceDir: effectiveWorkspace,
+          cfg: params.config,
+          abortSignal: params.abortSignal,
+          reservedToolNames: [
+            ...tools.map((tool) => tool.name),
+            ...(bundleMcpRuntime?.tools.map((tool) => tool.name) ?? []),
+          ],
+        })
+      : undefined;
+    const filteredBundledTools = applyFinalEffectiveToolPolicy({
+      bundledTools: [...(bundleMcpRuntime?.tools ?? []), ...(bundleLspRuntime?.tools ?? [])],
+      config: params.config,
+      // Reuse the core tool profile so bundled tools share its policy owner.
+      conversationCapabilityProfile: runtimeCapabilityProfile,
+      warn: (message) => log.warn(message),
+    });
+    const normalizedBundledTools = await normalizeToolSchemas(filteredBundledTools, "bundle");
+    const projectedEffectiveTools = [...tools, ...normalizedBundledTools];
+    const toolSchemaProjection = filterRuntimeCompatibleTools(projectedEffectiveTools);
+    await logRuntimeToolSchemaQuarantine({
+      ...toolDiagnosticContext,
+      diagnostics: toolSchemaProjection.diagnostics,
+      tools: projectedEffectiveTools,
+    });
+    const effectiveTools = [...toolSchemaProjection.tools];
+    const allowedToolNames = collectAllowedToolNames({ tools: effectiveTools });
+    const promptPolicyRestricted = toolPolicyRestrictsTools({ allow: params.toolsAllow });
+    // Compaction execution retains its existing tool objects. Only the model-visible endpoint
+    // prompt is narrowed to the caller's policy so private capability guidance cannot leak.
+    const promptTools = applyEmbeddedAttemptToolsAllow(effectiveTools, params.toolsAllow, {
+      toolMeta: (tool) => getPluginToolMeta(tool),
+    });
+    const promptAllowedToolNames = collectAllowedToolNames({ tools: promptTools });
+    runtimePlan.tools.logDiagnostics(effectiveTools, runtimePlanModelContext);
+    const machineName = await getMachineDisplayName();
+    const {
+      runtimeChannel,
+      runtimeCapabilities,
       reactionGuidance,
       messageToolHints,
-      sandboxInfo,
-      tools: promptTools,
-      contextFiles,
-      bootstrapTruncationNotice,
-      activeProjectKeys,
-      preparedMemoryPrompt,
-      preparedWatchedSessions,
-      promptContribution,
-      nativeCommandGuidanceLines,
+      customInlineButtonHint,
+    } = resolveRuntimeChannelPromptContext({
+      cfg: params.config,
+      channel: params.messageChannel ?? params.messageProvider,
+      accountId: params.agentAccountId,
+      requester: params,
     });
-    return transformProviderSystemPrompt({
-      provider,
+
+    const runtimeInfo = {
+      agentId: sessionAgentId,
+      agentName: params.config ? resolveRuntimeAgentName(params.config, sessionAgentId) : undefined,
+      sessionKey: params.sessionKey,
+      host: machineName,
+      os: resolveRuntimeOsLabel(),
+      arch: os.arch(),
+      node: process.version,
+      model: `${provider}/${modelId}`,
+      shell: detectRuntimeShell(),
+      channel: runtimeChannel,
+      chatType: params.chatType,
+      capabilities: runtimeCapabilities,
+      customInlineButtonHint,
+      activeProcessSessions: listActiveProcessSessionReferences({
+        scopeKey: resolveProcessToolScopeKey({
+          sessionKey: params.sessionKey,
+          sessionId: params.sessionId,
+          agentId: sessionAgentId,
+        }),
+      }),
+    };
+    if (sandbox?.enabled) {
+      params.abortSignal?.throwIfAborted();
+    }
+    const sandboxInfoExecPolicy =
+      sandbox?.enabled && params.bashElevated?.enabled === true
+        ? await resolveEmbeddedSandboxInfoExecPolicy(
+            {
+              config: params.config,
+              agentId: sessionAgentId,
+              sessionKey: params.sessionKey,
+              permissionMode: sessionPermissionPolicy?.mode,
+              sandboxAvailable: sandbox.enabled,
+              execOverrides,
+            },
+            { signal: params.abortSignal },
+          )
+        : undefined;
+    const sandboxInfo = buildEmbeddedSandboxInfo(
+      sandbox,
+      params.bashElevated,
+      sandboxInfoExecPolicy,
+    );
+    const reasoningTagHint = isReasoningTagProvider(provider, {
       config: params.config,
       workspaceDir: effectiveWorkspace,
-      context: {
-        ...buildPromptContributionContext(),
-        systemPrompt: builtSystemPrompt,
-      },
+      env: process.env,
+      modelId,
+      modelApi: effectiveModel.api,
+      model: effectiveModel,
     });
-  };
+    const promptSurface = resolveAgentPromptSurfaceForSessionKey(params.sessionKey);
+    const promptMode = promptPolicyRestricted
+      ? "minimal"
+      : resolvePromptModeForSession(params.sessionKey);
+    const nativeCommandGuidanceLines = listRegisteredPluginAgentPromptGuidance({
+      surface: promptSurface,
+    });
+    const openClawReferences = await resolveOpenClawReferencePaths({
+      workspaceDir: effectiveWorkspace,
+      argv1: process.argv[1],
+      cwd: effectiveCwd,
+      moduleUrl: import.meta.url,
+    });
+    const buildPromptContributionContext = () => ({
+      config: params.config,
+      agentDir,
+      workspaceDir: effectiveWorkspace,
+      provider,
+      modelId,
+      promptMode,
+      runtimeChannel,
+      runtimeCapabilities,
+      agentId: sessionAgentId,
+    });
+    const promptContribution = runtimePlan.prompt.resolveSystemPromptContribution(
+      buildPromptContributionContext(),
+    );
+    const preparedMemoryPrompt = await prepareAgentMemoryPrompt({
+      enabled: promptMode === "full",
+      toolNames: promptTools.map((tool) => tool.name),
+      citationsMode: params.config?.memory?.citations,
+      agentId: runtimeInfo.agentId,
+      agentSessionKey: runtimeInfo.sessionKey,
+      sandboxed: sandboxInfo?.enabled === true,
+    });
+    // Match live-turn policy gates so restricted endpoint compaction cannot disclose
+    // private ambient sections through its model-visible developer prompt.
+    const preparedWatchedSessions = await prepareWatchedSessionsPromptAsync({
+      enabled: promptMode === "full",
+      config: params.config,
+      sessionKey: params.sessionKey,
+      sandboxed: sandboxInfo?.enabled === true,
+      toolNames: promptTools.map((tool) => tool.name),
+      capabilityToolNames: promptAllowedToolNames,
+      assertCurrent: () => params.abortSignal?.throwIfAborted(),
+    });
+    const activeProjectKeys = params.preparedModelRuntime?.activeProjectKeys ?? [];
+    const { prepareTtsPreferences } = await import("../../tts/tts-preferences.js");
+    const preparedTtsPreferences =
+      promptMode === "full" ? await prepareTtsPreferences() : undefined;
+    const buildSystemPromptText = () => {
+      const builtSystemPrompt = buildConfiguredAgentSystemPrompt({
+        preparedTtsPreferences,
+        config: params.config,
+        preparedModelRuntime: params.preparedModelRuntime,
+        agentId: sessionAgentId,
+        workspaceDir: effectiveWorkspace,
+        runtimeCwd: effectiveCwd,
+        reasoningLevel: params.reasoningLevel ?? "off",
+        extraSystemPrompt: params.extraSystemPrompt,
+        ownerNumbers: params.ownerNumbers,
+        reasoningTagHint,
+        skillsPrompt: promptPolicyRestricted ? undefined : skillsPrompt,
+        docsPath: openClawReferences.docsPath ?? undefined,
+        sourcePath: openClawReferences.sourcePath ?? undefined,
+        promptMode,
+        promptSurface,
+        sourceReplyDeliveryMode: params.sourceReplyDeliveryMode,
+        acpEnabled: isAcpRuntimeSpawnAvailable({
+          config: params.config,
+          sandboxed: sandboxInfo?.enabled === true,
+        }),
+        runtimeInfo,
+        reactionGuidance,
+        messageToolHints,
+        sandboxInfo,
+        tools: promptTools,
+        contextFiles,
+        bootstrapTruncationNotice,
+        activeProjectKeys,
+        preparedMemoryPrompt,
+        preparedWatchedSessions,
+        promptContribution,
+        nativeCommandGuidanceLines,
+      });
+      return transformProviderSystemPrompt({
+        provider,
+        config: params.config,
+        workspaceDir: effectiveWorkspace,
+        context: {
+          ...buildPromptContributionContext(),
+          systemPrompt: builtSystemPrompt,
+        },
+      });
+    };
 
-  return {
-    ...prepared,
-    contextTokenBudget,
-    effectiveModel,
-    runtimePlan,
-    runtimePlanModelContext,
-    runAbortController,
-    effectiveTools,
-    allowedToolNames,
-    buildSystemPromptText,
-    resolvedMessageProvider,
-  };
+    return {
+      ...prepared,
+      contextTokenBudget,
+      effectiveModel,
+      runtimePlan,
+      runtimePlanModelContext,
+      runAbortController,
+      effectiveTools,
+      allowedToolNames,
+      buildSystemPromptText,
+      resolvedMessageProvider,
+    };
+  } catch (err) {
+    restoreSkillEnvironment();
+    throw err;
+  }
 }
 
 export type PreparedCompactionRuntime = Awaited<ReturnType<typeof buildPreparedCompactionRuntime>>;

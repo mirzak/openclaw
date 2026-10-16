@@ -340,7 +340,10 @@ describe("Git runtime promotion", () => {
 
       await fs.unlink(path.join(root, "packages"));
       await fs.rename(heldPackages, path.join(root, "packages"));
-      // Restore after repairing the parent; activation consumes its staged candidates.
+      if (phase === "activate") {
+        await expectRuntime(root, "original");
+        await promotion.activate();
+      }
       await promotion.restore();
       await expectRuntime(root, "original");
       await promotion.cleanup();

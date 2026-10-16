@@ -61,17 +61,17 @@ describe("discoverSkillCandidates", () => {
     });
     expect(
       await installSkillFromSource({ workspaceDir, spec: sourceDir, slug: "installed-skill" }),
-    ).toMatchObject({ slug: "installed-skill" });
+    ).toMatchObject({ ok: true });
     await fs.writeFile(path.join(sourceDir, "SKILL.md"), "---\nname: installed-skill\n---\n");
 
-    await expect(
-      installSkillFromSource({
+    expect(
+      await installSkillFromSource({
         workspaceDir,
         spec: sourceDir,
         slug: "installed-skill",
         force: true,
       }),
-    ).rejects.toThrow("description is required");
+    ).toMatchObject({ ok: false, error: expect.stringContaining("description is required") });
     expect(loadTestWorkspaceSkills(workspaceDir).map((entry) => entry.skill.description)).toEqual([
       "Keep the discoverable installation",
     ]);

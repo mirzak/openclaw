@@ -108,11 +108,17 @@ export function loadPromptTemplates({
       } else if (stats.isFile() && resolvedPath.endsWith(".md")) {
         filePaths = [resolvedPath];
       }
-      for (const filePath of filePaths) {
-        const template = loadTemplateFromFile(filePath, getSourceInfo(filePath));
-        if (template) {
-          templates.push(template);
+      const loadedTemplates: PromptTemplate[] = [];
+      try {
+        for (const filePath of filePaths) {
+          const template = loadTemplateFromFile(filePath, getSourceInfo(filePath));
+          if (template) {
+            loadedTemplates.push(template);
+          }
         }
+      } finally {
+        // Keep the loaded prefix if metadata resolution fails on a later file.
+        templates.push(...loadedTemplates);
       }
     } catch {
       // Ignore read failures

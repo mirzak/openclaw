@@ -1,5 +1,6 @@
-import { getRuntimeConfigSnapshot } from "../config/config.js";
+import { getRuntimeConfig } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { computeBackoff, type BackoffPolicy } from "../infra/backoff.js";
 import {
   applyConfiguredContextWindows,
   prepareContextWindowCaches,
@@ -20,6 +21,12 @@ import {
   CONTEXT_WINDOW_RUNTIME_STATE,
 } from "./context-runtime-state.js";
 
+const CONFIG_LOAD_RETRY_POLICY: BackoffPolicy = {
+  initialMs: 1_000,
+  maxMs: 60_000,
+  factor: 2,
+  jitter: 0,
+};
 const loadPreparedModelCatalogRuntime = () => import("./prepared-model-catalog.js");
 
 function primeConfiguredContextWindowsFromConfig(cfg: OpenClawConfig): OpenClawConfig {
@@ -30,6 +37,8 @@ function primeConfiguredContextWindowsFromConfig(cfg: OpenClawConfig): OpenClawC
     modelsConfig: cfg.models,
   });
   CONTEXT_WINDOW_RUNTIME_STATE.configuredConfig = cfg;
+  CONTEXT_WINDOW_RUNTIME_STATE.configLoadFailures = 0;
+  CONTEXT_WINDOW_RUNTIME_STATE.nextConfigLoadAttemptAtMs = 0;
   return cfg;
 }
 
@@ -37,8 +46,21 @@ function primeConfiguredContextWindows(): OpenClawConfig | undefined {
   if (CONTEXT_WINDOW_RUNTIME_STATE.configuredConfig) {
     return CONTEXT_WINDOW_RUNTIME_STATE.configuredConfig;
   }
-  const cfg = getRuntimeConfigSnapshot();
-  return cfg ? primeConfiguredContextWindowsFromConfig(cfg) : undefined;
+  if (Date.now() < CONTEXT_WINDOW_RUNTIME_STATE.nextConfigLoadAttemptAtMs) {
+    return undefined;
+  }
+  try {
+    return primeConfiguredContextWindowsFromConfig(getRuntimeConfig());
+  } catch {
+    CONTEXT_WINDOW_RUNTIME_STATE.configLoadFailures += 1;
+    const backoffMs = computeBackoff(
+      CONFIG_LOAD_RETRY_POLICY,
+      CONTEXT_WINDOW_RUNTIME_STATE.configLoadFailures,
+    );
+    CONTEXT_WINDOW_RUNTIME_STATE.nextConfigLoadAttemptAtMs = Date.now() + backoffMs;
+    // If config can't be loaded, leave cache empty and retry after backoff.
+    return undefined;
+  }
 }
 
 export function ensureContextWindowCacheLoaded(cfgOverride?: OpenClawConfig): Promise<void> {
@@ -114,6 +136,8 @@ export async function prewarmContextWindowCacheAfterReady(params: {
       }
       replaceContextWindowCaches(caches);
       CONTEXT_WINDOW_RUNTIME_STATE.configuredConfig = owner.config;
+      CONTEXT_WINDOW_RUNTIME_STATE.configLoadFailures = 0;
+      CONTEXT_WINDOW_RUNTIME_STATE.nextConfigLoadAttemptAtMs = 0;
       published = true;
     })
     .catch(() => {

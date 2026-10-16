@@ -84,7 +84,9 @@ import {
   type OpenAICodexResponsesOptions,
 } from "./openai-chatgpt-responses-request.js";
 import {
+  addCodexWebSocketSseFallback,
   buildCodexWebSocketHeaders,
+  hasCodexWebSocketSseFallback,
   matchesCodexWebSocketAuthority,
   resolveCodexWebSocketAuthority,
   type CodexWebSocketAuthority,
@@ -397,8 +399,11 @@ export const streamOpenAICodexResponses: StreamFunction<
       const websocketDisabledForSession =
         transport === "auto" &&
         websocketAuthority !== undefined &&
-        options?.sessionId !== undefined &&
-        websocketState.sseFallbacks.get(options.sessionId) === websocketAuthority.url;
+        hasCodexWebSocketSseFallback(
+          websocketState.sseFallbacks,
+          options?.sessionId,
+          websocketAuthority,
+        );
 
       if (websocketAuthority && !websocketDisabledForSession) {
         let websocketStarted = false;
@@ -490,7 +495,11 @@ export const streamOpenAICodexResponses: StreamFunction<
               options?.sessionId &&
               !independentResponsesRequest.has(options)
             ) {
-              websocketState.sseFallbacks.set(options.sessionId, websocketAuthority.url);
+              addCodexWebSocketSseFallback(
+                websocketState.sseFallbacks,
+                options.sessionId,
+                websocketAuthority,
+              );
             }
             if (websocketStarted || transport !== "auto") {
               throw transportError;

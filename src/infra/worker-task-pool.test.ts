@@ -130,11 +130,11 @@ it.each(["options", "constructor"] as const)(
         reason,
       );
       await pool.close();
-      expect(workers.map((worker) => worker.threadId)).toEqual([-1]);
+      expect(workers.map((worker) => worker.threadId)).toEqual(phase === "constructor" ? [-1] : []);
       expect(fs.existsSync(directory)).toBe(false);
     } finally {
       workerChannel.unsubscribe(cancel);
-      // Join the Worker even if the cancellation assertion fails.
+      // Join even a Worker incorrectly created after reentrant cancellation.
       await Promise.all(workers.map((worker) => worker.terminate()));
       await pool.close();
     }

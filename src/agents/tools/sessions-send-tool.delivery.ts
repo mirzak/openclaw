@@ -463,15 +463,18 @@ export async function createConfiguredAgentMainSession(params: {
   requesterSessionKey?: string;
   useTrustedInProcessCreation: boolean;
   assertCurrent?: () => void;
-}): Promise<void> {
+}): Promise<{ ok: true } | { ok: false; status: "error" | "forbidden"; error: string }> {
   const requesterPolicyError = resolveSenderRestrictedSpawnError({ ...params, visible: true });
   if (requesterPolicyError) {
-    throw new Error(requesterPolicyError);
+    return { ok: false, status: "forbidden", error: requesterPolicyError };
   }
   if (params.mode === "steer" || params.mode === "notify" || params.mode === "resume") {
-    throw new Error(
-      "Cannot notify, steer, or resume a missing session. Use mode=followup to start a new turn.",
-    );
+    return {
+      ok: false,
+      status: "error",
+      error:
+        "Cannot notify, steer, or resume a missing session. Use mode=followup to start a new turn.",
+    };
   }
   try {
     params.assertCurrent?.();
@@ -503,7 +506,8 @@ export async function createConfiguredAgentMainSession(params: {
         timeoutMs: 10_000,
       });
     }
+    return { ok: true };
   } catch (err) {
-    throw new Error(formatErrorMessage(err), { cause: err });
+    return { ok: false, status: "error", error: formatErrorMessage(err) };
   }
 }

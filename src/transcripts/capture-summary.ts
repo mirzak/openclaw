@@ -222,7 +222,7 @@ export async function createTranscriptSummaryUpdates(
   },
 ) {
   const { key, lane } = laneFor(params);
-  // Reserve the lane across the previous owner's retirement.
+  // Reserve the lane across startup reads and the previous owner's retirement.
   lane.pending++;
   try {
     await lane.live?.stop();
@@ -318,7 +318,19 @@ export async function createTranscriptSummaryUpdates(
     };
     lane.live = owner;
     lane.generation++;
-    return owner;
+    try {
+      const initial = await params.store.readSummarySnapshot(
+        params.session,
+        params.config.maxUtterances,
+      );
+      if (!initial || stopped || lane.live !== owner) {
+        throw new TranscriptsSummaryChangedError();
+      }
+      return owner;
+    } catch (error) {
+      await owner.stop();
+      throw error;
+    }
   } finally {
     lane.pending--;
     if (!lane.pending && !lane.live && lanes.get(key) === lane) {
