@@ -2,29 +2,22 @@ import { afterEach, beforeEach, expect, vi } from "vitest";
 import type { SessionsListResult } from "../api/types.ts";
 import { createAgentSelectionCapability } from "../app/agent-selection.ts";
 import { createApplicationConfigCapability } from "../app/config.ts";
-import type {
-  ApplicationContext,
-  ApplicationGateway,
-  ApplicationGatewaySnapshot,
-} from "../app/context.ts";
+import type { ApplicationContext, ApplicationGateway } from "../app/context.ts";
 import { createAgentIdentityCapability } from "../lib/agents/identity.ts";
 import { createAgentCapability } from "../lib/agents/index.ts";
 import { invalidateChatMetadataStore } from "../lib/chat/chat-metadata-cache.ts";
 import { invalidateCronCatalog } from "../lib/cron/catalog.ts";
 import { modelCatalogEventInvalidation } from "../lib/model-catalog-cache.ts";
-import { createApplicationContextProvider } from "../test-helpers/application-context.ts";
+import {
+  createApplicationContextProvider,
+  createApplicationGateway,
+} from "../test-helpers/application-context.ts";
 import {
   createTestGatewayClient,
   type GatewayRequestHandler,
 } from "../test-helpers/gateway-client.ts";
 import { installDialogPolyfill } from "../test-helpers/modal-dialog.ts";
 import type { CommandPalette } from "./command-palette.tsx";
-
-type GatewayHarness = {
-  gateway: ApplicationGateway;
-  setConnected: (connected: boolean) => void;
-  emit: (event: string, payload?: unknown) => void;
-};
 
 export function registerCommandPaletteTestHooks() {
   let restoreDialogPolyfill: () => void;
@@ -57,7 +50,7 @@ export function registerCommandPaletteTestHooks() {
 export function createGateway(
   connected: boolean,
   options: { methods?: string[]; request?: GatewayRequestHandler } = {},
-): GatewayHarness {
+) {
   const request =
     options.request ??
     ((method: string) =>
@@ -81,7 +74,7 @@ export function createGateway(
     }
     return request(...args);
   });
-  let snapshot: ApplicationGatewaySnapshot = {
+  const { gateway, publish, publishEvent } = createApplicationGateway({
     client,
     phase: connected ? "connected" : "reconnecting",
     offlineStable: false,
@@ -91,35 +84,21 @@ export function createGateway(
     sessionKey: "main",
     lastError: null,
     lastErrorCode: null,
-  };
-  const listeners = new Set<(next: ApplicationGatewaySnapshot) => void>();
-  const events = new Set<Parameters<ApplicationGateway["subscribeEvents"]>[0]>();
-  const gateway = {
-    get snapshot() {
-      return snapshot;
-    },
+  });
+  Object.assign(gateway, {
     connection: { gatewayUrl: "ws://localhost", token: "", bootstrapToken: "", password: "" },
     connectionRevision: 0,
     eventLog: [],
     eventLogRevision: 0,
     loadSelfProfile: async () => null,
-    connect: () => undefined,
     setSessionKey: () => undefined,
     start: () => undefined,
     stop: () => undefined,
-    subscribe(listener) {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
-    },
     subscribeEventLog: () => () => undefined,
-    subscribeEvents(listener) {
-      events.add(listener);
-      return () => events.delete(listener);
-    },
-  } satisfies ApplicationGateway;
+  });
   return {
     gateway,
-    emit(event, payload = {}) {
+    emit(event: string, payload: unknown = {}) {
       if (event === "cron" || event === "config.changed") {
         invalidateCronCatalog(client);
       }
@@ -127,22 +106,17 @@ export function createGateway(
       if (invalidation) {
         invalidateChatMetadataStore(client, undefined, undefined, invalidation);
       }
-      for (const listener of events) {
-        listener({ type: "event", event, payload });
-      }
+      publishEvent({ type: "event", event, payload });
     },
-    setConnected(nextConnected) {
+    setConnected(nextConnected: boolean) {
       if (!nextConnected) {
         invalidateCronCatalog(client);
         invalidateChatMetadataStore(client);
       }
-      snapshot = {
-        ...snapshot,
+      publish({
+        ...gateway.snapshot,
         phase: nextConnected ? "connected" : "reconnecting",
-      };
-      for (const listener of listeners) {
-        listener(snapshot);
-      }
+      });
     },
   };
 }
@@ -158,7 +132,7 @@ afterEach(() => {
 
 export function createContext(
   gateway: ApplicationGateway,
-  list: ApplicationContext["sessions"]["list"],
+  list: ApplicationContext["sessions"]["list"] = vi.fn(async () => null),
 ): ApplicationContext {
   const agents = createAgentCapability(gateway);
   // Search scenarios control catalog acquisition independently of creation.
@@ -193,7 +167,7 @@ export function createSessionResult(key: string, displayName: string): SessionsL
   } as SessionsListResult;
 }
 
-export async function mountPalette(context: ApplicationContext) {
+export async function mountPalette(context = createContext(createGateway(true).gateway)) {
   const provider = createApplicationContextProvider(context);
   const palette = document.createElement("openclaw-command-palette") as CommandPalette;
   palette.onNavigate = vi.fn();
@@ -207,12 +181,26 @@ export async function mountPalette(context: ApplicationContext) {
 export async function enterQuery(palette: CommandPalette, query: string) {
   palette.openPalette();
   await palette.updateComplete;
-  const input = palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input");
-  if (!input) {
-    throw new Error("Expected command palette input");
-  }
-  input.value = query;
-  input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+  setInputValue(paletteInput(palette), query, true);
+  await palette.updateComplete;
+}
+
+export const paletteInput = (palette: CommandPalette) =>
+  palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")!;
+
+export function setInputValue(input: HTMLTextAreaElement, value: string, composed = false) {
+  input.value = value;
+  input.dispatchEvent(new Event("input", { bubbles: true, composed }));
+}
+
+export function pressKey(input: HTMLTextAreaElement, key: string, init: KeyboardEventInit = {}) {
+  const event = new KeyboardEvent("keydown", { bubbles: true, key, ...init });
+  input.dispatchEvent(event);
+  return event;
+}
+
+export async function settlePalette(palette: CommandPalette, ms = 200) {
+  await vi.advanceTimersByTimeAsync(ms);
   await palette.updateComplete;
 }
 

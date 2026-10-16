@@ -9,7 +9,12 @@ import { createDraftFixture } from "../pages/new-session/draft-submission-flow.t
 import { createApplicationGateway } from "../test-helpers/application-context.ts";
 import { installDialogPolyfill } from "../test-helpers/modal-dialog.ts";
 import { waitForSolid } from "../test-helpers/solid-settle.ts";
-import { mountPalette } from "./command-palette.test-support.ts";
+import {
+  mountPalette,
+  settlePalette,
+  paletteInput,
+  pressKey,
+} from "./command-palette.test-support.ts";
 import "./command-palette.tsx";
 
 const people: UsersMentionableResult = {
@@ -48,6 +53,7 @@ afterEach(() => {
 async function mount(createdSessionKey = "agent:main:dashboard:mentioned") {
   const directory = vi.fn(async (): Promise<UsersMentionableResult> => people);
   const fixture = createDraftFixture({
+    selfUser: { id: "sender", identity: { type: "profile", id: "sender" } },
     request: async (method) => {
       if (method === "users.mentionable") {
         return directory();
@@ -59,9 +65,6 @@ async function mount(createdSessionKey = "agent:main:dashboard:mentioned") {
     },
   });
   const { context } = fixture;
-  Object.assign(context.gateway.snapshot, {
-    selfUser: { id: "sender", identity: { type: "profile", id: "sender" } },
-  });
   const connection = createApplicationGateway(context.gateway.snapshot);
   Object.assign(connection.gateway, {
     connectionRevision: 1,
@@ -80,73 +83,51 @@ async function mount(createdSessionKey = "agent:main:dashboard:mentioned") {
     },
     navigate: vi.fn(),
   });
-  for (const capability of [
-    context.agentSelection,
-    context.agents,
-    context.sessions,
-    context.config,
-  ]) {
-    Object.assign(capability, { subscribe: () => () => {} });
-  }
+  Object.assign(context.agentSelection, { subscribe: () => () => {} });
   Object.assign(context.agents.state, { connected: true, client: context.gateway.snapshot.client });
   Object.assign(context.sessions, { list: vi.fn(async () => null) });
   vi.mocked(context.sessions.createResult).mockImplementation((params) =>
     requestSessionCreate(context.gateway.snapshot.client!, params),
   );
   const { palette, provider } = await mountPalette(context);
-  const getInput = () => palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")!;
+  const getInput = () => paletteInput(palette);
   palette.openPalette();
   await palette.updateComplete;
   getInput().focus();
-  const edit = async (options: {
-    start: number;
-    end: number;
-    text: string;
-    inputType?: string;
-  }) => {
+  const edit = async (start: number, end: number, text: string, inputType = "insertText") => {
     const input = getInput();
     const previous = input.value;
-    input.setSelectionRange(options.start, options.end);
-    const inputType = options.inputType ?? "insertText";
+    input.setSelectionRange(start, end);
     const event = {
       bubbles: true,
       inputType,
-      data: inputType.startsWith("delete") ? null : options.text,
+      data: inputType.startsWith("delete") ? null : text,
     };
     input.dispatchEvent(new InputEvent("beforeinput", { ...event, cancelable: true }));
-    input.value = previous.slice(0, options.start) + options.text + previous.slice(options.end);
-    const caret = options.start + options.text.length;
+    input.value = previous.slice(0, start) + text + previous.slice(end);
+    const caret = start + text.length;
     input.setSelectionRange(caret, caret);
     input.dispatchEvent(new InputEvent("input", event));
     await palette.updateComplete;
   };
-  const append = (text: string) =>
-    edit({ start: getInput().value.length, end: getInput().value.length, text });
+  const append = (text: string) => edit(getInput().value.length, getInput().value.length, text);
   const replace = (text: string, inputType = "insertText") =>
-    edit({ start: 0, end: getInput().value.length, text, inputType });
+    edit(0, getInput().value.length, text, inputType);
   const key = async (pressedKey: string, extra: KeyboardEventInit = {}) => {
-    const event = new KeyboardEvent("keydown", {
-      bubbles: true,
-      cancelable: true,
-      key: pressedKey,
-      ...extra,
-    });
-    getInput().dispatchEvent(event);
+    const event = pressKey(getInput(), pressedKey, { cancelable: true, ...extra });
     await palette.updateComplete;
     return event;
   };
   const search = async (text = "@") => {
     await append(text);
-    await vi.advanceTimersByTimeAsync(150);
-    await palette.updateComplete;
+    await settlePalette(palette, 150);
   };
   const menu = () => palette.querySelector(".mention-menu");
   const recipients = () => [...palette.querySelectorAll(".composer-context-strip__person")];
   const send = async () => {
     await vi.advanceTimersByTimeAsync(0);
     await key("Enter", { ctrlKey: true });
-    await vi.advanceTimersByTimeAsync(0);
-    await palette.updateComplete;
+    await settlePalette(palette, 0);
   };
   return {
     ...fixture,
@@ -226,17 +207,17 @@ describe("command palette people mentions", () => {
       await f.search();
       await f.key(change === "same-name token" ? "ArrowDown" : "End");
       await f.key("Enter");
-      await f.edit({
-        start: change === "same-name token" ? 0 : 3,
-        end: change === "same-name token" ? 6 : 4,
-        text: "",
-        inputType: "deleteContentForward",
-      });
+      await f.edit(
+        change === "same-name token" ? 0 : 3,
+        change === "same-name token" ? 6 : 4,
+        "",
+        "deleteContentForward",
+      );
       expect(f.recipients()).toHaveLength(1);
       if (change === "same-name token") {
-        await f.edit({ start: 0, end: 0, text: "Review " });
+        await f.edit(0, 0, "Review ");
         await f.append(" tail");
-        await f.edit({ start: 13, end: 13, text: "@" });
+        await f.edit(13, 13, "@");
         await vi.advanceTimersByTimeAsync(150);
         await f.key("End");
         await f.key("Enter");
@@ -378,26 +359,15 @@ describe("command palette people mentions", () => {
     await f.palette.updateComplete;
     expect(f.recipients()).toHaveLength(1);
     const input = f.palette.querySelector<HTMLTextAreaElement>("textarea")!;
-    input.dispatchEvent(
-      new KeyboardEvent("keydown", {
-        key: "Enter",
-        ctrlKey: true,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
+    pressKey(input, "Enter", { ctrlKey: true, cancelable: true });
     await vi.advanceTimersByTimeAsync(0);
     expect(f.context.sessions.createResult).toHaveBeenCalledOnce();
   });
 
   it("locks recipients while submitting and never sends twice", async () => {
     const f = await mount();
-    let finish!: (value: Awaited<ReturnType<typeof requestSessionCreate>>) => void;
-    vi.mocked(f.context.sessions.createResult).mockReturnValueOnce(
-      new Promise((resolve) => {
-        finish = resolve;
-      }),
-    );
+    const submission = createDeferred<Awaited<ReturnType<typeof requestSessionCreate>>>();
+    vi.mocked(f.context.sessions.createResult).mockReturnValueOnce(submission.promise);
     await f.search();
     await f.key("Enter");
     await f.send();
@@ -407,7 +377,7 @@ describe("command palette people mentions", () => {
     await f.send();
     expect(f.context.sessions.createResult).toHaveBeenCalledOnce();
     expect(f.recipients()).toHaveLength(1);
-    finish({
+    submission.resolve({
       key: "agent:main:dashboard:mentioned",
       initialRun: { status: "started", runId: "mention-run" },
     });

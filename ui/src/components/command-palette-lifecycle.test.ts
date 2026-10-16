@@ -14,6 +14,10 @@ import {
   findPaletteOption,
   mountPalette,
   registerCommandPaletteTestHooks,
+  settlePalette,
+  paletteInput,
+  setInputValue,
+  pressKey,
 } from "./command-palette.test-support.ts";
 import "./command-palette.tsx";
 
@@ -24,13 +28,7 @@ describe("CommandPalette lifecycle", () => {
     vi.stubGlobal("webkit", {
       messageHandlers: { openclawBrowser: { postMessage: vi.fn() } },
     });
-    const { gateway } = createGateway(true);
-    const { palette } = await mountPalette(
-      createContext(
-        gateway,
-        vi.fn(async () => null),
-      ),
-    );
+    const { palette } = await mountPalette();
     const changes = vi.fn();
     const unsubscribe = subscribeNativeOverlayOcclusion(changes, () => null);
     try {
@@ -39,11 +37,7 @@ describe("CommandPalette lifecycle", () => {
       await palette.querySelector("openclaw-modal-dialog")?.updateComplete;
       expect(changes.mock.calls).toEqual([[false], [true]]);
 
-      palette
-        .querySelector(".cmd-palette__input")
-        ?.dispatchEvent(
-          new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
-        );
+      pressKey(paletteInput(palette), "Escape", { cancelable: true });
       await palette.updateComplete;
       expect(changes).toHaveBeenLastCalledWith(false);
       palette.openPalette();
@@ -62,8 +56,7 @@ describe("CommandPalette lifecycle", () => {
     const list = vi.fn(async () => createSessionResult("agent:main:old", "Old chat"));
     const { palette, provider } = await mountPalette(createContext(gateway, list));
     await enterQuery(palette, "old");
-    await vi.advanceTimersByTimeAsync(200);
-    await palette.updateComplete;
+    await settlePalette(palette);
     expect(palette.textContent).toContain("Old chat");
 
     const modal = palette.querySelector("openclaw-modal-dialog");
@@ -89,8 +82,7 @@ describe("CommandPalette lifecycle", () => {
     await vi.advanceTimersByTimeAsync(100);
     setConnected(false);
     await palette.updateComplete;
-    await vi.advanceTimersByTimeAsync(200);
-    await palette.updateComplete;
+    await settlePalette(palette);
     expect(list).not.toHaveBeenCalled();
     findPaletteOption(palette, "Plugins", true)!.click();
     expect(palette.onNavigate).toHaveBeenCalledWith("plugins");
@@ -125,8 +117,7 @@ describe("CommandPalette lifecycle", () => {
         harness.setConnected(true);
       }
       await palette.updateComplete;
-      await vi.advanceTimersByTimeAsync(200);
-      await palette.updateComplete;
+      await settlePalette(palette);
 
       if (change === "reconnect") {
         expect(list).toHaveBeenCalledTimes(2);
@@ -141,8 +132,7 @@ describe("CommandPalette lifecycle", () => {
         expect(replacementList).not.toHaveBeenCalled();
         expect(palette.textContent).not.toContain("Stale chat");
         await enterQuery(palette, "retry");
-        await vi.advanceTimersByTimeAsync(200);
-        await palette.updateComplete;
+        await settlePalette(palette);
         expect(replacementList).toHaveBeenCalledOnce();
         expect(palette.textContent).toContain("Fresh chat");
       }
@@ -177,18 +167,15 @@ describe("CommandPalette lifecycle", () => {
         harness.emit(change);
       }
       await palette.updateComplete;
-      await vi.advanceTimersByTimeAsync(200);
-      await palette.updateComplete;
-      const input = palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")!;
+      await settlePalette(palette);
+      const input = paletteInput(palette);
       expect(input.value).toBe(prompt);
       expect(list).not.toHaveBeenCalled();
       expect(request).not.toHaveBeenCalled();
       expectPalettePromptMode(palette);
 
-      input.value = "needle";
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      await vi.advanceTimersByTimeAsync(200);
-      await palette.updateComplete;
+      setInputValue(input, "needle");
+      await settlePalette(palette);
       expect(list).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ search: "needle" }));
       expect(request).toHaveBeenCalledWith(
         "sessions.search",

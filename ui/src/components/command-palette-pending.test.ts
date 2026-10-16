@@ -14,6 +14,10 @@ import {
   expectPalettePromptMode,
   findPaletteOption,
   mountPalette,
+  settlePalette,
+  paletteInput,
+  setInputValue,
+  pressKey,
 } from "./command-palette.test-support.ts";
 import "./command-palette.tsx";
 
@@ -41,15 +45,14 @@ describe("CommandPalette pending searches", () => {
       const { palette } = await mountPalette(createContext(gateway, list));
       await enterQuery(palette, composing ? "plugins" : "");
       const original = palette.querySelector(".cmd-palette__search")!.textContent;
-      const input = palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")!;
+      const input = paletteInput(palette);
       if (composing) {
         input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
       }
       for (const query of composing
         ? ["plugin"]
         : ["p", "pl", "plu", "plug", "plugi", "plugin", "plugins"]) {
-        input.value = query;
-        input.dispatchEvent(new Event("input", { bubbles: true }));
+        setInputValue(input, query);
         await palette.updateComplete;
         expect(input.value).toBe(query);
         expect(palette.querySelector(".cmd-palette__search")!.textContent).toBe(original);
@@ -65,8 +68,7 @@ describe("CommandPalette pending searches", () => {
       }
       await vi.advanceTimersByTimeAsync(99);
       expect(list).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(1);
-      await palette.updateComplete;
+      await settlePalette(palette, 1);
       expect(list).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({ search: composing ? "plugin" : "plugins" }),
       );
@@ -90,13 +92,11 @@ describe("CommandPalette pending searches", () => {
     expect(palette.textContent).not.toContain("Searching sessions");
     await vi.advanceTimersByTimeAsync(199);
 
-    const input = palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")!;
+    const input = paletteInput(palette);
     const prompt = "plugins\nReview the available integrations and explain how to configure them.";
-    input.value = prompt;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    setInputValue(input, prompt);
     await palette.updateComplete;
-    await vi.advanceTimersByTimeAsync(100);
-    await palette.updateComplete;
+    await settlePalette(palette, 100);
 
     expect(list).not.toHaveBeenCalled();
     expect(request).not.toHaveBeenCalled();
@@ -108,17 +108,14 @@ describe("CommandPalette pending searches", () => {
     expect(palette.isOpen).toBe(true);
     expect(input.value).toBe(prompt);
 
-    input.value = "";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    setInputValue(input, "");
     await palette.updateComplete;
     expect(findPaletteOption(palette, "Plugins", true)).toBeDefined();
     expect(palette.querySelectorAll('[role="option"]').length).toBeGreaterThan(0);
     expect(list).not.toHaveBeenCalled();
 
-    input.value = "plugins";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    await vi.advanceTimersByTimeAsync(200);
-    await palette.updateComplete;
+    setInputValue(input, "plugins");
+    await settlePalette(palette);
     expect(list).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ search: "plugins" }));
     expect(request).toHaveBeenCalledWith(
       "sessions.search",
@@ -149,9 +146,8 @@ describe("CommandPalette pending searches", () => {
     expect(list).toHaveBeenCalledOnce();
     expect(request).toHaveBeenCalledTimes(2);
 
-    const input = palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")!;
-    input.value = prompt;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    const input = paletteInput(palette);
+    setInputValue(input, prompt);
     await palette.updateComplete;
     const stale = createSessionResult("agent:main:stale", "zzfixtureunique stale session");
     metadata.resolve(stale);
@@ -175,16 +171,14 @@ describe("CommandPalette pending searches", () => {
       models: [{ id: "stale", provider: "fixture", name: prompt }],
       refreshFailed: true,
     });
-    await vi.advanceTimersByTimeAsync(100);
-    await palette.updateComplete;
+    await settlePalette(palette, 100);
 
     expect(list).toHaveBeenCalledOnce();
     expect(request).toHaveBeenCalledTimes(2);
     expectPalettePromptMode(palette);
     expect(input.value).toBe(prompt);
 
-    input.value = "zzfixtureunique";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    setInputValue(input, "zzfixtureunique");
     await palette.updateComplete;
     expect(palette.querySelector('[inert][aria-hidden="true"]')).toBeNull();
     expect(palette.querySelectorAll('[role="option"]')).toHaveLength(0);
@@ -228,8 +222,7 @@ describe("CommandPalette pending searches", () => {
             : { ...createSessionResult("agent:main:fixture", "Unused"), sessions: [] },
         );
       }
-      await vi.advanceTimersByTimeAsync(0);
-      await palette.updateComplete;
+      await settlePalette(palette, 0);
       expect(results.getAttribute("aria-busy")).toBe("false");
       expect(palette.textContent).not.toContain("Searching sessions");
       if (outcome === "match") {
@@ -262,20 +255,17 @@ describe("CommandPalette pending searches", () => {
     expect(palette.textContent).not.toContain("Searching sessions");
     expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
     expect(palette.textContent).not.toContain("No results");
-    const input = palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")!;
-    input.value = "z";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    const input = paletteInput(palette);
+    setInputValue(input, "z");
     await palette.updateComplete;
     expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
     expect(palette.textContent).not.toContain("No results");
     catalog.resolve({ models: [{ id: "fixture", provider: "fixture", name: "zzcatalog model" }] });
-    await vi.advanceTimersByTimeAsync(200);
-    await palette.updateComplete;
+    await settlePalette(palette);
     expect(findPaletteOption(palette, "zzcatalog model")).toBeDefined();
     expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
     await enterQuery(palette, "zzmissing");
-    await vi.advanceTimersByTimeAsync(200);
-    await palette.updateComplete;
+    await settlePalette(palette);
     expect(palette.textContent).toContain("No results");
     expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
     expect(request).toHaveBeenCalledOnce();
@@ -312,8 +302,7 @@ describe("CommandPalette pending searches", () => {
         },
       ],
     });
-    await vi.advanceTimersByTimeAsync(0);
-    await palette.updateComplete;
+    await settlePalette(palette, 0);
     expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
     expect(findPaletteOption(palette, "Unrelated title")?.textContent).toContain(
       "zzfixtureunique transcript match",
@@ -353,15 +342,12 @@ describe("CommandPalette pending searches", () => {
       );
       const { palette } = await mountPalette(createContext(gateway, list));
       await enterQuery(palette, "zzfixtureunique");
-      await vi.advanceTimersByTimeAsync(200);
-      await palette.updateComplete;
+      await settlePalette(palette);
       expect(palette.textContent).toContain(notice);
       expect(palette.querySelector(".cmd-palette__no-results")).toBeNull();
-      const input = palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")!;
-      input.value = "zzfixtureunique\nSummarize the findings in a new session.";
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      await vi.advanceTimersByTimeAsync(200);
-      await palette.updateComplete;
+      const input = paletteInput(palette);
+      setInputValue(input, "zzfixtureunique\nSummarize the findings in a new session.");
+      await settlePalette(palette);
       expectPalettePromptMode(palette);
       expect(list).toHaveBeenCalledOnce();
     },
@@ -378,15 +364,13 @@ describe("CommandPalette pending searches", () => {
     const { palette } = await mountPalette(createContext(gateway, list));
     await enterQuery(palette, "zzold");
     await vi.advanceTimersByTimeAsync(200);
-    const input = palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")!;
-    input.value = "zznew";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    const input = paletteInput(palette);
+    setInputValue(input, "zznew");
     old.resolve(createSessionResult("agent:main:old", "zzold match"));
-    await vi.advanceTimersByTimeAsync(0);
-    await palette.updateComplete;
+    await settlePalette(palette, 0);
     expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
     expect(palette.querySelectorAll('[role="option"]')).toHaveLength(0);
-    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    pressKey(input, "Enter");
     expect(list).toHaveBeenCalledTimes(2);
     expect(list).toHaveBeenLastCalledWith(expect.objectContaining({ search: "zznew" }));
     expect(palette.onSelectSession).not.toHaveBeenCalled();
@@ -394,13 +378,12 @@ describe("CommandPalette pending searches", () => {
     await vi.advanceTimersByTimeAsync(200);
     expect(list).toHaveBeenCalledTimes(2);
     current.resolve(createSessionResult("agent:main:new", "zznew match"));
-    await vi.advanceTimersByTimeAsync(0);
-    await palette.updateComplete;
+    await settlePalette(palette, 0);
     expect(palette.textContent).not.toContain("zzold match");
     expect(findPaletteOption(palette, "zznew match")).toBeDefined();
     expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
     expect(palette.onSelectSession).not.toHaveBeenCalled();
-    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    pressKey(input, "Enter");
     expect(palette.onSelectSession).toHaveBeenCalledExactlyOnceWith("agent:main:new");
   });
 
@@ -424,9 +407,8 @@ describe("CommandPalette pending searches", () => {
       } else if (action === "disconnect") {
         harness.setConnected(false);
       } else {
-        const input = palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")!;
-        input.value = "z";
-        input.dispatchEvent(new Event("input", { bubbles: true }));
+        const input = paletteInput(palette);
+        setInputValue(input, "z");
       }
       await palette.updateComplete;
       if (action === "short-query") {
@@ -435,8 +417,7 @@ describe("CommandPalette pending searches", () => {
       }
       expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
       deferred.resolve(createSessionResult("agent:main:stale", "zzfixtureunique stale"));
-      await vi.advanceTimersByTimeAsync(0);
-      await palette.updateComplete;
+      await settlePalette(palette, 0);
       expect(palette.textContent).not.toContain("Searching sessions");
       expect(findPaletteOption(palette, "zzfixtureunique stale")).toBeUndefined();
     },

@@ -17,7 +17,7 @@ import { createApplicationGateway } from "../test-helpers/application-context.ts
 import { installDialogPolyfill } from "../test-helpers/modal-dialog.ts";
 import { mountSolid } from "../test-helpers/mount-solid.ts";
 import { flush } from "../test-helpers/solid-settle.ts";
-import { mountPalette } from "./command-palette.test-support.ts";
+import { mountPalette, paletteInput, setInputValue } from "./command-palette.test-support.ts";
 import "./command-palette.tsx";
 
 let restoreDialog: () => void;
@@ -101,10 +101,8 @@ async function mount(options: Parameters<typeof createDraftFixture>[0] = {}) {
   onTestFinished(() => webPush.dispose());
   Object.assign(context, { gateway: connection.gateway, webPush });
   Object.assign(context.agentSelection, { subscribe: () => () => {} });
-  Object.assign(context.agents, { subscribe: () => () => {} });
   Object.assign(context.agents.state, { connected: true, client: context.gateway.snapshot.client });
-  Object.assign(context.sessions, { subscribe: () => () => {}, list: vi.fn(async () => null) });
-  Object.assign(context.config, { subscribe: () => () => {} });
+  Object.assign(context.sessions, { list: vi.fn(async () => null) });
   Object.assign(context, {
     agentIdentity: {
       subscribe: () => () => {},
@@ -120,7 +118,7 @@ async function mount(options: Parameters<typeof createDraftFixture>[0] = {}) {
   const { palette } = await mountPalette(context);
   palette.openPalette();
   await palette.updateComplete;
-  const input = palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")!;
+  const input = paletteInput(palette);
   input.focus();
   const start = () => palette.querySelector<HTMLButtonElement>(".cmd-palette__create")!;
   return {
@@ -163,8 +161,7 @@ describe("command palette paste-only images", () => {
   it("preserves the input and submits text with images in the background", async () => {
     const message = "Describe these images";
     const { palette, input, context, start } = await mount();
-    input.value = message;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    setInputValue(input, message);
     input.setSelectionRange(0, Math.min(5, message.length), "backward");
     const selection = [input.selectionStart, input.selectionEnd];
     expect(paste(input, [image()]).defaultPrevented).toBe(true);
@@ -337,7 +334,7 @@ describe("command palette paste-only images", () => {
     const take = state.captureHandoff();
     palette.openPalette(take);
     await palette.updateComplete;
-    const replacement = palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")!;
+    const replacement = paletteInput(palette);
     replacement.focus();
     await palette.updateComplete;
     expect(take()).toBeUndefined();

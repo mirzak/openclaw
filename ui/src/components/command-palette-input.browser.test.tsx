@@ -1,22 +1,43 @@
 import { createSignal } from "solid-js";
 import type { ComponentProps } from "solid-js";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mountSolid } from "../test-helpers/mount-solid.ts";
 import { flush } from "../test-helpers/solid-settle.ts";
 import "../styles.css";
 import { CommandPaletteInput } from "./command-palette-input.tsx";
 
 const hasBrowserLayout = !navigator.userAgent.toLowerCase().includes("jsdom");
-const onInputRef = () => undefined;
 const nextFrame = () =>
   new Promise<void>((resolve) => {
     requestAnimationFrame(() => resolve());
   });
 
 describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
-  let host: HTMLDivElement | undefined;
+  let host: HTMLDivElement;
   let unmount: (() => void) | undefined;
   let update: ((next: ComponentProps<typeof CommandPaletteInput>) => void) | undefined;
+  const propsFor = (
+    value: string,
+    extra: Partial<ComponentProps<typeof CommandPaletteInput>> = {},
+  ) => ({
+    value,
+    placeholder: "Search or start a task…",
+    onInputRef: () => undefined,
+    onValueChange: () => undefined,
+    ...extra,
+  });
+  const edit = (input: HTMLTextAreaElement, value: string) => {
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+  const expectFades = (entry: Element, top: boolean, bottom: boolean) =>
+    expect(["top", "bottom"].map((edge) => entry.hasAttribute("data-scroll-fade-" + edge))).toEqual(
+      [top, bottom],
+    );
+  beforeEach(() => {
+    host = document.body.appendChild(document.createElement("div"));
+    host.style.cssText = "width: 740px; max-width: 100%;";
+  });
   const renderInput = (props: ComponentProps<typeof CommandPaletteInput>) => {
     if (update) {
       update(props);
@@ -31,28 +52,20 @@ describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
   };
 
   afterEach(() => {
-    if (host) {
-      unmount?.();
-      unmount = undefined;
-      update = undefined;
-      host.remove();
-      host = undefined;
-    }
+    unmount?.();
+    unmount = undefined;
+    update = undefined;
+    host.remove();
     vi.restoreAllMocks();
   });
 
   it("preserves the prompt without remeasuring result navigation and measures again on reconnect", async () => {
-    host = document.body.appendChild(document.createElement("div"));
     // Reconnection must cross a wrapping boundary independently of the
     // runner's viewport and platform font metrics.
     host.style.cssText = "width: 740px; font-family: monospace;";
-    const props = {
-      value: "Keep this prompt and its caret while changing preferences.",
-      placeholder: "Search or start a task…",
-      onInputRef,
-      onValueChange: () => undefined,
+    const props = propsFor("Keep this prompt and its caret while changing preferences.", {
       actions: <button type="button">Settings</button>,
-    };
+    });
     renderInput(props);
     await document.fonts.ready;
     // Initial layout installs ResizeObserver; its first delivery schedules
@@ -90,16 +103,14 @@ describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
   });
 
   it("keeps a scrolled prompt in place through rerenders and resizing until the user edits", async () => {
-    host = document.body.appendChild(document.createElement("div"));
-    host.style.cssText = "width: 740px; max-width: 100%;";
-    const props = {
-      value: Array.from({ length: 12 }, (_, index) => "Prompt line " + (index + 1)).join("\n"),
-      placeholder: "Search or start a task…",
-      onInputRef,
-      onValueChange: (value: string) => {
-        props.value = value;
+    const props = propsFor(
+      Array.from({ length: 12 }, (_, index) => "Prompt line " + (index + 1)).join("\n"),
+      {
+        onValueChange: (value) => {
+          props.value = value;
+        },
       },
-    };
+    );
     renderInput(props);
     const input = host.querySelector("textarea")!;
     const entry = host.querySelector(".cmd-palette__entry")!;
@@ -111,12 +122,9 @@ describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
     const previousScroll = input.scrollTop;
 
     renderInput({ ...props, activeDescendant: "next-result" });
-    await new Promise<void>((resolve) => {
-      requestAnimationFrame(() => resolve());
-    });
+    await nextFrame();
     expect(input.scrollTop).toBe(previousScroll);
-    expect(entry.hasAttribute("data-scroll-fade-top")).toBe(true);
-    expect(entry.hasAttribute("data-scroll-fade-bottom")).toBe(true);
+    expectFades(entry, true, true);
 
     host.style.width = "500px";
     await new Promise<void>((resolve) => {
@@ -132,9 +140,7 @@ describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
     input.value += "\nContinue writing";
     input.dispatchEvent(new Event("input", { bubbles: true }));
     renderInput(props);
-    await new Promise<void>((resolve) => {
-      requestAnimationFrame(() => resolve());
-    });
+    await nextFrame();
     expect(input.scrollTop).toBe(input.scrollHeight - input.clientHeight);
     expect(entry.hasAttribute("data-scroll-fade-bottom")).toBe(false);
 
@@ -143,47 +149,37 @@ describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
     input.setRangeText("Edit the beginning: ", 0, 0, "end");
     input.dispatchEvent(new Event("input", { bubbles: true }));
     renderInput(props);
-    await new Promise<void>((resolve) => {
-      requestAnimationFrame(() => resolve());
-    });
+    await nextFrame();
     expect(input.scrollTop).toBe(0);
   });
 
   it("grows down through three lines, keeps actions fixed and fades clear of the far-right scrollbar", async () => {
-    host = document.body.appendChild(document.createElement("div"));
-    host.style.cssText = "width: 740px; max-width: 100%;";
-    renderInput({
-      value: "One line",
-      placeholder: "Search or start a task…",
-      onInputRef,
-      onValueChange: () => undefined,
-      actions: (
-        <button type="button" class="cmd-palette__create">
-          New session<kbd>Ctrl+Enter</kbd>
-        </button>
-      ),
-    });
+    renderInput(
+      propsFor("One line", {
+        actions: (
+          <button type="button" class="cmd-palette__create">
+            New session<kbd>Ctrl+Enter</kbd>
+          </button>
+        ),
+      }),
+    );
     const input = host.querySelector("textarea")!;
     const entry = host.querySelector<HTMLElement>(".cmd-palette__entry")!;
     const actions = host.querySelector<HTMLElement>(".cmd-palette__input-actions")!;
     const textScroll = host.querySelector<HTMLElement>(".cmd-palette__input-scroll")!;
-    await new Promise<void>((resolve) => {
-      requestAnimationFrame(() => resolve());
-    });
+    await nextFrame();
     input.dispatchEvent(new Event("input", { bubbles: true }));
     const top = input.getBoundingClientRect().top;
     const actionTop = actions.getBoundingClientRect().top;
     const lineHeight = Number.parseFloat(getComputedStyle(input).lineHeight);
     expect(input.clientHeight).toBe(24);
 
-    input.value = "One line\nTwo lines";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    edit(input, "One line\nTwo lines");
     expect(input.clientHeight).toBe(lineHeight * 2);
     expect(input.getBoundingClientRect().top).toBe(top);
     expect(actions.getBoundingClientRect().top).toBe(actionTop);
 
-    input.value = "One line\nTwo lines\nThree lines\nFour lines\nFive lines";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    edit(input, "One line\nTwo lines\nThree lines\nFour lines\nFive lines");
     expect(input.clientHeight).toBe(lineHeight * 3);
     expect(input.scrollHeight).toBeGreaterThan(input.clientHeight);
     expect(getComputedStyle(input).overflowY).toBe("auto");
@@ -203,27 +199,21 @@ describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
     // Autofocus keeps an edited caret visible; explicitly inspect the top edge.
     input.scrollTop = 0;
     input.dispatchEvent(new Event("scroll"));
-    expect(entry.hasAttribute("data-scroll-fade-bottom")).toBe(true);
-    expect(entry.hasAttribute("data-scroll-fade-top")).toBe(false);
+    expectFades(entry, false, true);
 
     input.scrollTop = input.scrollHeight;
     input.dispatchEvent(new Event("scroll"));
-    expect(entry.hasAttribute("data-scroll-fade-top")).toBe(true);
-    expect(entry.hasAttribute("data-scroll-fade-bottom")).toBe(false);
+    expectFades(entry, true, false);
     input.scrollTop = 0;
     input.dispatchEvent(new Event("scroll"));
-    expect(entry.hasAttribute("data-scroll-fade-top")).toBe(false);
-    expect(entry.hasAttribute("data-scroll-fade-bottom")).toBe(true);
+    expectFades(entry, false, true);
 
-    input.value = "A short task";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    edit(input, "A short task");
     expect(input.clientHeight).toBe(24);
-    expect(entry.hasAttribute("data-scroll-fade-top")).toBe(false);
-    expect(entry.hasAttribute("data-scroll-fade-bottom")).toBe(false);
+    expectFades(entry, false, false);
     expect(input.getBoundingClientRect().top).toBe(top);
 
-    input.value = "A wrapping task with enough text to grow after the available width changes.";
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+    edit(input, "A wrapping task with enough text to grow after the available width changes.");
     host.style.width = "320px";
     await vi.waitFor(() => expect(input.clientHeight).toBe(lineHeight * 3));
     expect(actions.getBoundingClientRect().top).toBe(actionTop);

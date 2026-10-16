@@ -6,6 +6,7 @@ import {
 import type { CanvasDocumentViewResult } from "@openclaw/gateway-protocol";
 import { createComponent, createSignal } from "solid-js";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.ts";
 import {
   applicationContext,
   type ApplicationContext,
@@ -126,6 +127,27 @@ function message(
   );
 }
 
+async function loaded(docId = "cv_inline", parent: Element | ShadowRoot = document.body) {
+  const client = { request: vi.fn().mockResolvedValue(documentView) };
+  const view = mount(client, docId, parent);
+  return { client, view, frame: await frameFor(view) };
+}
+
+function proxyReady(frame: HTMLIFrameElement) {
+  message(frame, {
+    method: "ui/notifications/sandbox-proxy-ready",
+    params: { sandboxUrl: frame.src },
+  });
+}
+
+function expectRead(client: { request: ReturnType<typeof vi.fn> }, docId: string) {
+  expect(client.request).toHaveBeenLastCalledWith(
+    "canvas.document.view",
+    { docId },
+    { timeoutMs: 30_000 },
+  );
+}
+
 describe("Canvas widget view", () => {
   afterEach(() => {
     document.body.replaceChildren();
@@ -136,24 +158,13 @@ describe("Canvas widget view", () => {
   });
 
   it("loads authenticated HTML once for concurrent views and waits for the exact isolated proxy", async () => {
-    let resolve!: (value: CanvasDocumentViewResult) => void;
-    const client = {
-      request: vi.fn(
-        () =>
-          new Promise<CanvasDocumentViewResult>((done) => {
-            resolve = done;
-          }),
-      ),
-    };
+    const pending = createDeferred<CanvasDocumentViewResult>();
+    const client = { request: vi.fn(() => pending.promise) };
     const first = mount(client);
     const second = mount(client);
     await expect.poll(() => client.request.mock.calls.length).toBe(1);
-    expect(client.request).toHaveBeenCalledWith(
-      "canvas.document.view",
-      { docId: "cv_inline" },
-      { timeoutMs: 30_000 },
-    );
-    resolve(documentView);
+    expectRead(client, "cv_inline");
+    pending.resolve(documentView);
     const frame = await frameFor(first);
     await frameFor(second);
     const post = vi.spyOn(frame.contentWindow!, "postMessage");
@@ -194,16 +205,11 @@ describe("Canvas widget view", () => {
   it.each(["generation", "client"])(
     "discards an old connection's read when its %s changes",
     async (change) => {
-      let resolveOld!: (value: CanvasDocumentViewResult) => void;
+      const old = createDeferred<CanvasDocumentViewResult>();
       const client = {
         request: vi
           .fn()
-          .mockImplementationOnce(
-            () =>
-              new Promise<CanvasDocumentViewResult>((done) => {
-                resolveOld = done;
-              }),
-          )
+          .mockImplementationOnce(() => old.promise)
           .mockResolvedValue({ ...documentView, html: "<p>New connection</p>" }),
       };
       const view = mount(client);
@@ -219,7 +225,7 @@ describe("Canvas widget view", () => {
         gateways.get(view)!.notify();
       }
       await frameFor(view);
-      resolveOld(documentView);
+      old.resolve(documentView);
       await settle(view);
       expect(view.documentHtml).toBe("<p>New connection</p>");
       expect(client.request).toHaveBeenCalledTimes(change === "generation" ? 2 : 1);
@@ -313,14 +319,9 @@ describe("Canvas widget view", () => {
   });
 
   it("retains rendered content across client replacement, revalidates unchanged bytes, and replaces changed bytes", async () => {
-    const client = { request: vi.fn().mockResolvedValue(documentView) };
-    const view = mount(client);
-    const frame = await frameFor(view);
+    const { client, view, frame } = await loaded();
     const post = vi.spyOn(frame.contentWindow!, "postMessage");
-    message(frame, {
-      method: "ui/notifications/sandbox-proxy-ready",
-      params: { sandboxUrl: frame.src },
-    });
+    proxyReady(frame);
     await settle(view);
     const replacement = { request: vi.fn().mockResolvedValue(documentView) };
     gateways.get(view)!.snapshot.client = replacement;
@@ -334,11 +335,8 @@ describe("Canvas widget view", () => {
     connection(view, "connected");
     await settle(view);
     expect(client.request).toHaveBeenCalledOnce();
-    expect(replacement.request).toHaveBeenCalledExactlyOnceWith(
-      "canvas.document.view",
-      { docId: view.docId },
-      { timeoutMs: 30_000 },
-    );
+    expect(replacement.request).toHaveBeenCalledOnce();
+    expectRead(replacement, view.docId);
     expect(view.querySelector("iframe")).toBe(frame);
     expect(
       post.mock.calls.filter(([data]) => data.method === "ui/notifications/sandbox-resource-ready"),
@@ -375,10 +373,7 @@ describe("Canvas widget view", () => {
     const view = mount(client, "cv_scroll", thread);
     const start = async (frame: HTMLIFrameElement) => {
       const post = vi.spyOn(frame.contentWindow!, "postMessage");
-      message(frame, {
-        method: "ui/notifications/sandbox-proxy-ready",
-        params: { sandboxUrl: frame.src },
-      });
+      proxyReady(frame);
       await settle(view);
       expect(post).toHaveBeenCalledWith(
         { type: "openclaw:widget-board-host", nonce: expect.any(String) },
@@ -561,9 +556,7 @@ describe("Canvas widget view", () => {
   });
 
   it("does not wake the agent for offline or resource-download errors", async () => {
-    const client = { request: vi.fn().mockResolvedValue(documentView) };
-    const view = mount(client, "cv_network_error");
-    const frame = await frameFor(view);
+    const { client, view, frame } = await loaded("cv_network_error");
     message(frame, { type: "openclaw:widget-runtime-error", message: "Failed to fetch" });
     connection(view, "reconnecting");
     message(frame, { type: "openclaw:widget-runtime-error", message: "d3 is not defined" });
@@ -652,9 +645,7 @@ describe("Canvas widget view", () => {
   );
 
   it("ignores stale sessions and malformed errors and omits invalid locations", async () => {
-    const client = { request: vi.fn().mockResolvedValue(documentView) };
-    const view = mount(client, "cv_runtime_invalid");
-    const frame = await frameFor(view);
+    const { client, view, frame } = await loaded("cv_runtime_invalid");
     const report = { type: "openclaw:widget-runtime-error", message: "Missing element" };
     message(frame, { ...report, message: { message: "Invalid" } });
     view.sessionKey = "agent:main:changed";
@@ -700,9 +691,7 @@ describe("Canvas widget view", () => {
     const container = document.createElement("div");
     document.body.append(container);
     const root = container.attachShadow({ mode: "open" });
-    const client = { request: vi.fn().mockResolvedValue(documentView) };
-    const view = mount(client, "cv_theme", root);
-    const frame = await frameFor(view);
+    const { client, view, frame } = await loaded("cv_theme", root);
     const post = vi.spyOn(frame.contentWindow!, "postMessage");
     document.documentElement.dataset.themeMode = "light";
     await expect
@@ -729,14 +718,9 @@ describe("Canvas widget view", () => {
     "client replacement",
     "parking",
   ])("gates the focused private prompt channel on %s", async (change) => {
-    const client = { request: vi.fn().mockResolvedValue(documentView) };
-    const view = mount(client, `cv_prompt_${change}`);
-    const frame = await frameFor(view);
+    const { client, view, frame } = await loaded(`cv_prompt_${change}`);
     const post = vi.spyOn(frame.contentWindow!, "postMessage");
-    message(frame, {
-      method: "ui/notifications/sandbox-proxy-ready",
-      params: { sandboxUrl: frame.src },
-    });
+    proxyReady(frame);
     await Promise.resolve();
     let onMessage!: (event: MessageEvent) => void;
     const postMessage = vi.fn();
@@ -755,33 +739,25 @@ describe("Canvas widget view", () => {
     view.addEventListener(WIDGET_PROMPT_EVENT, received);
     message(frame, { type: "openclaw:widget-prompt-offer" }, [port]);
     expect(postMessage).toHaveBeenCalledWith({ type: "openclaw:widget-prompt-host-ready" });
-    onMessage(
-      new MessageEvent("message", {
-        data: { type: "openclaw:widget-prompt", prompt: "Background" },
-      }),
-    );
+    const prompt = (text: string) =>
+      onMessage(
+        new MessageEvent("message", {
+          data: { type: "openclaw:widget-prompt", prompt: text },
+        }),
+      );
+    prompt("Background");
     expect(received).not.toHaveBeenCalled();
     Object.defineProperty(document, "activeElement", { get: () => frame, configurable: true });
     Object.defineProperty(frame, "checkVisibility", { value: () => true });
     message(frame, { type: "openclaw:widget-prompt", prompt: "Forged window message" });
     expect(received).not.toHaveBeenCalled();
-    onMessage(
-      new MessageEvent("message", {
-        data: { type: "openclaw:widget-prompt", prompt: "Show details" },
-      }),
-    );
+    prompt("Show details");
     expect(received).toHaveBeenCalledOnce();
     expect(client.request).toHaveBeenCalledOnce();
     if (change === "parking") {
-      const prompt = () =>
-        onMessage(
-          new MessageEvent("message", {
-            data: { type: "openclaw:widget-prompt", prompt: "Resume details" },
-          }),
-        );
       const report = { type: "openclaw:widget-runtime-error", message: "Missing details" };
       view.presentationActive = false;
-      prompt();
+      prompt("Resume details");
       message(frame, report);
       expect({
         prompts: received.mock.calls.length,
@@ -795,7 +771,7 @@ describe("Canvas widget view", () => {
       expect(close).not.toHaveBeenCalled();
       view.presentationActive = true;
       await settle(view);
-      prompt();
+      prompt("Resume details");
       expect(received).toHaveBeenCalledTimes(2);
       expect(client.request).toHaveBeenCalledOnce();
       expect(view.querySelector("iframe")).toBe(frame);
@@ -814,40 +790,26 @@ describe("Canvas widget view", () => {
     if (change === "connection recovery" || change === "client replacement") {
       connection(view, "reconnecting");
       await settle(view);
-      const prompt = () =>
-        onMessage(
-          new MessageEvent("message", {
-            data: { type: "openclaw:widget-prompt", prompt: "Resume details" },
-          }),
-        );
-      prompt();
+
+      prompt("Resume details");
       expect(received).toHaveBeenCalledOnce();
       expect(view.querySelector("iframe")).toBe(frame);
-      let revalidate!: (value: CanvasDocumentViewResult) => void;
+      const revalidation = createDeferred<CanvasDocumentViewResult>();
       const currentClient =
         change === "client replacement"
           ? { request: vi.fn().mockResolvedValue(documentView) }
           : client;
-      currentClient.request.mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            revalidate = resolve;
-          }),
-      );
+      currentClient.request.mockImplementationOnce(() => revalidation.promise);
       gateways.get(view)!.snapshot.client = currentClient;
       connection(view, "connected");
       await settle(view);
-      expect(currentClient.request).toHaveBeenLastCalledWith(
-        "canvas.document.view",
-        { docId: view.docId },
-        { timeoutMs: 30_000 },
-      );
-      prompt();
+      expectRead(currentClient, view.docId);
+      prompt("Resume details");
       expect(received).toHaveBeenCalledOnce();
       expect(view.querySelector("iframe")).toBe(frame);
-      revalidate(documentView);
+      revalidation.resolve(documentView);
       await settle(view);
-      prompt();
+      prompt("Resume details");
       expect(received).toHaveBeenCalledTimes(2);
       expect(view.querySelector("iframe")).toBe(frame);
       expect(close).not.toHaveBeenCalled();
@@ -869,11 +831,7 @@ describe("Canvas widget view", () => {
     }
     expect(close).toHaveBeenCalledOnce();
     expect(removeEventListener).toHaveBeenCalledWith("message", onMessage);
-    onMessage(
-      new MessageEvent("message", {
-        data: { type: "openclaw:widget-prompt", prompt: "Stale port" },
-      }),
-    );
+    prompt("Stale port");
     expect(received).toHaveBeenCalledOnce();
     if (change === "strict then scripts") {
       view.allowScripts = true;
