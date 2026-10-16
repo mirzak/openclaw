@@ -22,41 +22,14 @@ const ROOMY_HOST = {
 };
 const throttledGoEnv = { GOMAXPROCS: "2", GOGC: "30", GOMEMLIMIT: "3GiB" };
 type CheckResources = Parameters<typeof applyLocalTsgoPolicy>[2];
-type PolicyCase = [
-  name: string,
-  args: string[],
-  env: NodeJS.ProcessEnv,
-  host: CheckResources,
-  expectedArgs: string[] | undefined,
-  expectedEnv: NodeJS.ProcessEnv,
-];
-
-function expectPolicy(
-  result: ReturnType<typeof applyLocalTsgoPolicy>,
-  args: string[] | undefined,
-  env: NodeJS.ProcessEnv,
-) {
-  if (args) {
-    expect(result.args).toEqual(args);
-  }
-  for (const [key, value] of Object.entries(env)) {
-    expect(result.env[key], key).toBe(value);
-  }
-}
-
-function makeEnv(overrides: Record<string, string | undefined> = {}) {
-  const env: NodeJS.ProcessEnv = {
+function makeEnv(overrides: NodeJS.ProcessEnv = {}) {
+  return {
     ...process.env,
     OPENCLAW_LOCAL_CHECK: "1",
+    OPENCLAW_LOCAL_CHECK_MODE: undefined,
+    GITHUB_ACTIONS: undefined,
     ...overrides,
   };
-  if (!Object.hasOwn(overrides, "OPENCLAW_LOCAL_CHECK_MODE")) {
-    delete env.OPENCLAW_LOCAL_CHECK_MODE;
-  }
-  if (!Object.hasOwn(overrides, "GITHUB_ACTIONS")) {
-    delete env.GITHUB_ACTIONS;
-  }
-  return env;
 }
 
 function makeBoundedOxlintEnv(args: string[], overrides: NodeJS.ProcessEnv = {}) {
@@ -80,20 +53,14 @@ describe("local-check-runtime", () => {
     const localPath = path.resolve(cwd, "node_modules", ".bin", "oxlint");
     const primaryPath = path.join(primaryRoot, "node_modules", ".bin", "oxlint");
 
-    expect(
+    const resolve = (installed: string[]) =>
       resolveRepoToolBinPath("oxlint", {
         cwd,
-        fileExists: (candidate) => candidate === primaryPath,
+        fileExists: (candidate) => installed.includes(candidate),
         resolveCommonDir: () => commonDir,
-      }),
-    ).toBe(primaryPath);
-    expect(
-      resolveRepoToolBinPath("oxlint", {
-        cwd,
-        fileExists: (candidate) => candidate === localPath || candidate === primaryPath,
-        resolveCommonDir: () => commonDir,
-      }),
-    ).toBe(localPath);
+      });
+    expect(resolve([primaryPath])).toBe(primaryPath);
+    expect(resolve([localPath, primaryPath])).toBe(localPath);
   });
 
   it.each([
@@ -147,30 +114,32 @@ describe("local-check-runtime", () => {
     }
   });
 
-  const tsgoCases: PolicyCase[] = [
-    [
-      "profiling without a throttled mode",
+  it("applies tsgo profiling without a throttled mode", () => {
+    const result = applyLocalTsgoPolicy(
       ["-p", "tsconfig.ui.json"],
       { OPENCLAW_TSGO_PPROF_DIR: ".artifacts/profiles" },
       ROOMY_HOST,
-      ["-p", "tsconfig.ui.json", "--declaration", "false", "--pprofDir", ".artifacts/profiles"],
-      { OPENCLAW_LOCAL_CHECK_MODE: undefined, GOMAXPROCS: undefined, GOMEMLIMIT: undefined },
-    ],
-    [
-      "single CPU",
-      [],
-      makeEnv({ OPENCLAW_LOCAL_CHECK_MODE: "throttled" }),
-      { logicalCpuCount: 1, totalMemoryBytes: 16 * GIB },
-      undefined,
-      { GOMAXPROCS: "1" },
-    ],
-  ];
-  it.each(tsgoCases)(
-    "applies tsgo policy for %s",
-    (_name, args, env, host, expectedArgs, expectedEnv) => {
-      expectPolicy(applyLocalTsgoPolicy(args, env, host), expectedArgs, expectedEnv);
-    },
-  );
+    );
+    expect(result.args).toEqual([
+      "-p",
+      "tsconfig.ui.json",
+      "--declaration",
+      "false",
+      "--pprofDir",
+      ".artifacts/profiles",
+    ]);
+    for (const key of ["OPENCLAW_LOCAL_CHECK_MODE", "GOMAXPROCS", "GOMEMLIMIT"]) {
+      expect(result.env[key], key).toBeUndefined();
+    }
+  });
+
+  it("applies tsgo policy for a single CPU", () => {
+    const result = applyLocalTsgoPolicy([], makeEnv({ OPENCLAW_LOCAL_CHECK_MODE: "throttled" }), {
+      logicalCpuCount: 1,
+      totalMemoryBytes: 16 * GIB,
+    });
+    expect(result.env.GOMAXPROCS).toBe("1");
+  });
 
   it("sizes compiler workers from unresolved capacity instead of remaining memory", () => {
     const host = {
@@ -198,71 +167,59 @@ describe("local-check-runtime", () => {
     }
   });
 
-  type BoundedCase = {
-    name: string;
-    args: string[];
-    host?: Partial<CheckResources>;
-    env?: NodeJS.ProcessEnv;
-    threads: "1" | "2";
-    expectedEnv?: NodeJS.ProcessEnv;
-    measured?: boolean;
-    unmeasuredArgs?: string[][];
-  };
-  const boundedCases: BoundedCase[] = [
-    {
-      name: "admitted extensions/tsconfig.json",
-      args: ["--tsconfig", "extensions/tsconfig.json"],
-      host: { memoryCapacityBytes: 15 * GIB, memoryLimitBytes: 14 * GIB },
-      threads: "2",
-      measured: true,
-      expectedEnv: { GOMAXPROCS: "4", GOGC: "100", GOMEMLIMIT: "8GiB" },
-    },
-    {
-      name: "explicit limits and unmeasured configurations",
-      args: ["--tsconfig", "extensions/tsconfig.json", "--threads=1"],
-      env: { GOMAXPROCS: "1", GOGC: "20", GOMEMLIMIT: "2GiB" },
-      expectedEnv: { GOMAXPROCS: "1", GOGC: "20", GOMEMLIMIT: "2GiB" },
-      threads: "1",
-      unmeasuredArgs: [
-        ["--tsconfig", "test/tsconfig/tsconfig.test.root.json"],
-        ["--tsconfig", "extensions/tsconfig.json", "--threads=4"],
-        ["--tsconfig", "extensions/tsconfig.json", "--", "--threads=4"],
-      ],
-    },
-    {
-      name: "extensions/tsconfig.json, null available, bound admission",
-      args: ["--tsconfig", "extensions/tsconfig.json", "extensions/example"],
-      host: { memoryLimitBytes: null },
-      threads: "1",
-    },
-  ];
-  it.each(boundedCases)("applies the bounded CI budget for $name", (row) => {
-    const args = row.args;
-    const inputEnv = makeBoundedOxlintEnv(args, row.env);
-    const host: CheckResources = {
+  const extensions = ["--tsconfig", "extensions/tsconfig.json"];
+  function bounded(
+    args: string[],
+    env: NodeJS.ProcessEnv = {},
+    resources: Partial<CheckResources> = {},
+  ) {
+    const inputEnv = makeBoundedOxlintEnv(args, env);
+    const result = applyLocalOxlintPolicy(args, inputEnv, {
       logicalCpuCount: 4,
       totalMemoryBytes: 16 * GIB,
       memoryCapacityBytes: 16 * GIB,
       memoryLimitBytes: 16 * GIB,
       platform: "linux",
-      ...row.host,
-    };
-    const result = applyLocalOxlintPolicy(args, inputEnv, host);
-    expect(result.env).toMatchObject(row.expectedEnv ?? throttledGoEnv);
-    expect(result.args).toContain(`--threads=${row.threads}`);
-    if (row.measured) {
-      expect(result.args).toContain("--type-aware");
-      expect(inputEnv.GOMEMLIMIT).toBeUndefined();
-    }
-    for (const unmeasured of row.unmeasuredArgs ?? []) {
-      expect(
-        applyLocalOxlintPolicy(unmeasured, makeBoundedOxlintEnv(unmeasured), host).env,
-      ).toMatchObject(throttledGoEnv);
+      ...resources,
+    });
+    return { ...result, inputEnv };
+  }
+
+  it("applies the bounded CI budget for admitted extensions/tsconfig.json", () => {
+    const result = bounded(
+      extensions,
+      {},
+      {
+        memoryCapacityBytes: 15 * GIB,
+        memoryLimitBytes: 14 * GIB,
+      },
+    );
+    expect(result.env).toMatchObject({ GOMAXPROCS: "4", GOGC: "100", GOMEMLIMIT: "8GiB" });
+    expect(result.args).toEqual(expect.arrayContaining(["--threads=2", "--type-aware"]));
+    expect(result.inputEnv.GOMEMLIMIT).toBeUndefined();
+  });
+
+  it("applies explicit limits and throttles unmeasured configurations", () => {
+    const env = { GOMAXPROCS: "1", GOGC: "20", GOMEMLIMIT: "2GiB" };
+    const result = bounded([...extensions, "--threads=1"], env);
+    expect(result.env).toMatchObject(env);
+    expect(result.args).toContain("--threads=1");
+    for (const args of [
+      ["--tsconfig", "test/tsconfig/tsconfig.test.root.json"],
+      [...extensions, "--threads=4"],
+      [...extensions, "--", "--threads=4"],
+    ]) {
+      expect(bounded(args).env).toMatchObject(throttledGoEnv);
     }
   });
 
+  it("throttles bounded CI admission with unknown available memory", () => {
+    const result = bounded([...extensions, "extensions/example"], {}, { memoryLimitBytes: null });
+    expect(result.env).toMatchObject(throttledGoEnv);
+    expect(result.args).toContain("--threads=1");
+  });
+
   it("keeps prep and oxlint resource policies separate", () => {
-    const goEnv = { GOMAXPROCS: undefined, GOGC: undefined, GOMEMLIMIT: undefined };
     const prepGoEnv = { GOMAXPROCS: null, GOGC: null, GOMEMLIMIT: null };
     const lintGoEnv = {
       GOMAXPROCS: String(Math.min(2, Math.max(1, os.availableParallelism()))),
@@ -296,7 +253,9 @@ fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({ step, goEnv, args: 
     const env = makeEnv({
       CAPTURE_PATH: capturePath,
       OPENCLAW_OXLINT_SKIP_PREPARE: undefined,
-      ...goEnv,
+      GOMAXPROCS: undefined,
+      GOGC: undefined,
+      GOMEMLIMIT: undefined,
     });
 
     const result = spawnSync(
@@ -348,63 +307,68 @@ fs.appendFileSync(process.env.CAPTURE_PATH, JSON.stringify({ step, goEnv, args: 
 describe("Tooling bootstrap dependency ownership", () => {
   afterEach(() => vi.unstubAllEnvs());
 
-  function fixture() {
-    vi.stubEnv("PNPM_CONFIG_MODULES_DIR", undefined);
-    vi.stubEnv("pnpm_config_modules_dir", undefined);
-    vi.stubEnv("npm_config_modules_dir", undefined);
-    const root = fs.realpathSync(createTempDir("openclaw-toolchain-ownership-"));
-    const primary = path.join(root, "primary");
-    const checkout = path.join(root, "checkout");
-    fs.mkdirSync(checkout);
-    expect(spawnSync("git", ["init", "--quiet", primary]).status).toBe(0);
-    const gitdir = path.join(primary, ".git", "worktrees", "task");
-    fs.mkdirSync(gitdir, { recursive: true });
-    fs.writeFileSync(path.join(gitdir, "commondir"), "../..\n");
-    fs.writeFileSync(path.join(gitdir, "HEAD"), "ref: refs/heads/main\n");
-    fs.writeFileSync(path.join(gitdir, "gitdir"), `${checkout}/.git\n`);
-    fs.writeFileSync(path.join(checkout, ".git"), `gitdir: ${gitdir}\n`);
-    const modules = path.join(primary, "node_modules");
-    const tsx = path.join(modules, "tsx");
-    fs.mkdirSync(tsx, { recursive: true });
-    fs.writeFileSync(
-      path.join(tsx, "package.json"),
-      JSON.stringify({ name: "tsx", type: "module", exports: { "./esm": "./esm.mjs" } }),
-    );
-    fs.writeFileSync(path.join(tsx, "esm.mjs"), "export {};\n");
-    return { checkout, modules, entry: pathToFileURL(path.join(tsx, "esm.mjs")).href };
-  }
-
-  function nativeFixture() {
-    const root = fs.realpathSync(createTempDir("openclaw-native-toolchain-"));
-    const checkout = path.join(root, "checkout");
-    const lib = path.join(checkout, "scripts", "lib");
-    fs.mkdirSync(lib, { recursive: true });
-    for (const file of [
-      "tsx-cli-shim.mjs",
-      "local-check-runtime.mts",
-      "managed-cleanup-handoff.mts",
+  function fixture(native = false) {
+    for (const key of [
+      "PNPM_CONFIG_MODULES_DIR",
+      "pnpm_config_modules_dir",
+      "npm_config_modules_dir",
     ]) {
-      fs.copyFileSync(path.resolve("scripts", "lib", file), path.join(lib, file));
+      vi.stubEnv(key, undefined);
     }
-    fs.writeFileSync(
-      path.join(checkout, "scripts", "entry.mjs"),
-      'import { runNodeCliShim } from "./lib/tsx-cli-shim.mjs"; await runNodeCliShim(import.meta.url, { implementation: "./implementation.mts" });\n',
-    );
-    fs.writeFileSync(
-      path.join(checkout, "scripts", "implementation.mts"),
-      'import value from "fixture-dependency"; console.log(value);\n',
-    );
+    const root = fs.realpathSync(createTempDir("openclaw-toolchain-ownership-"));
+    const checkout = path.join(root, "checkout");
+    const primary = native ? checkout : path.join(root, "primary");
     const configured = " modules";
-    const modules = path.join(checkout, configured);
-    const dependency = path.join(modules, "fixture-dependency");
+    const modules = path.join(primary, native ? configured : "node_modules");
+    const name = native ? "fixture-dependency" : "tsx";
+    const dependency = path.join(modules, name);
+    fs.mkdirSync(checkout);
     fs.mkdirSync(dependency, { recursive: true });
     fs.writeFileSync(
       path.join(dependency, "package.json"),
-      JSON.stringify({ name: "fixture-dependency", type: "module", exports: "./index.js" }),
+      JSON.stringify({
+        name,
+        type: "module",
+        exports: native ? "./index.js" : { "./esm": "./esm.mjs" },
+      }),
     );
-    fs.writeFileSync(path.join(dependency, "index.js"), 'export default "configured";\n');
+    fs.writeFileSync(
+      path.join(dependency, native ? "index.js" : "esm.mjs"),
+      native ? 'export default "configured";\n' : "export {};\n",
+    );
+    if (native) {
+      const lib = path.join(checkout, "scripts", "lib");
+      fs.mkdirSync(lib, { recursive: true });
+      for (const file of [
+        "tsx-cli-shim.mjs",
+        "local-check-runtime.mts",
+        "managed-cleanup-handoff.mts",
+      ]) {
+        fs.copyFileSync(path.resolve("scripts", "lib", file), path.join(lib, file));
+      }
+      fs.writeFileSync(
+        path.join(checkout, "scripts/entry.mjs"),
+        'import { runNodeCliShim } from "./lib/tsx-cli-shim.mjs"; await runNodeCliShim(import.meta.url, { implementation: "./implementation.mts" });\n',
+      );
+      fs.writeFileSync(
+        path.join(checkout, "scripts/implementation.mts"),
+        'import value from "fixture-dependency"; console.log(value);\n',
+      );
+    } else {
+      expect(spawnSync("git", ["init", "--quiet", primary]).status).toBe(0);
+      const gitdir = path.join(primary, ".git", "worktrees", "task");
+      fs.mkdirSync(gitdir, { recursive: true });
+      for (const [file, contents] of Object.entries({
+        commondir: "../..\n",
+        HEAD: "ref: refs/heads/main\n",
+        gitdir: `${checkout}/.git\n`,
+      })) {
+        fs.writeFileSync(path.join(gitdir, file), contents);
+      }
+      fs.writeFileSync(path.join(checkout, ".git"), `gitdir: ${gitdir}\n`);
+    }
     const run = (overrides: NodeJS.ProcessEnv) =>
-      spawnSync(process.execPath, [path.join(checkout, "scripts", "entry.mjs")], {
+      spawnSync(process.execPath, [path.join(checkout, "scripts/entry.mjs")], {
         cwd: root,
         encoding: "utf8",
         timeout: 10_000,
@@ -416,13 +380,14 @@ describe("Tooling bootstrap dependency ownership", () => {
           ...overrides,
         },
       });
-    return { checkout, modules, configured, run };
+    const entry = pathToFileURL(path.join(dependency, "esm.mjs")).href;
+    return { checkout, modules, configured, run, entry };
   }
 
   it.each(["PNPM_CONFIG_MODULES_DIR"])(
     "loads native child packages without TSX through %s, relative to the shim checkout",
     (key) => {
-      const { checkout, modules, configured, run } = nativeFixture();
+      const { checkout, modules, configured, run } = fixture(true);
       const result = run({ [key]: configured });
       expect(result.status, result.stderr).toBe(0);
       expect(result.stdout.trim()).toBe("configured");
@@ -432,7 +397,7 @@ describe("Tooling bootstrap dependency ownership", () => {
   );
 
   it.each(["directory", "link"])("keeps native child dependencies in the owned %s", (kind) => {
-    const { checkout, modules, configured, run } = nativeFixture();
+    const { checkout, modules, configured, run } = fixture(true);
     const owned = path.join(checkout, "owned");
     fs.cpSync(modules, owned, { recursive: true });
     fs.writeFileSync(
@@ -456,7 +421,7 @@ describe("Tooling bootstrap dependency ownership", () => {
   it.each([false, true])(
     "preserves native empty primary alias with npm fallback=%s",
     (fallback) => {
-      const { checkout, configured, run } = nativeFixture();
+      const { checkout, configured, run } = fixture(true);
       const result = run({
         PNPM_CONFIG_MODULES_DIR: "",
         pnpm_config_modules_dir: configured,
