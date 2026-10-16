@@ -23,50 +23,15 @@ const auditMaintenance = vi.hoisted(() => ({
   gate: undefined as { entered: () => void; release: Promise<void> } | undefined,
 }));
 
-it("joins managed reload acquisition during Gateway close", async () => {
-  const fixture = await createGatewayMetadataCloseFixture("managed-model-close");
-  process.env.OPENCLAW_TEST_MINIMAL_GATEWAY = "0";
-  fixture.config.gateway = { reload: { mode: "hybrid" } };
-  fixture.config.agents = {
-    defaults: { workspace: fixture.state.workspaceDir, model: `${fixture.pluginId}/before` },
-    entries: { main: { workspace: fixture.state.workspaceDir } },
-  };
-  const entered = createDeferredCore();
-  const cancelled = createDeferredCore();
-  const finishAcquisition = createDeferredCore();
-  const escape = createDeferredCore();
-  const reloaderStopEntered = createDeferredCore();
-  let armed = false;
-  let acquisitionSignal: AbortSignal | undefined;
-  let acquisitionFinished = false;
-  let closeFinished = false;
-  let closing: Promise<void> | undefined;
-  const missingModelChunk = vi.fn(() => {
-    throw Object.assign(new Error("rotated model-runtime chunk"), {
-      code: "ERR_MODULE_NOT_FOUND",
-    });
-  });
-  const restorers: Array<() => void> = [];
-  const bridgeKey = `__managed_model_close_${path.basename(fixture.state.root)}`;
-  Object.defineProperty(globalThis, bridgeKey, {
-    configurable: true,
-    value: async (signal: AbortSignal) => {
-      if (!armed) {
-        return;
-      }
-      acquisitionSignal = signal;
-      const onAbort = () => cancelled.resolve();
-      signal.addEventListener("abort", onAbort, { once: true });
-      entered.resolve();
-      try {
-        await Promise.race([cancelled.promise, escape.promise]);
-        await finishAcquisition.promise;
-      } finally {
-        signal.removeEventListener("abort", onAbort);
-        acquisitionFinished = true;
-      }
-    },
-  });
+type Fixture = Awaited<ReturnType<typeof createGatewayMetadataCloseFixture>>;
+
+async function writeCatalog(
+  fixture: Fixture,
+  bridgeKey: string,
+  models: string[],
+  phase = "static catalog",
+) {
+  const invoke = `await globalThis[${JSON.stringify(bridgeKey)}](ctx.signal);`;
   await fs.writeFile(
     path.join(fixture.rootDir, "openclaw.plugin.json"),
     JSON.stringify({
@@ -78,15 +43,81 @@ it("joins managed reload acquisition during Gateway close", async () => {
   );
   await fs.writeFile(
     path.join(fixture.rootDir, "catalog.cjs"),
-    `module.exports = { id: ${JSON.stringify(fixture.pluginId)}, label: "Reload acquisition fixture", auth: [],
+    `module.exports = { id: ${JSON.stringify(fixture.pluginId)}, label: "Acquisition fixture", auth: [],
       staticCatalog: { async run(ctx) {
-        await globalThis[${JSON.stringify(bridgeKey)}](ctx.signal);
+        ${phase === "static catalog" ? invoke : ""}
         return { provider: { api: "openai-completions", baseUrl: "https://fixture.invalid/v1",
-          models: ["before", "after"].map(id => ({ id, name: id, reasoning: false, input: ["text"],
+          models: ${JSON.stringify(models)}.map(id => ({ id, name: id, reasoning: false, input: ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024 })) } };
-      } }
+      } },
+      ${phase === "synthetic auth" ? `async prepareSyntheticAuth(ctx) { ${invoke} return { apiKey: "synthetic-fixture-key" }; },` : ""}
     };`,
   );
+}
+
+function beforeCompletion(entered: Promise<unknown>, completing: Promise<unknown>) {
+  return Promise.race([
+    entered,
+    completing.then(() => {
+      throw new Error("Operation completed before entering its lifecycle gate");
+    }),
+  ]);
+}
+
+function holdAcquisition(accept: () => boolean, start = () => async () => {}) {
+  const held = {
+    entered: createDeferredCore(),
+    release: createDeferredCore(),
+    finish: createDeferredCore(),
+    signal: undefined as AbortSignal | undefined,
+    joined: false,
+    async run(signal: AbortSignal | undefined) {
+      if (!accept()) {
+        return;
+      }
+      held.signal = signal;
+      const cleanup = start();
+      const cancel = () => held.release.resolve();
+      signal?.addEventListener("abort", cancel, { once: true });
+      held.entered.resolve();
+      try {
+        await held.release.promise;
+        await held.finish.promise;
+      } finally {
+        signal?.removeEventListener("abort", cancel);
+        await cleanup();
+        held.joined = true;
+      }
+    },
+  };
+  return held;
+}
+
+it("joins managed reload acquisition during Gateway close", async () => {
+  const fixture = await createGatewayMetadataCloseFixture("managed-model-close");
+  process.env.OPENCLAW_TEST_MINIMAL_GATEWAY = "0";
+  fixture.config.gateway = { reload: { mode: "hybrid" } };
+  fixture.config.agents = {
+    defaults: { workspace: fixture.state.workspaceDir, model: `${fixture.pluginId}/before` },
+    entries: { main: { workspace: fixture.state.workspaceDir } },
+  };
+  const reloaderStopEntered = createDeferredCore();
+  let armed = false;
+  const acquisition = holdAcquisition(() => armed);
+  let closeFinished = false;
+  let closing: Promise<void> | undefined;
+  const missingModelChunk = vi.fn(() => {
+    throw Object.assign(new Error("rotated model-runtime chunk"), {
+      code: "ERR_MODULE_NOT_FOUND",
+    });
+  });
+  let restoreStop = () => {};
+  const bridgeKey = `__managed_model_close_${path.basename(fixture.state.root)}`;
+  Object.defineProperty(globalThis, bridgeKey, {
+    configurable: true,
+    value: acquisition.run,
+  });
+  await writeCatalog(fixture, bridgeKey, ["before", "after"]);
   try {
     const port = await fixture.reservePort();
     const server = await fixture.start(port);
@@ -97,7 +128,7 @@ it("joins managed reload acquisition during Gateway close", async () => {
       reloaderStopEntered.resolve();
       return stopReloader();
     });
-    restorers.push(() => observedStop.mockRestore());
+    restoreStop = () => observedStop.mockRestore();
     const snapshot = await readConfigFileSnapshot();
     armed = true;
     await fixture.state.writeConfig({
@@ -110,8 +141,8 @@ it("joins managed reload acquisition during Gateway close", async () => {
         },
       },
     });
-    await entered.promise;
-    expect(acquisitionSignal?.aborted).toBe(false);
+    await acquisition.entered.promise;
+    expect(acquisition.signal?.aborted).toBe(false);
     vi.doMock("../agents/prepared-model-runtime.js", missingModelChunk);
     await expect(import("../agents/prepared-model-runtime.js")).rejects.toThrow();
     expect(missingModelChunk).toHaveBeenCalledOnce();
@@ -120,32 +151,26 @@ it("joins managed reload acquisition during Gateway close", async () => {
       closeFinished = true;
     });
     void closing.catch(() => {});
-    await Promise.race([
-      reloaderStopEntered.promise,
-      closing.then(() => {
-        throw new Error("Gateway close did not stop its reloader");
-      }),
-    ]);
-    expect(acquisitionSignal?.aborted).toBe(true);
+    await beforeCompletion(reloaderStopEntered.promise, closing);
+    expect(acquisition.signal?.aborted).toBe(true);
     expect(() => refreshPreparedModelRuntimeSnapshots(snapshot.sourceConfig)).toThrow(/shutdown/);
-    expect(acquisitionFinished).toBe(false);
-    expect(closeFinished).toBe(false);
-    escape.resolve();
-    finishAcquisition.resolve();
+    expect([acquisition.joined, closeFinished]).toEqual([false, false]);
+    acquisition.release.resolve();
+    acquisition.finish.resolve();
     await closing;
-    expect(acquisitionFinished).toBe(true);
+    expect(acquisition.joined).toBe(true);
     expect(missingModelChunk).not.toHaveBeenCalled();
     armed = false;
   } finally {
     armed = false;
-    escape.resolve();
-    finishAcquisition.resolve();
+    acquisition.release.resolve();
+    acquisition.finish.resolve();
     await Promise.allSettled([closing]);
     vi.doUnmock("../agents/prepared-model-runtime.js");
     try {
       await fixture.cleanup();
     } finally {
-      restorers.toReversed().forEach((restore) => restore());
+      restoreStop();
       Reflect.deleteProperty(globalThis, bridgeKey);
     }
   }
@@ -175,10 +200,7 @@ it.each(["static catalog", "synthetic auth"] as const)(
   "Gateway shutdown joins degraded %s acquisition and registered plugin cleanup outcomes",
   async (phase) => {
     const fixture = await createGatewayMetadataCloseFixture("degraded-model-close");
-    const entered = createDeferredCore();
-    const release = createDeferredCore();
     const closingEntered = createDeferredCore();
-    const finishAcquisition = createDeferredCore();
     const cleanupEntered = createDeferredCore();
     const finishCleanup = createDeferredCore();
     const cleanupFailure =
@@ -187,63 +209,30 @@ it.each(["static catalog", "synthetic auth"] as const)(
     let closeFinished = false;
     const workers: Worker[] = [];
     const timers = new Set<ReturnType<typeof setInterval>>();
-    let acquisitionSignal: AbortSignal | undefined;
     let acquisitions = 0;
-    let joined = false;
     let completePublications = 0;
     const bridgeKey = `__degraded_model_close_${path.basename(fixture.state.root)}`;
-    const acquire = async (signal: AbortSignal | undefined) => {
-      if (++acquisitions !== 2) {
-        return;
-      }
-      acquisitionSignal = signal;
-      const worker = new Worker("setInterval(() => {}, 1000)", { eval: true });
-      workers.push(worker);
-      const timer = setInterval(() => {}, 1000);
-      timers.add(timer);
-      const cancel = () => release.resolve();
-      signal?.addEventListener("abort", cancel, { once: true });
-      entered.resolve();
-      try {
-        await release.promise;
-        await finishAcquisition.promise;
-      } finally {
-        signal?.removeEventListener("abort", cancel);
-        clearInterval(timer);
-        timers.delete(timer);
-        await worker.terminate();
-        joined = true;
-      }
-      // A cooperative hook may return after abort; the host must still reject its stale facts.
-    };
-    Object.defineProperty(globalThis, bridgeKey, { configurable: true, value: acquire });
-    const provider = fixture.pluginId;
-    await fs.writeFile(
-      path.join(fixture.rootDir, "openclaw.plugin.json"),
-      JSON.stringify({
-        id: provider,
-        providers: [provider],
-        providerCatalogEntry: "./catalog.cjs",
-        configSchema: { type: "object", properties: {} },
-      }),
+    const acquisition = holdAcquisition(
+      () => ++acquisitions === 2,
+      () => {
+        const worker = new Worker("setInterval(() => {}, 1000)", { eval: true });
+        workers.push(worker);
+        const timer = setInterval(() => {}, 1000);
+        timers.add(timer);
+        return async () => {
+          clearInterval(timer);
+          timers.delete(timer);
+          await worker.terminate();
+        };
+      },
     );
-    await fs.writeFile(
-      path.join(fixture.rootDir, "catalog.cjs"),
-      `module.exports = { id: ${JSON.stringify(provider)}, label: "Acquisition fixture", auth: [],
-        staticCatalog: { async run(ctx) {
-          ${phase === "static catalog" ? `await globalThis[${JSON.stringify(bridgeKey)}](ctx.signal);` : ""}
-          return { provider: { api: "openai-completions", baseUrl: "https://fixture.invalid/v1",
-            models: [{ id: "model", name: "Fixture", reasoning: false, input: ["text"],
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024 }] } };
-        } },
-        ${phase === "synthetic auth" ? `async prepareSyntheticAuth(ctx) { await globalThis[${JSON.stringify(bridgeKey)}](ctx.signal); return { apiKey: "synthetic-fixture-key" }; },` : ""}
-      };`,
-    );
+    Object.defineProperty(globalThis, bridgeKey, { configurable: true, value: acquisition.run });
+    await writeCatalog(fixture, bridgeKey, ["model"], phase);
     fixture.config.agents = {
       ownership: "explicit",
       defaults: {
         workspace: fixture.state.workspaceDir,
-        model: `${provider}/model`,
+        model: `${fixture.pluginId}/model`,
         heartbeat: { agentId: "main" },
         systemAgent: { agentId: "main" },
       },
@@ -268,14 +257,13 @@ it.each(["static catalog", "synthetic auth"] as const)(
     try {
       const port = await fixture.reservePort();
       const server = await fixture.start(port);
-      const metadata = fixture.kernels.get(port)?.getPluginMetadataSnapshot();
-      expect(metadata).toBeDefined();
-      const callback = fixture.loadCallback(metadata!);
-      const callbackOwner = getPluginValueInstance(callback);
-      expect(callbackOwner).toBeDefined();
-      callbackOwner!.lifecycle.onDispose(async () => {
+      const callback = fixture.loadCallback(
+        fixture.kernels.get(port)!.getPluginMetadataSnapshot()!,
+      );
+      const lifecycle = getPluginValueInstance(callback)!.lifecycle;
+      lifecycle.onDispose(async () => {
         cleanupEntered.resolve();
-        expect(joined).toBe(true);
+        expect(acquisition.joined).toBe(true);
         await finishCleanup.promise;
         cleanupFinished = true;
         if (cleanupFailure) {
@@ -287,12 +275,7 @@ it.each(["static catalog", "synthetic auth"] as const)(
       const scheduledTimeouts = vi.spyOn(globalThis, "setTimeout");
       const clearedTimeouts = vi.spyOn(globalThis, "clearTimeout");
       publication = publishConfiguredModelRuntimeSnapshots({ cfg: fixture.config });
-      await Promise.race([
-        entered.promise,
-        publication.then(() => {
-          throw new Error("Startup bypassed held provider acquisition");
-        }),
-      ]);
+      await beforeCompletion(acquisition.entered.promise, publication);
       await vi.advanceTimersByTimeAsync(120_000);
       await publication;
       expect(getPreparedModelRuntimeStartupStatus()).toMatchObject({
@@ -317,21 +300,14 @@ it.each(["static catalog", "synthetic auth"] as const)(
       void closing.catch(() => {});
       await closingEntered.promise;
       await nextTurn();
-      expect(acquisitionSignal?.aborted).toBe(true);
-      expect(joined).toBe(false);
-      expect(callbackOwner!.lifecycle.signal.aborted).toBe(false);
-      expect(closeFinished).toBe(false);
-      finishAcquisition.resolve();
-      await Promise.race([
-        cleanupEntered.promise,
-        closing.then(() => {
-          throw new Error("Gateway close bypassed registered plugin cleanup");
-        }),
-      ]);
+      expect(acquisition.signal?.aborted).toBe(true);
+      expect([acquisition.joined, closeFinished]).toEqual([false, false]);
+      expect(lifecycle.signal.aborted).toBe(false);
+      acquisition.finish.resolve();
+      await beforeCompletion(cleanupEntered.promise, closing);
       await nextTurn();
-      expect(callbackOwner!.lifecycle.signal.aborted).toBe(true);
-      expect(cleanupFinished).toBe(false);
-      expect(closeFinished).toBe(false);
+      expect(lifecycle.signal.aborted).toBe(true);
+      expect([cleanupFinished, closeFinished]).toEqual([false, false]);
       finishCleanup.resolve();
       await closing;
       if (cleanupFailure) {
@@ -344,10 +320,10 @@ it.each(["static catalog", "synthetic auth"] as const)(
       expect(process.listenerCount(fixture.event)).toBe(fixture.listeners);
       expect(() => callback()).toThrow(/retir|disabled|reloaded/);
       expect(performance.now() - startedAt).toBeLessThan(GATEWAY_SHUTDOWN_TIMEOUT_MS);
-      expect(joined).toBe(true);
+      expect(acquisition.joined).toBe(true);
       expect(timers.size).toBe(0);
       expect(workers.every((worker) => worker.threadId === -1)).toBe(true);
-      expect(getEventListeners(acquisitionSignal!, "abort")).toHaveLength(0);
+      expect(getEventListeners(acquisition.signal!, "abort")).toHaveLength(0);
       expect(getPreparedModelCatalogWorkerPoolSnapshot()).toMatchObject({
         workers: 0,
         activeTasks: 0,
@@ -358,8 +334,8 @@ it.each(["static catalog", "synthetic auth"] as const)(
       await expect(fetch(`http://127.0.0.1:${port}/readyz`)).rejects.toThrow();
     } finally {
       vi.useRealTimers();
-      release.resolve();
-      finishAcquisition.resolve();
+      acquisition.release.resolve();
+      acquisition.finish.resolve();
       finishCleanup.resolve();
       await Promise.allSettled([publication, closing]);
       await Promise.all(
@@ -400,12 +376,7 @@ it("joins initial audit maintenance before metadata fixture callers replace time
       returned = true;
       return server;
     });
-    await Promise.race([
-      Promise.all([entered.promise, gatewayReady.promise]),
-      starting.then(() => {
-        throw new Error("Gateway fixture returned before audit maintenance readiness");
-      }),
-    ]);
+    await beforeCompletion(Promise.all([entered.promise, gatewayReady.promise]), starting);
     await nextTurn();
     expect(returned).toBe(false);
     release.resolve();

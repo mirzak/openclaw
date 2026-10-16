@@ -26,9 +26,29 @@ import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { getFreePort } from "../test-utils/ports.js";
 import { createGatewayMemoryCloseRegistryFactory } from "./server-close.memory.test-support.js";
-import { createGatewayKernel } from "./server-kernel.js";
+import type { createGatewayKernel } from "./server-kernel.js";
 import type { GatewayServer } from "./server-public.js";
 import { startGatewayServerCore } from "./server-start.js";
+
+type Kernel = Awaited<ReturnType<typeof createGatewayKernel>>;
+type Fixture = Awaited<ReturnType<typeof createFixture>>;
+async function openManager(fixture: Fixture, memory: ReturnType<Fixture["registry"]>) {
+  const result = await memory.runtime.getMemorySearchManager({
+    cfg: fixture.config,
+    agentId: "main",
+  });
+  assert(result.manager, result.error ?? "Memory manager unavailable");
+  await result.manager.probeEmbeddingAvailability();
+  return result.manager;
+}
+const contextAborted = (kernel: Kernel) =>
+  getGatewayContextLifetime(kernel.resolvePluginGatewayContext).signal.aborted;
+const beforeSettlement = (
+  gate: Promise<void>,
+  settlement: Promise<unknown>,
+  message: string,
+  signal: AbortSignal,
+) => withinTest(awaitGateBeforeSettlement(gate, settlement, message), signal);
 
 async function createFixture(label: string) {
   const original = captureActivePluginRegistrySnapshot();
@@ -72,10 +92,7 @@ async function createFixture(label: string) {
     state,
     config,
     registry,
-    async start(
-      memory: ReturnType<typeof registry>,
-      onKernel?: (kernel: Awaited<ReturnType<typeof createGatewayKernel>>) => void,
-    ) {
+    async start(memory: ReturnType<typeof registry>) {
       const port = await getFreePort();
       const auth = { mode: "token" as const, token: "memory-close-token" };
       await state.writeConfig({
@@ -88,15 +105,9 @@ async function createFixture(label: string) {
         },
       });
       setActivePluginRegistry(memory.registry);
-      const create = createGatewayKernel;
-      const factory = vi
-        .spyOn(await import("./server-kernel.js"), "createGatewayKernel")
-        .mockImplementation(async (...args) => {
-          const kernel = await create(...args);
-          onKernel?.(kernel);
-          return kernel;
-        });
+      const factory = vi.spyOn(await import("./server-kernel.js"), "createGatewayKernel");
       let server: GatewayServer;
+      let kernel: Kernel;
       try {
         server = await startGatewayServerCore(port, {
           auth,
@@ -105,11 +116,14 @@ async function createFixture(label: string) {
           sidecarStartup: "defer",
         });
         servers.push(server);
+        const created = await factory.mock.results[0]?.value;
+        assert(created);
+        kernel = created;
       } finally {
         factory.mockRestore();
       }
       await server.startupSettled;
-      return server;
+      return { server, kernel };
     },
     async cleanup() {
       for (const server of servers.toReversed()) {
@@ -141,18 +155,13 @@ it("joins accepted Memory sync through Gateway close before its first publicatio
       path.join(fixture.state.workspaceDir, "memory", "shutdown.md"),
       "# Accepted shutdown memory\nKeep the synthetic blue release preference.\n",
     );
-    server = await fixture.start(memory, (kernel) => {
-      kernel.scheduler.signal.addEventListener("abort", () => closePreludeEntered.resolve(), {
-        once: true,
-      });
+    const started = await fixture.start(memory);
+    server = started.server;
+    started.kernel.scheduler.signal.addEventListener("abort", () => closePreludeEntered.resolve(), {
+      once: true,
     });
-    const result = await memory.runtime.getMemorySearchManager({
-      cfg: fixture.config,
-      agentId: "main",
-    });
-    const manager = result.manager;
-    assert(manager?.sync && manager.close, result.error ?? "Memory manager unavailable");
-    await manager.probeEmbeddingAvailability();
+    const manager = await openManager(fixture, memory);
+    assert(manager.sync && manager.close);
     const options = { agentId: "main", env: fixture.state.env };
     const agentPath = resolveOpenClawAgentSqlitePath(options);
     const requests = () => messages.mock.calls.map(([request]) => request);
@@ -188,21 +197,17 @@ it("joins accepted Memory sync through Gateway close before its first publicatio
       },
     });
     void syncing.catch(() => {});
-    await withinTest(
-      awaitGateBeforeSettlement(
-        embeddingEntered.promise,
-        syncing,
-        "Memory sync settled before its accepted embedding work",
-      ),
+    await beforeSettlement(
+      embeddingEntered.promise,
+      syncing,
+      "Memory sync settled before its accepted embedding work",
       signal,
     );
     assert(closing, "Memory sync did not report progress before embedding");
-    await withinTest(
-      awaitGateBeforeSettlement(
-        closePreludeEntered.promise,
-        closing,
-        "Gateway closed without beginning its close prelude",
-      ),
+    await beforeSettlement(
+      closePreludeEntered.promise,
+      closing,
+      "Gateway closed without beginning its close prelude",
       signal,
     );
     expect(readLeases()).toEqual(acceptedLeases);
@@ -214,19 +219,14 @@ it("joins accepted Memory sync through Gateway close before its first publicatio
     const stored = new DatabaseSync(agentPath, { readOnly: true });
     const leases = new DatabaseSync(shared.path, { readOnly: true });
     try {
-      expect(
-        stored
-          .prepare("SELECT text FROM memory_index_chunks WHERE path = ?")
-          .all("memory/shutdown.md"),
-      ).toEqual([{ text: expect.stringContaining("Keep the synthetic blue release preference.") }]);
-      expect(
-        stored.prepare("SELECT count(*) AS count FROM memory_embedding_cache").get(),
-      ).toMatchObject({
-        count: 1,
-      });
-      expect(
-        leases.prepare("SELECT lease_id FROM agent_database_leases WHERE path = ?").all(agentPath),
-      ).toEqual([]);
+      const chunks = stored.prepare("SELECT text FROM memory_index_chunks WHERE path = ?");
+      const cached = stored.prepare("SELECT count(*) AS count FROM memory_embedding_cache");
+      const live = leases.prepare("SELECT lease_id FROM agent_database_leases WHERE path = ?");
+      expect(chunks.all("memory/shutdown.md")).toEqual([
+        { text: expect.stringContaining("Keep the synthetic blue release preference.") },
+      ]);
+      expect(cached.get()).toMatchObject({ count: 1 });
+      expect(live.all(agentPath)).toEqual([]);
     } finally {
       stored.close();
       leases.close();
@@ -245,8 +245,8 @@ it("drains memory before stalled connection cleanup while preserving terminal cl
   signal,
 }) => {
   const fixture = await createFixture("gateway-memory-close-failure");
-  const kernels: Awaited<ReturnType<typeof createGatewayKernel>>[] = [];
-  const servers: GatewayServer[] = [];
+  let kernel: Kernel;
+  let server: GatewayServer;
   let refuse = true;
   const memoryFailure = new Error("synthetic memory close refused");
   const completed: string[] = [];
@@ -254,9 +254,7 @@ it("drains memory before stalled connection cleanup while preserving terminal cl
   const releaseConnectionWork = createDeferredCore();
   let connectionWork: Promise<void> | undefined;
   const firstClose = vi.fn(async () => {
-    expect(getGatewayContextLifetime(kernels[0]!.resolvePluginGatewayContext).signal.aborted).toBe(
-      false,
-    );
+    expect(contextAborted(kernel)).toBe(false);
     memoryCloseStarted.resolve();
     if (refuse) {
       throw memoryFailure;
@@ -265,42 +263,25 @@ it("drains memory before stalled connection cleanup while preserving terminal cl
   });
   const first = fixture.registry(firstClose);
   try {
-    servers.push(
-      await fixture.start(first, (kernel) => {
-        kernels.push(kernel);
-      }),
-    );
-    expect(kernels[0]!.pluginRuntime.registry).toBe(first.registry);
-    const one = await first.runtime.getMemorySearchManager({
-      cfg: fixture.config,
-      agentId: "main",
-    });
-    assert(one.manager, one.error ?? "First memory manager unavailable");
-    await one.manager.probeEmbeddingAvailability();
+    ({ server, kernel } = await fixture.start(first));
+    expect(kernel.pluginRuntime.registry).toBe(first.registry);
+    await openManager(fixture, first);
     const warning = new Error("synthetic earlier shutdown warning");
-    const firstKernel = kernels[0];
-    assert(firstKernel);
-    const registryClose = vi.spyOn(firstKernel.pluginRuntime, "close");
+    const registryClose = vi.spyOn(kernel.pluginRuntime, "close");
     setActivePluginRegistry(first.registry);
-    vi.spyOn(firstKernel.terminalSessions, "disposeAll").mockImplementationOnce(() => {
+    vi.spyOn(kernel.terminalSessions, "disposeAll").mockImplementationOnce(() => {
       throw warning;
     });
-    connectionWork = firstKernel.connectionWork.track(() => releaseConnectionWork.promise);
-    const closing = servers[0]!
-      .close({ reason: "memory close proof" })
-      .catch((error: unknown) => error);
-    await withinTest(
-      awaitGateBeforeSettlement(
-        memoryCloseStarted.promise,
-        closing,
-        "Gateway retired before memory drainage began",
-      ),
+    connectionWork = kernel.connectionWork.track(() => releaseConnectionWork.promise);
+    const closing = server.close({ reason: "memory close proof" }).catch((error: unknown) => error);
+    await beforeSettlement(
+      memoryCloseStarted.promise,
+      closing,
+      "Gateway retired before memory drainage began",
       signal,
     );
     expect(first.instance.lifecycle.signal.aborted).toBe(false);
-    expect(getGatewayContextLifetime(firstKernel.resolvePluginGatewayContext).signal.aborted).toBe(
-      false,
-    );
+    expect(contextAborted(kernel)).toBe(false);
     expect(registryClose).not.toHaveBeenCalled();
     releaseConnectionWork.resolve();
     const failure = await closing;
@@ -312,17 +293,13 @@ it("drains memory before stalled connection cleanup while preserving terminal cl
     expect(registryClose).toHaveBeenCalledOnce();
     expect(registryResult?.memoryErrors).toContain(memoryFailure);
     expect(first.instance.lifecycle.signal.aborted).toBe(true);
-    expect(getGatewayContextLifetime(firstKernel.resolvePluginGatewayContext).signal.aborted).toBe(
-      true,
-    );
-    expect(() => firstKernel.pluginRuntime.publish(first.registry)).toThrow();
+    expect(contextAborted(kernel)).toBe(true);
+    expect(() => kernel.pluginRuntime.publish(first.registry)).toThrow();
     expect(completed).toEqual([]);
-    await expect(servers[0]!.close({ reason: "warning failure stays terminal" })).rejects.toBe(
-      failure,
-    );
+    await expect(server.close({ reason: "warning failure stays terminal" })).rejects.toBe(failure);
     expect(firstClose).toHaveBeenCalledTimes(failedAttempts);
     expect(getGatewayPluginMetadataSnapshot()).toBeUndefined();
-    await expect(servers[0]!.close({ reason: "already closed" })).rejects.toBe(failure);
+    await expect(server.close({ reason: "already closed" })).rejects.toBe(failure);
     expect(firstClose).toHaveBeenCalledTimes(failedAttempts);
     expect(registryClose).toHaveBeenCalledOnce();
   } finally {
@@ -340,12 +317,7 @@ it("closes one managed memory runtime exactly once across repeated owner close c
   setActivePluginRegistry(memory.registry);
   const owner = createPluginRegistryOwner(memory.registry);
   try {
-    const result = await memory.runtime.getMemorySearchManager({
-      cfg: fixture.config,
-      agentId: "main",
-    });
-    assert(result.manager, result.error ?? "Shared memory manager unavailable");
-    await result.manager.probeEmbeddingAvailability();
+    await openManager(fixture, memory);
     const preparation = owner.prepareClose();
     expect(owner.prepareClose()).toBe(preparation);
     await preparation;
