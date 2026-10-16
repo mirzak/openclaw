@@ -659,13 +659,6 @@ const testing = {
   runSweeperTickForTests: subagentSweeper.runTick,
 } as const;
 
-async function addSubagentRunForTests(entry: SubagentRunRecord) {
-  await mutateSubagentRuns([entry.runId], () => ({
-    value: undefined,
-    postimages: new Map([[entry.runId, entry]]),
-  }));
-}
-
 export const finalizeInterruptedSubagentRun = completionRuntime.finalizeInterruptedSubagentRun;
 export const markSubagentRunTerminated = subagentRunManager.markSubagentRunTerminated;
 export const cancelSubagentRequesterSettleWake =
@@ -723,8 +716,6 @@ export const adoptSubagentRunForRequesterTurn =
 const SUBAGENT_REGISTRY_TEST_HANDLE = Symbol.for("openclaw.subagentRegistryTestApi");
 if (process.env.VITEST || process.env.NODE_ENV === "test") {
   (globalThis as Record<PropertyKey, unknown>)[SUBAGENT_REGISTRY_TEST_HANDLE] = {
-    addSubagentRunForTests,
-    finalizeInterruptedSubagentRun: completionRuntime.finalizeInterruptedSubagentRun,
     releaseSubagentRun: subagentRunManager.releaseSubagentRun,
     resetSubagentRegistryForTests,
     testing,
