@@ -171,14 +171,15 @@ it("uses display deltas independently of cumulative raw assistant snapshots", as
   const runId = "display-deltas";
   harness.registerRun(runId, "agent:main:display-deltas");
   for (const [index, delta] of ["Hello", " world"].entries()) {
-    await harness.handler({
+    const event: AgentEventRuntimePayload = {
       runId,
       seq: index + 1,
       ts: Date.now(),
       stream: "assistant",
       data: { itemId: "raw", text: "raw transcript text", delta },
       assistantProjection: { itemId: "display", delta, replace: false },
-    });
+    };
+    await harness.handler(event);
   }
   vi.advanceTimersByTime(75);
   expect(chatDeltaText(frames)).toBe("Hello world");
@@ -191,8 +192,8 @@ it("retains display deltas while a hidden run has no session subscribers", async
   const runId = "hidden-display-deltas";
   const sessionKey = "agent:main:hidden-display-deltas";
   harness.registerRun(runId, sessionKey);
-  const emit = (seq: number, delta: string) =>
-    harness.handler({
+  const emit = (seq: number, delta: string) => {
+    const event: AgentEventRuntimePayload = {
       runId,
       sessionKey,
       seq,
@@ -202,7 +203,9 @@ it("retains display deltas while a hidden run has no session subscribers", async
       projectSessionLifecycle: false,
       data: { itemId: "raw", text: "raw transcript text", delta },
       assistantProjection: { itemId: "display", delta, replace: false },
-    });
+    };
+    return harness.handler(event);
+  };
 
   await emit(1, "Hello");
   expect(frames).toEqual([]);

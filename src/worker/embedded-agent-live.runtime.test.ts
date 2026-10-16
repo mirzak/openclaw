@@ -166,7 +166,12 @@ describe("createWorkerLiveRuntime", () => {
     runtime.handleSessionEvent({
       type: "message_update",
       message,
-      assistantMessageEvent: { type: "text_end", contentIndex: 0 },
+      assistantMessageEvent: {
+        type: "text_end",
+        contentIndex: 0,
+        content: "Checking a detail.",
+        partial: message,
+      },
     });
     const final = makeAgentAssistantMessage({ content: [{ type: "text", text: "The answer." }] });
     runtime.handleSessionEvent({ type: "message_start", message: final });
