@@ -25,7 +25,6 @@ import type { BlockReplyPayload } from "./embedded-agent-payloads.js";
 import type { EmbeddedRunReplayState } from "./embedded-agent-runner/replay-state.js";
 import type { EmbeddedRunAttemptResult } from "./embedded-agent-runner/run/types.js";
 import type { EmbeddedRunLivenessState } from "./embedded-agent-runner/types.js";
-import type { createStreamingReplyResolver } from "./embedded-agent-subscribe.handlers.messages.stream.js";
 import type {
   BlockReplyChunking,
   SubscribeEmbeddedAgentSessionParams,
@@ -79,6 +78,26 @@ export type AssistantStreamData = {
   managedMediaUrls?: string[];
   phase?: AssistantPhase;
   itemId?: string;
+};
+
+export type StreamingReplyResolver = (params: {
+  evtType: "text_delta" | "text_start" | "text_end";
+  next: string;
+  previousText: string;
+  previousCleaned: string;
+  visibleDelta: string;
+  appendDelta: string | null;
+  parsedStreamDirectives: ReplyDirectiveParseResult | null;
+  previousAudioDirectiveCount: number;
+  rawDirectiveSource?: string;
+  rawDirectiveDelta?: string;
+}) => {
+  text: string;
+  delta: string;
+  replace: boolean;
+  hasText: boolean;
+  replyDirectives: ReplyDirectiveParseResult | null;
+  audioDirectiveCount: number;
 };
 
 /** Incremental tag and Markdown parsing state, owned by one stream lane. */
@@ -174,7 +193,7 @@ export type EmbeddedAgentSubscribeState = {
     projection?: {
       kind: "raw" | "delivery" | "final";
       projector: ReturnType<typeof createAssistantVisibleStreamText>;
-      resolveReply: ReturnType<typeof createStreamingReplyResolver>;
+      resolveReply: StreamingReplyResolver;
     };
   };
   lastStreamedReasoning?: string;

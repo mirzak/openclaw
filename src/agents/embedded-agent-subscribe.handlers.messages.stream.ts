@@ -5,10 +5,7 @@ import {
   asOptionalRecord as asRecord,
 } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import {
-  parseReplyDirectives,
-  type ReplyDirectiveParseResult,
-} from "../auto-reply/reply/reply-directives.js";
+import { parseReplyDirectives } from "../auto-reply/reply/reply-directives.js";
 import {
   createStreamingDirectiveAccumulator,
   splitTrailingDirective,
@@ -29,6 +26,7 @@ import { hasReplyDirectiveMetadata } from "./embedded-agent-subscribe.handlers.m
 import type {
   EmbeddedAgentSubscribeContext,
   EmbeddedAgentSubscribeState,
+  StreamingReplyResolver,
 } from "./embedded-agent-subscribe.handlers.types.js";
 import {
   extractAssistantCommentaryText,
@@ -300,29 +298,11 @@ export function resolveAssistantTextChunk(params: {
   return accumulatedText.includes(content) ? "" : content;
 }
 
-export function createStreamingReplyResolver() {
+export function createStreamingReplyResolver(): StreamingReplyResolver {
   let directiveCodePrefix: StreamDirectiveCodePrefix | undefined;
   let hasDirectiveMarker = false;
   let previousChar = "";
-  return (params: {
-    evtType: "text_delta" | "text_start" | "text_end";
-    next: string;
-    previousText: string;
-    previousCleaned: string;
-    visibleDelta: string;
-    appendDelta: string | null;
-    parsedStreamDirectives: ReplyDirectiveParseResult | null;
-    previousAudioDirectiveCount: number;
-    rawDirectiveSource?: string;
-    rawDirectiveDelta?: string;
-  }): {
-    text: string;
-    delta: string;
-    replace: boolean;
-    hasText: boolean;
-    replyDirectives: ReplyDirectiveParseResult | null;
-    audioDirectiveCount: number;
-  } => {
+  return (params) => {
     if (params.rawDirectiveSource !== undefined) {
       const appended = params.rawDirectiveDelta ?? params.rawDirectiveSource;
       if (params.rawDirectiveDelta === undefined) {
