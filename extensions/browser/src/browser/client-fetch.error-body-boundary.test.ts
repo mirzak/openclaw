@@ -22,22 +22,25 @@ vi.mock("./bridge-auth-registry.js", () => ({
 
 const { fetchBrowserJson } = await import("./client-fetch.js");
 
-const STREAM_CHUNK = Buffer.alloc(4 * 1024, "x");
-const STREAM_BODY_BYTES = 1024 * 1024;
-const SUCCESS_STREAM_CHUNK = Buffer.alloc(64 * 1024, "x");
-const SUCCESS_STREAM_BODY_BYTES = 33 * 1024 * 1024;
 const BROWSER_SUCCESS_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
 const MALFORMED_UTF8_STATUSES = [200, 401, 408, 500, 504] as const;
 
-function streamBody(res: http.ServerResponse, success: boolean, onClose: () => void) {
-  const chunk = success ? SUCCESS_STREAM_CHUNK : STREAM_CHUNK;
-  const total = success ? SUCCESS_STREAM_BODY_BYTES : STREAM_BODY_BYTES;
-  const state = { completed: false };
+function streamState() {
+  return { ...Promise.withResolvers<void>(), completed: false };
+}
+
+function streamBody(
+  res: http.ServerResponse,
+  success: boolean,
+  state: ReturnType<typeof streamState>,
+) {
+  const chunk = Buffer.alloc((success ? 64 : 4) * 1024, "x");
+  const total = (success ? 33 : 1) * 1024 * 1024;
   let written = 0;
   let closed = false;
   res.once("close", () => {
     closed = true;
-    onClose();
+    state.resolve();
   });
   res.writeHead(success ? 200 : 500, {
     "Content-Type": success ? "application/json" : "text/plain",
@@ -64,39 +67,29 @@ function streamBody(res: http.ServerResponse, success: boolean, onClose: () => v
     }
   };
   writeNext();
-  return state;
 }
 
 describe("fetchHttpJson error body boundary", () => {
   let server: http.Server;
   let baseUrl: string;
-  let streamClosed: ReturnType<typeof Promise.withResolvers<void>>;
-  let successStreamClosed: ReturnType<typeof Promise.withResolvers<void>>;
+  const fetchRoute = (route: string) => fetchBrowserJson(`${baseUrl}/${route}`);
+  let streams: Record<"large" | "success-large", ReturnType<typeof streamState>>;
   let malformedConnectionClosed: Map<number, ReturnType<typeof Promise.withResolvers<void>>>;
-  let stream: ReturnType<typeof streamBody>;
-  let successStream: ReturnType<typeof streamBody>;
 
   beforeEach(async () => {
-    for (const key of [
-      "ALL_PROXY",
-      "all_proxy",
-      "HTTP_PROXY",
-      "http_proxy",
-      "HTTPS_PROXY",
-      "https_proxy",
-    ]) {
-      vi.stubEnv(key, "");
+    for (const scheme of ["ALL", "HTTP", "HTTPS"]) {
+      vi.stubEnv(`${scheme}_PROXY`, "");
+      vi.stubEnv(`${scheme.toLowerCase()}_proxy`, "");
     }
 
     vi.stubEnv("OPENCLAW_DEBUG_PROXY_ENABLED", "0");
-    streamClosed = Promise.withResolvers<void>();
-    successStreamClosed = Promise.withResolvers<void>();
+    streams = { large: streamState(), "success-large": streamState() };
     malformedConnectionClosed = new Map(
       MALFORMED_UTF8_STATUSES.map((status) => [status, Promise.withResolvers<void>()]),
     );
     server = http.createServer((req, res) => {
       if (req.url === "/rate-limit") {
-        req.socket.once("close", () => streamClosed.resolve());
+        req.socket.once("close", () => streams.large.resolve());
         res.writeHead(429, { "Content-Type": "application/json" });
         res.write('{"error":"rate-limited"');
         return;
@@ -109,11 +102,6 @@ describe("fetchHttpJson error body boundary", () => {
         res.end(Buffer.from('{"error":"control \xff"}', "latin1"));
         return;
       }
-      if (req.url === "/success-large") {
-        successStream = streamBody(res, true, successStreamClosed.resolve);
-        return;
-      }
-
       if (req.url === "/navigation-blocked") {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(
@@ -126,7 +114,8 @@ describe("fetchHttpJson error body boundary", () => {
         return;
       }
 
-      stream = streamBody(res, false, streamClosed.resolve);
+      const success = req.url === "/success-large";
+      streamBody(res, success, streams[success ? "success-large" : "large"]);
     });
     await new Promise<void>((resolve) => {
       server.listen(0, "127.0.0.1", resolve);
@@ -150,38 +139,27 @@ describe("fetchHttpJson error body boundary", () => {
     await expect(fetchBrowserJson(`${baseUrl}/rate-limit`, { signal })).rejects.toThrow(
       /rate[ -]?limit/i,
     );
-    await streamClosed.promise;
+    await streams.large.promise;
   });
 
-  it("cancels an overflowing stream and releases the guarded fetch", async () => {
-    const error = await fetchBrowserJson(`${baseUrl}/large`).catch((err: unknown) => err);
-
-    expect(error).toMatchObject({ name: "BrowserServiceError", message: "HTTP 500" });
-    await expect(streamClosed.promise).resolves.toBeUndefined();
-    expect(stream.completed).toBe(false);
-  });
-
-  it("cancels an overflowing successful JSON response", async () => {
-    const error = await fetchBrowserJson(`${baseUrl}/success-large`).catch((err: unknown) => err);
-
-    expect(error).toMatchObject({
-      name: "BrowserServiceError",
-      message: `Browser control response exceeded ${BROWSER_SUCCESS_BODY_LIMIT_BYTES} bytes`,
-    });
-    await expect(successStreamClosed.promise).resolves.toBeUndefined();
-    expect(successStream.completed).toBe(false);
+  it.each([
+    ["large", "HTTP 500"],
+    [
+      "success-large",
+      `Browser control response exceeded ${BROWSER_SUCCESS_BODY_LIMIT_BYTES} bytes`,
+    ],
+  ] as const)("cancels overflowing %s responses and releases fetch", async (route, message) => {
+    const error = await fetchBrowserJson(`${baseUrl}/${route}`).catch((err: unknown) => err);
+    expect(error).toMatchObject({ name: "BrowserServiceError", message });
+    await expect(streams[route].promise).resolves.toBeUndefined();
+    expect(streams[route].completed).toBe(false);
   });
 
   it("rejects malformed UTF-8 responses, preserves retry policy, and releases each fetch", async () => {
     for (const status of MALFORMED_UTF8_STATUSES) {
-      const error = await fetchBrowserJson(`${baseUrl}/malformed-utf8/${status}`).catch(
-        (err: unknown) => err,
-      );
+      const error = await fetchRoute(`malformed-utf8/${status}`).catch((err: unknown) => err);
 
-      expect(error).toMatchObject({
-        name: "BrowserServiceError",
-        status,
-      });
+      expect(error).toMatchObject({ name: "BrowserServiceError", status });
       const message = error instanceof Error ? error.message : "";
       expect(message).toContain(`Browser control response was not valid UTF-8 (HTTP ${status})`);
       if (status === 401) {
@@ -198,9 +176,7 @@ describe("fetchHttpJson error body boundary", () => {
   });
 
   it("preserves a navigation denial without exposing raw policy details over HTTP", async () => {
-    const error = await fetchBrowserJson(`${baseUrl}/navigation-blocked`).catch(
-      (err: unknown) => err,
-    );
+    const error = await fetchRoute("navigation-blocked").catch((err: unknown) => err);
 
     expect(error).toMatchObject({
       name: "BrowserServiceError",

@@ -100,8 +100,7 @@ async function expectGeneratedBrowserAuthPersistence(
   expect(result.auth[field === "token" ? "password" : "token"]).toBeUndefined();
   expect(mocks.writeConfigFile).toHaveBeenCalledTimes(1);
   const persistedCfg = readPersistedConfig();
-  expect(persistedCfg?.gateway?.auth?.mode).toBe(mode);
-  expect(persistedCfg?.gateway?.auth?.[field]).toBe(result.generatedToken);
+  expect(persistedCfg.gateway?.auth).toMatchObject({ mode, [field]: result.generatedToken });
   expect(mocks.ensureGatewayStartupAuth).not.toHaveBeenCalled();
 }
 
@@ -218,12 +217,17 @@ describe("ensureBrowserControlAuth", () => {
     expectNoAuthWrites();
   });
 
-  it("does not persist over unresolved token SecretRef in none mode", async () => {
-    const cfg = browserConfig({
-      mode: "none",
-      token: { source: "env", provider: "default", id: "BROWSER_TOKEN" },
-    });
-    await expectUnresolvedBrowserSecretRefSkipsPersistence(cfg);
+  it.each([
+    ["none", "token", "BROWSER_TOKEN"],
+    ["trusted-proxy", "password", "BROWSER_PASSWORD"],
+  ] as const)("does not overwrite unresolved %s %s SecretRefs", async (mode, field, id) => {
+    await expectUnresolvedBrowserSecretRefSkipsPersistence(
+      browserConfig({
+        mode,
+        [field]: { source: "env", provider: "default", id },
+        ...(mode === "trusted-proxy" ? { trustedProxy: { userHeader: "x-forwarded-user" } } : {}),
+      }),
+    );
   });
 
   it("still auto-generates in none mode when only password SecretRef is set", async () => {
@@ -240,15 +244,6 @@ describe("ensureBrowserControlAuth", () => {
       trustedProxy: { userHeader: "x-forwarded-user" },
     });
     await expectGeneratedBrowserAuthPersistence(cfg, "trusted-proxy", "password");
-  });
-
-  it("does not persist over unresolved password SecretRef in trusted-proxy mode", async () => {
-    const cfg = browserConfig({
-      mode: "trusted-proxy",
-      password: { source: "env", provider: "default", id: "BROWSER_PASSWORD" },
-      trustedProxy: { userHeader: "x-forwarded-user" },
-    });
-    await expectUnresolvedBrowserSecretRefSkipsPersistence(cfg);
   });
 
   it("reuses auth from latest config snapshot", async () => {

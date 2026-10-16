@@ -36,10 +36,6 @@ function check(report: ReturnType<typeof buildBrowserDoctorReport>, id: string) 
   return report.checks.find((entry) => entry.id === id);
 }
 
-function collectWarningCheckIds(checks: readonly { id: string; status: string }[]): string[] {
-  return checks.filter((entry) => entry.status === "warn").map((entry) => entry.id);
-}
-
 function runningGraphics(graphics: BrowserStatus["graphics"]) {
   return reportFor({
     running: true,
@@ -67,13 +63,7 @@ describe("buildBrowserDoctorReport", () => {
   });
 
   it("fails when Chrome MCP attach is not ready", () => {
-    const report = reportFor({
-      profile: "user",
-      transport: "chrome-mcp",
-      cdpPort: null,
-      userDataDir: null,
-      attachOnly: true,
-    });
+    const report = reportFor({ transport: "chrome-mcp" });
 
     expect(report.ok).toBe(false);
     expect(check(report, "attach-target")?.status).toBe("fail");
@@ -91,11 +81,9 @@ describe("buildBrowserDoctorReport", () => {
     );
 
     expect(report.ok).toBe(true);
-    expect(collectWarningCheckIds(report.checks)).toEqual([
-      "managed-executable",
-      "display",
-      "linux-sandbox",
-    ]);
+    expect(
+      report.checks.filter((entry) => entry.status === "warn").map((entry) => entry.id),
+    ).toEqual(["managed-executable", "display", "linux-sandbox"]);
     expect(check(report, "display")?.summary).toBe(
       "No DISPLAY or WAYLAND_DISPLAY is set while headed mode is selected (config)",
     );
@@ -130,7 +118,7 @@ describe("buildBrowserDoctorReport", () => {
 
     expect(report.ok).toBe(true);
     const graphicsCheck = check(report, "graphics");
-    expect(graphicsCheck?.status).toBe("info");
+    expect(graphicsCheck).toMatchObject({ status: "info" });
     expect(graphicsCheck?.summary).toContain("software");
     expect(graphicsCheck?.summary).toContain("SwiftShader");
   });
@@ -161,17 +149,7 @@ describe("buildBrowserDoctorReport", () => {
     ["all-zero version", "0.0.0.0", "info"],
     ["too many version components", "2.0.0.0.0", "info"],
   ] as const)("classifies %s extension version evidence", (_label, extensionVersion, severity) => {
-    const report = reportFor(
-      {
-        profile: "chrome",
-        transport: "extension",
-        running: true,
-        cdpPort: 18792,
-        userDataDir: null,
-        attachOnly: true,
-      },
-      { extensionVersion },
-    );
+    const report = reportFor({ transport: "extension", running: true }, { extensionVersion });
 
     const versionCheck = check(report, "extension-version");
     expect(versionCheck?.status).toBe(severity);

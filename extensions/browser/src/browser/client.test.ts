@@ -40,12 +40,6 @@ function captureFetch(body: unknown, responseFor?: (url: string, init?: RequestI
 }
 
 describe("browser client", () => {
-  function jsonResponse(body: unknown): Response {
-    return new Response(JSON.stringify(body), {
-      headers: { "content-type": "application/json" },
-    });
-  }
-
   function requireSnapshotCall(calls: FetchCall[]): string {
     const call = calls.find(({ url }) => url.includes("/snapshot?"));
     if (!call) {
@@ -72,10 +66,7 @@ describe("browser client", () => {
   });
 
   it("preserves unavailable tab state from a disconnected browser", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => jsonResponse({ running: false, tabs: [] })),
-    );
+    captureFetch({ running: false, tabs: [] });
 
     await expect(browserTabs(baseUrl)).resolves.toEqual({
       running: false,
@@ -88,30 +79,27 @@ describe("browser client", () => {
     await expect(browserStatus(baseUrl)).rejects.toThrow(/cancelled/i);
   });
 
-  it("adds labels + efficient mode query params to snapshots", async () => {
+  it.each<[string, Parameters<typeof browserSnapshot>[1], Record<string, string>]>([
+    [
+      "labels and efficient mode",
+      { format: "ai", labels: true, mode: "efficient" },
+      { labels: "1", mode: "efficient" },
+    ],
+    ["ARIA refs", { format: "ai", refs: "aria" }, { refs: "aria" }],
+    ["server capability defaults", { profile: "chrome" }, { profile: "chrome" }],
+  ])("encodes snapshot %s", async (_name, options, query) => {
     const calls = captureFetch({ ok: true, format: "ai" });
-
-    const snapshot = await browserSnapshot(baseUrl, {
+    await expect(browserSnapshot(baseUrl, options)).resolves.toMatchObject({
+      ok: true,
       format: "ai",
-      labels: true,
-      mode: "efficient",
     });
-
-    expect(snapshot).toMatchObject({ ok: true, format: "ai" });
-
     const parsed = new URL(requireSnapshotCall(calls));
-    expect(parsed.searchParams.get("labels")).toBe("1");
-    expect(parsed.searchParams.get("mode")).toBe("efficient");
+    expect(Object.fromEntries(parsed.searchParams)).toMatchObject(query);
+    expect(parsed.searchParams.has("format")).toBe(options.format !== undefined);
   });
 
   it("encodes observation filters and routes emulation through the selected profile", async () => {
-    const calls = captureFetch({
-      ok: true,
-      targetId: "canonical",
-      requests: [],
-      text: "Prose",
-      truncated: false,
-    });
+    const calls = captureFetch({ ok: true });
     const profile = "test profile";
     await browserRequests(baseUrl, { targetId: "t1", filter: "/api?q=a&b", clear: false, profile });
     await browserPageText(baseUrl, {
@@ -161,36 +149,20 @@ describe("browser client", () => {
     expect(JSON.parse(deviceBody)).toEqual({ targetId: "t1", name: "iPhone 15" });
   });
 
-  it("adds refs=aria to snapshots when requested", async () => {
-    const calls = captureFetch({ ok: true, format: "ai" });
-
-    await browserSnapshot(baseUrl, {
-      format: "ai",
-      refs: "aria",
-    });
-
-    const parsed = new URL(requireSnapshotCall(calls));
-    expect(parsed.searchParams.get("refs")).toBe("aria");
-  });
-
   it("forwards an explicit snapshot timeoutMs into the query string", async () => {
-    const calls: string[] = [];
-    stubSnapshotFetch(calls);
+    const calls = captureFetch({ ok: true, format: "ai" });
 
     await browserSnapshot("http://127.0.0.1:18791", {
       format: "ai",
       timeoutMs: 4321,
     });
 
-    const snapshotCall = calls.find((url) => url.includes("/snapshot?"));
-    expect(snapshotCall).toBeTruthy();
-    const parsed = new URL(snapshotCall as string);
+    const parsed = new URL(requireSnapshotCall(calls));
     expect(parsed.searchParams.get("timeoutMs")).toBe("4321");
   });
 
   it("clamps oversized snapshot timeoutMs before forwarding", async () => {
-    const calls: string[] = [];
-    stubSnapshotFetch(calls);
+    const calls = captureFetch({ ok: true, format: "ai" });
 
     await browserSnapshot("http://127.0.0.1:18791", {
       format: "ai",
@@ -202,29 +174,13 @@ describe("browser client", () => {
   });
 
   it("falls back to the default snapshot timeout when none is supplied", async () => {
-    const calls: string[] = [];
-    stubSnapshotFetch(calls);
+    const calls = captureFetch({ ok: true, format: "ai" });
 
     await browserSnapshot("http://127.0.0.1:18791", { format: "ai" });
 
-    const snapshotCall = calls.find((url) => url.includes("/snapshot?"));
-    expect(snapshotCall).toBeTruthy();
-    const parsed = new URL(snapshotCall as string);
+    const parsed = new URL(requireSnapshotCall(calls));
     expect(parsed.searchParams.get("timeoutMs")).toBe("20000");
   });
-
-  it("omits format when the caller wants server-side snapshot capability defaults", async () => {
-    const calls = captureFetch({ ok: true, format: "ai" });
-
-    await browserSnapshot(baseUrl, {
-      profile: "chrome",
-    });
-
-    const parsed = new URL(requireSnapshotCall(calls));
-    expect(parsed.searchParams.get("format")).toBeNull();
-    expect(parsed.searchParams.get("profile")).toBe("chrome");
-  });
-
   it("uses the expected endpoints + methods for common calls", async () => {
     const download = {
       url: "https://y/report.csv",
@@ -251,8 +207,8 @@ describe("browser client", () => {
       "/hooks/file-chooser": { ok: true },
       "/hooks/dialog": { ok: true },
       "/console": { ok: true, targetId: "t1", messages: [] },
-      "/pdf": { ok: true, path: "/tmp/a.pdf", targetId: "t1", url: "https://x" },
-      "/screenshot": { ok: true, path: "/tmp/a.png", targetId: "t1", url: "https://x" },
+      "/pdf": { ok: true, path: "/tmp/a.pdf" },
+      "/screenshot": { ok: true, path: "/tmp/a.png" },
       "/snapshot": { ok: true, format: "aria" },
       "/doctor": { ok: true, profile: "openclaw" },
       "/": { running: true, cdpPort: 18792 },
@@ -346,8 +302,7 @@ describe("browser client", () => {
 
     const screenshotCalls = calls.filter((c) => c.url.endsWith("/screenshot"));
     const screenshot = screenshotCalls[0];
-    expect(screenshot?.init?.method).toBe("POST");
-    expect(screenshot?.init?.timeoutMs).toBe(12_345);
+    expect(screenshot?.init).toMatchObject({ method: "POST", timeoutMs: 12_345 });
     const screenshotBody = JSON.parse(
       typeof screenshot?.init?.body === "string" ? screenshot.init.body : "{}",
     ) as { fullPage?: unknown; timeoutMs?: unknown };
@@ -361,16 +316,13 @@ describe("browser client", () => {
   });
 
   it("marks internally selected close targets as exact", async () => {
-    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
-      jsonResponse({ ok: true }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
+    const calls = captureFetch({ ok: true });
 
     await browserCloseTabByRawTargetId(baseUrl, "RAW_TARGET", {
       profile: "openclaw",
     });
 
-    const [url, init] = fetchMock.mock.calls[0] ?? [];
+    const { url, init } = calls[0]!;
     expect(url).toBe("http://127.0.0.1:18791/tabs/RAW_TARGET?targetIdMode=raw&profile=openclaw");
     expect(init).toMatchObject({ method: "DELETE" });
     expect(init?.body).toBeUndefined();
