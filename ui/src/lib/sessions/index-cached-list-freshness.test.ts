@@ -10,6 +10,23 @@ import {
   sessionsResult,
 } from "./session-capability.test-support.ts";
 
+const parentKey = "agent:main:parent";
+function childRow(sessionId: string, fields: Partial<GatewaySessionRow> = {}): GatewaySessionRow {
+  return {
+    key: "agent:main:subagent:child",
+    sessionId,
+    kind: "direct",
+    spawnedBy: parentKey,
+    snapshotAt: 100,
+    hasActiveRun: false,
+    ...fields,
+  };
+}
+function setup(request: Parameters<typeof createTestGatewayClient>[0]) {
+  const harness = createGatewayHarness(createTestGatewayClient(request));
+  return { ...harness, sessions: createTestSessionCapability(harness.gateway) };
+}
+
 const background: GatewaySessionRow = {
   key: "agent:main:background",
   sessionId: "background-session",
@@ -46,73 +63,55 @@ describe("cached session list freshness", () => {
       activeRunIds: ["background-run"],
     };
     let page = sessionsResult([row], 100);
-    const harness = createGatewayHarness(
-      createTestGatewayClient(async () => structuredClone(page)),
-    );
-    const sessions = createTestSessionCapability(harness.gateway);
-    try {
-      await sessions.refresh({ agentId: "main", force: true });
-      emitRuntime(harness, running);
-      expect(sessions.state.result?.sessions[0]).toMatchObject({
-        status: "running",
-        hasActiveRun: true,
-      });
+    const harness = setup(async () => structuredClone(page));
+    const { sessions } = harness;
+    await sessions.refresh({ agentId: "main", force: true });
+    emitRuntime(harness, running);
+    expect(sessions.state.result?.sessions[0]).toMatchObject({
+      status: "running",
+      hasActiveRun: true,
+    });
 
-      // Runtime projection changed without a persisted-row write. Request order
-      // does not make this completed Gateway cache entry a fresh observation.
-      await sessions.refresh({ agentId: "main", force: true });
-      expect(sessions.state.result?.sessions[0]).toMatchObject({
-        status: "running",
-        hasActiveRun: true,
-        activeRunIds: ["background-run"],
-        snapshotAt: 200,
-      });
+    // Runtime projection changed without a persisted-row write. Request order
+    // does not make this completed Gateway cache entry a fresh observation.
+    await sessions.refresh({ agentId: "main", force: true });
+    expect(sessions.state.result?.sessions[0]).toMatchObject({
+      status: "running",
+      hasActiveRun: true,
+      activeRunIds: ["background-run"],
+      snapshotAt: 200,
+    });
 
-      const completed = { ...row, snapshotAt: 300 };
-      page = sessionsResult([completed], 300);
-      await sessions.refresh({ agentId: "main", force: true });
-      expect(sessions.state.result?.sessions[0]).toMatchObject({
-        status: "done",
-        hasActiveRun: false,
-        activeRunIds: [],
-        snapshotAt: 300,
-      });
-      emitRuntime(harness, running);
-      expect(sessions.state.result?.sessions[0]).toMatchObject(completed);
+    const completed = { ...row, snapshotAt: 300 };
+    page = sessionsResult([completed], 300);
+    await sessions.refresh({ agentId: "main", force: true });
+    expect(sessions.state.result?.sessions[0]).toMatchObject({
+      status: "done",
+      hasActiveRun: false,
+      activeRunIds: [],
+      snapshotAt: 300,
+    });
+    emitRuntime(harness, running);
+    expect(sessions.state.result?.sessions[0]).toMatchObject(completed);
 
-      page = sessionsResult([{ ...running, snapshotAt: 400 }], 400);
-      await sessions.refresh({ agentId: "main", force: true });
-      const settled: GatewaySessionRow = {
-        ...row,
-        snapshotAt: 500,
-      };
-      emitRuntime(harness, settled);
-      expect(sessions.state.result?.sessions[0]).toMatchObject(settled);
-    } finally {
-      sessions.dispose();
-    }
+    page = sessionsResult([{ ...running, snapshotAt: 400 }], 400);
+    await sessions.refresh({ agentId: "main", force: true });
+    const settled: GatewaySessionRow = {
+      ...row,
+      snapshotAt: 500,
+    };
+    emitRuntime(harness, settled);
+    expect(sessions.state.result?.sessions[0]).toMatchObject(settled);
   });
 
   it("keeps fresh child facts when a later root request returns an older cached page", async () => {
-    const parentKey = "agent:main:parent";
-    const childKey = "agent:main:subagent:child";
     const parent: GatewaySessionRow = {
       key: parentKey,
       sessionId: "parent-session",
       kind: "direct",
-      childSessions: [childKey],
+      childSessions: ["agent:main:subagent:child"],
     };
-    const child: GatewaySessionRow = {
-      key: childKey,
-      sessionId: "child-session",
-      kind: "direct",
-      spawnedBy: parentKey,
-      updatedAt: 10,
-      snapshotAt: 100,
-      status: "done",
-      hasActiveRun: false,
-      activeRunIds: [],
-    };
+    const child = childRow("child-session", { updatedAt: 10, status: "done", activeRunIds: [] });
     // Runtime facts can change without advancing the persisted updatedAt value.
     const freshChild = {
       ...child,
@@ -123,7 +122,7 @@ describe("cached session list freshness", () => {
     };
     let root = sessionsResult([parent, child], 100);
     let children = sessionsResult([freshChild], 200);
-    const client = createTestGatewayClient(
+    const { sessions } = setup(
       vi.fn(async (method, params) => {
         if (method === "sessions.subscribe") {
           return { subscribed: true };
@@ -133,7 +132,6 @@ describe("cached session list freshness", () => {
         return structuredClone(isRecord(params) && params.spawnedBy ? children : root);
       }),
     );
-    const sessions = createTestSessionCapability(createGatewayHarness(client).gateway);
     const query = { spawnedBy: parentKey, limit: 100 };
     await sessions.refresh({ agentId: "main", force: true });
     const primaryRevision = sessions.canonicalListRevision;
@@ -160,8 +158,9 @@ describe("cached session list freshness", () => {
     stopPrimary();
     stopChildren();
     const projectedChild = () => sessions.projectRows([child])[0];
+    const primaryChild = () => sessions.state.result?.sessions.find((row) => row.key === child.key);
     expect(projectedChild()).toMatchObject({ hasActiveRun: true, status: "running" });
-    expect(sessions.state.result?.sessions.find((row) => row.key === child.key)).toMatchObject({
+    expect(primaryChild()).toMatchObject({
       hasActiveRun: true,
       status: "running",
       activeRunIds: ["new-run"],
@@ -170,7 +169,7 @@ describe("cached session list freshness", () => {
     // A later request is not a newer observation when its result came from cache.
     await sessions.refresh({ agentId: "main", force: true });
     expect(projectedChild()).toMatchObject({ hasActiveRun: true, status: "running" });
-    expect(sessions.state.result?.sessions.find((row) => row.key === child.key)).toMatchObject({
+    expect(primaryChild()).toMatchObject({
       hasActiveRun: true,
       activeRunIds: ["new-run"],
     });
@@ -182,27 +181,17 @@ describe("cached session list freshness", () => {
     children = sessionsResult([freshChild], 200);
     await sessions.refreshList(query);
     expect(projectedChild()).toMatchObject({ hasActiveRun: false, status: "done" });
-    sessions.dispose();
   });
 
   it.each(["removed", "replaced"] as const)(
     "does not restore a primary child %s while its managed query was pending",
     async (change) => {
-      const parentKey = "agent:main:parent";
-      const child: GatewaySessionRow = {
-        key: "agent:main:subagent:child",
-        sessionId: "old-child",
-        kind: "direct",
-        spawnedBy: parentKey,
-        snapshotAt: 100,
-        hasActiveRun: false,
-      };
+      const child = childRow("old-child");
       let root = sessionsResult([child], 100);
       const pending = createDeferred<ReturnType<typeof sessionsResult>>();
-      const client = createTestGatewayClient(async (_method, params) =>
+      const { sessions } = setup(async (_method, params) =>
         isRecord(params) && params.spawnedBy ? pending.promise : structuredClone(root),
       );
-      const sessions = createTestSessionCapability(createGatewayHarness(client).gateway);
       await sessions.refresh({ agentId: "main", force: true });
       const refresh = sessions.refreshList({ spawnedBy: parentKey });
       root = sessionsResult(
@@ -221,15 +210,7 @@ describe("cached session list freshness", () => {
   it.each(["disconnects", "replaces the client"] as const)(
     "does not publish a retired child snapshot after a primary listener %s",
     async (transition) => {
-      const parentKey = "agent:main:parent";
-      const child: GatewaySessionRow = {
-        key: "agent:main:subagent:child",
-        sessionId: "child-session",
-        kind: "direct",
-        spawnedBy: parentKey,
-        snapshotAt: 100,
-        hasActiveRun: false,
-      };
+      const child = childRow("child-session");
       const client = createTestGatewayClient(async (_method, params) =>
         isRecord(params) && params.spawnedBy
           ? sessionsResult([{ ...child, snapshotAt: 200, hasActiveRun: true }], 200)

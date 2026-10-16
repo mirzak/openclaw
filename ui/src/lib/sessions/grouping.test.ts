@@ -12,60 +12,49 @@ import {
   UNGROUPED_ID,
 } from "./grouping.ts";
 
+type Actor = NonNullable<GatewaySessionRow["owner"]>["actor"];
+function actor(id: string, label: string, type: "human" | "agent" = "human"): Actor {
+  return {
+    type,
+    id,
+    label,
+    identity: { type: type === "human" ? "profile" : "agent", id: id.trim() },
+  };
+}
+function ownedRow(key: string, ownerActor: Actor, fields: Partial<GatewaySessionRow> = {}) {
+  return row({ key, ...fields, owner: { actor: ownerActor } });
+}
+
 describe("groupSidebarSessionRows", () => {
   it("groups owners by identity even when they share a checkout", () => {
     const workContext = { name: "shared", path: "/repos/shared" };
     const sections = groupSidebarSessionRows(
       [
-        row({
-          key: "remote",
-          workContext,
-          owner: {
-            actor: {
-              type: "human",
+        ownedRow(
+          "remote",
+          {
+            ...actor("current", "Ada"),
+            identity: {
+              type: "remote",
+              pluginId: "chat",
+              domain: "users",
+              idKind: "user",
               id: "current",
-              label: "Ada",
-              identity: {
-                type: "remote",
-                pluginId: "chat",
-                domain: "users",
-                idKind: "user",
-                id: "current",
-              },
             },
           },
-        }),
-        row({
-          key: "agent",
-          workContext,
-          owner: {
-            actor: {
-              type: "agent",
-              id: "current",
-              label: "Aaron",
-              identity: { type: "agent", id: "current" },
-            },
-          },
-        }),
-        row({
-          key: "former",
-          workContext,
-          owner: {
-            actor: {
-              type: "human",
-              id: "former",
-              label: "Zoe",
-              identity: { type: "profile", id: "current" },
-            },
-          },
-        }),
-        row({
-          key: "current",
-          workContext,
-          owner: {
-            actor: { type: "human", id: "current", identity: { type: "profile", id: "current" } },
-          },
-        }),
+          { workContext },
+        ),
+        ownedRow("agent", actor("current", "Aaron", "agent"), { workContext }),
+        ownedRow(
+          "former",
+          { ...actor("former", "Zoe"), identity: { type: "profile", id: "current" } },
+          { workContext },
+        ),
+        ownedRow(
+          "current",
+          { type: "human", id: "current", identity: { type: "profile", id: "current" } },
+          { workContext },
+        ),
       ],
       { grouping: "person", selfOwnerId: "current" },
     ).filter((section) => section.rows.length > 0);
@@ -113,10 +102,10 @@ describe("groupSidebarSessionRows", () => {
   it("flattens the kind-based zones into one list when grouping is none", () => {
     const sections = groupSidebarSessionRows(
       [
-        { ...row({ key: "tg" }), channel: "telegram", channelSession: true },
-        { ...row({ key: "wt" }), workSession: true },
-        { ...row({ key: "grp", kind: "group" }) },
-        { ...row({ key: "pin" }), pinned: true },
+        row({ key: "tg", channel: "telegram", channelSession: true }),
+        row({ key: "wt", workSession: true }),
+        row({ key: "grp", kind: "group" }),
+        row({ key: "pin", pinned: true }),
       ],
       { grouping: "none" },
     );
@@ -129,25 +118,22 @@ describe("groupSidebarSessionRows", () => {
     const openclaw = { name: "openclaw", path: "/repos/openclaw" };
     const sections = groupSidebarSessionRows(
       [
-        { ...row({ key: "z-1" }), workContext: { name: "zulu", path: "/repos/zulu" } },
-        { ...row({ key: "oc-1" }), workContext: openclaw, workSession: true },
+        row({ key: "z-1", workContext: { name: "zulu", path: "/repos/zulu" } }),
+        row({ key: "oc-1", workContext: openclaw, workSession: true }),
         row({ key: "thread" }),
         // Same basename, different checkout: the path keeps the sections apart.
-        { ...row({ key: "fork-1" }), workContext: { name: "openclaw", path: "/forks/openclaw" } },
+        row({ key: "fork-1", workContext: { name: "openclaw", path: "/forks/openclaw" } }),
         row({ key: "grp", kind: "group" }),
-        { ...row({ key: "no-repo" }), workSession: true },
-        { ...row({ key: "oc-2", category: "Ignored" }), workContext: openclaw },
+        row({ key: "no-repo", workSession: true }),
+        row({ key: "oc-2", category: "Ignored", workContext: openclaw }),
         // Worktree checkouts fold into their origin repo's section.
-        {
-          ...row({ key: "oc-wt" }),
+        row({
+          key: "oc-wt",
           workContext: { name: "c7c338", path: "/repos/openclaw/.claude/worktrees/c7c338" },
-        },
+        }),
         // A trailing separator must not mint a second identical section.
-        {
-          ...row({ key: "oc-slash" }),
-          workContext: { name: "openclaw", path: "/repos/openclaw/" },
-        },
-        { ...row({ key: "pin", pinned: true }), workContext: openclaw },
+        row({ key: "oc-slash", workContext: { name: "openclaw", path: "/repos/openclaw/" } }),
+        row({ key: "pin", pinned: true, workContext: openclaw }),
       ],
       { grouping: "project", knownGroups: ["Ignored"] },
     );
@@ -176,67 +162,14 @@ describe("groupSidebarSessionRows", () => {
   it("orders owner sections before stored zones and leaves ownerless rows in their smart zones", () => {
     const sections = groupSidebarSessionRows(
       [
-        row({
-          key: "agent",
-          owner: {
-            actor: {
-              type: "agent",
-              id: "agent-z",
-              identity: { type: "agent", id: "agent-z" },
-              label: "Zed",
-            },
-          },
-        }),
-        row({
-          key: "owned-group",
-          kind: "group",
-          category: "Ignored",
-          owner: {
-            actor: {
-              type: "human",
-              id: "profile-b",
-              identity: { type: "profile", id: "profile-b" },
-              label: "Bea",
-            },
-          },
-        }),
+        ownedRow("agent", actor("agent-z", "Zed", "agent")),
+        ownedRow("owned-group", actor("profile-b", "Bea"), { kind: "group", category: "Ignored" }),
         row({ key: "thread" }),
         row({ key: "group", kind: "group" }),
         row({ key: "work", workSession: true }),
-        row({
-          key: "human-a",
-          owner: {
-            actor: {
-              type: "human",
-              id: "profile-a",
-              identity: { type: "profile", id: "profile-a" },
-              label: "Ada",
-            },
-          },
-        }),
-        row({
-          key: "self",
-          owner: {
-            actor: {
-              type: "human",
-              id: "profile-self",
-              identity: { type: "profile", id: "profile-self" },
-              label: "Zoe",
-              avatarUrl: "/avatars/self",
-            },
-          },
-        }),
-        row({
-          key: "agent-a",
-          owner: {
-            actor: {
-              type: "agent",
-              id: "agent-a",
-              identity: { type: "agent", id: "agent-a" },
-              label: "Alpha",
-            },
-          },
-        }),
+        ownedRow("human-a", actor("profile-a", "Ada")),
+        ownedRow("self", { ...actor("profile-self", "Zoe"), avatarUrl: "/avatars/self" }),
+        ownedRow("agent-a", actor("agent-a", "Alpha", "agent")),
         row({ key: "blank-owner", owner: { actor: { type: "human", id: "   " } } }),
         row({ key: "pinned", pinned: true, owner: { actor: { type: "human", id: "profile-a" } } }),
       ],
@@ -479,29 +412,9 @@ describe("groupSessionRows", () => {
   it("groups sessions by their durable owner identity and leaves ownerless sessions last", () => {
     const groups = groupSessionRows({
       rows: [
-        row({
-          key: "bob",
-          owner: {
-            actor: {
-              type: "human",
-              id: "profile-b",
-              identity: { type: "profile", id: "profile-b" },
-              label: "Bob",
-            },
-          },
-        }),
+        ownedRow("bob", actor("profile-b", "Bob")),
         row({ key: "ownerless" }),
-        row({
-          key: "ada",
-          owner: {
-            actor: {
-              type: "human",
-              id: " profile-a ",
-              identity: { type: "profile", id: "profile-a" },
-              label: "Ada",
-            },
-          },
-        }),
+        ownedRow("ada", actor(" profile-a ", "Ada")),
         row({ key: "blank", owner: { actor: { type: "human", id: " " } } }),
       ],
       mode: "person",

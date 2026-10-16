@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { describe, expect, it, onTestFinished, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import type { GatewaySessionRow, SessionsListResult } from "../../api/types.ts";
 import {
@@ -10,6 +10,7 @@ import { childSessionListQuery, fetchChildSessionRows } from "./child-session-da
 import {
   createGatewayHarness,
   createTestSessionCapability,
+  sessionsResult,
 } from "./session-capability.test-support.ts";
 
 const parentKey = "agent:main:parent";
@@ -29,24 +30,23 @@ function listResult(
   nextOffset: number | null,
 ): SessionsListResult {
   return {
-    ts: 1,
+    ...sessionsResult(sessions, 1),
     path: "",
-    count: sessions.length,
     totalCount,
     hasMore: nextOffset !== null,
     nextOffset,
-    defaults: { modelProvider: null, model: null, contextTokens: null },
-    sessions,
   };
 }
 
 function capability(request: GatewayRequestHandler) {
-  const sessions = createTestSessionCapability(
+  return createTestSessionCapability(
     createGatewayHarness(createTestGatewayClient(request)).gateway,
   );
-  onTestFinished(() => sessions.dispose());
-  return sessions;
 }
+
+const childQuery = childSessionListQuery(parentKey);
+const load = (sessions: ReturnType<typeof capability>) =>
+  fetchChildSessionRows({ sessions, parentKey, isCurrent: () => true });
 
 describe("fetchChildSessionRows", () => {
   it("loads a default 50-child Swarm roster in one request", async () => {
@@ -69,11 +69,7 @@ describe("fetchChildSessionRows", () => {
     expect(sessions.state.result?.sessions[0]?.label).toBe(previous.label);
     const list = vi.spyOn(sessions, "refreshList");
 
-    const rows = await fetchChildSessionRows({
-      sessions,
-      parentKey,
-      isCurrent: () => true,
-    });
+    const rows = await load(sessions);
 
     expect(rows).toHaveLength(50);
     expect(list).toHaveBeenCalledOnce();
@@ -102,11 +98,7 @@ describe("fetchChildSessionRows", () => {
     const sessions = capability(request);
     const list = vi.spyOn(sessions, "refreshList");
 
-    const rows = await fetchChildSessionRows({
-      sessions,
-      parentKey,
-      isCurrent: () => true,
-    });
+    const rows = await load(sessions);
 
     expect(rows).toHaveLength(101);
     expect(list).toHaveBeenCalledTimes(2);
@@ -149,11 +141,11 @@ describe("fetchChildSessionRows", () => {
       await sessions.refresh({ force: true });
       const removal = sessions.delete(target.key, { expectedSessionId: target.sessionId });
       try {
-        const rows = await fetchChildSessionRows({ sessions, parentKey, isCurrent: () => true });
+        const rows = await load(sessions);
         expect(rows).toHaveLength(count - 1);
         expect(rows?.some((row) => row.key === target.key)).toBe(false);
         expect(offsets).toEqual(count > 100 ? [0, 100] : [0]);
-        expect(sessions.listSnapshot(childSessionListQuery(parentKey)).result).toMatchObject({
+        expect(sessions.listSnapshot(childQuery).result).toMatchObject({
           count: count - 1,
           totalCount: count,
         });
@@ -162,9 +154,7 @@ describe("fetchChildSessionRows", () => {
         }
         deletion.resolve({ ok: true, deleted });
         await removal;
-        expect(
-          await fetchChildSessionRows({ sessions, parentKey, isCurrent: () => true }),
-        ).toHaveLength(deleted ? count - 1 : count);
+        expect(await load(sessions)).toHaveLength(deleted ? count - 1 : count);
       } finally {
         deletion.resolve({ ok: true, deleted: false });
         await removal;
@@ -189,21 +179,14 @@ describe("fetchChildSessionRows", () => {
         return listResult([tail], 101, null);
       });
       const sessions = capability(request);
-      const query = {
-        spawnedBy: parentKey,
-        limit: 100,
-        includeGlobal: false,
-        includeUnknown: false,
-        configuredAgentsOnly: true,
-      };
-      const load = fetchChildSessionRows({ sessions, parentKey, isCurrent: () => true });
+      const pending = load(sessions);
       if (recovers) {
-        expect(await load).toHaveLength(101);
-        expect(sessions.listSnapshot(query).result?.sessions).toHaveLength(101);
+        expect(await pending).toHaveLength(101);
+        expect(sessions.listSnapshot(childQuery).result?.sessions).toHaveLength(101);
         expect(request).toHaveBeenCalledTimes(6);
       } else {
-        await expect(load).rejects.toThrow("child session list kept changing");
-        expect(sessions.listSnapshot(query).result?.sessions).toHaveLength(100);
+        await expect(pending).rejects.toThrow("child session list kept changing");
+        expect(sessions.listSnapshot(childQuery).result?.sessions).toHaveLength(100);
         expect(request).toHaveBeenCalledTimes(8);
       }
     },

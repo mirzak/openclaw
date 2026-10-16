@@ -21,6 +21,7 @@ import {
 } from "./session-capability.test-support.ts";
 import type { SessionRunTerminal } from "./session-run-terminal.ts";
 
+const cleanup: Array<() => void> = [];
 const mainKey = "agent:main:main";
 const row = (key = mainKey, fields: Partial<GatewaySessionRow> = {}): GatewaySessionRow => ({
   key,
@@ -45,7 +46,9 @@ function sessionHarness(
   });
   const harness = createGatewayHarness(createTestGatewayClient(request), featureMethods);
   harness.gateway.snapshot.sessionKey = sessionKey;
-  return { ...harness, request, sessions: createTestSessionCapability(harness.gateway) };
+  const sessions = createTestSessionCapability(harness.gateway);
+  cleanup.push(sessions.dispose);
+  return { ...harness, request, sessions };
 }
 
 function changed(key: string) {
@@ -64,7 +67,12 @@ function changed(key: string) {
   } as const;
 }
 
-afterEach(() => vi.useRealTimers());
+afterEach(() => {
+  for (const dispose of cleanup.splice(0).toReversed()) {
+    dispose();
+  }
+  vi.useRealTimers();
+});
 
 it.each([false, null])(
   "shares confirmed archive visibility after a %s restore event",
@@ -146,7 +154,6 @@ it("automatically retries an explicitly retryable group catalog failure", async 
   expect(sessions.state.groups).toEqual(["Recovered"]);
   expect(sessions.state.sectionOrder).toEqual(["work", "category:Recovered"]);
   expect(calls).toBe(2);
-  sessions.dispose();
 });
 
 it("publishes state.error when replacing the group catalog is rejected", async () => {
@@ -160,7 +167,6 @@ it("publishes state.error when replacing the group catalog is rejected", async (
   );
   await expect(sessions.groupsPut(["Alpha"])).rejects.toThrow("group catalog rejected");
   expect(sessions.state.error).toBe("group catalog rejected");
-  sessions.dispose();
 });
 
 it("reports a group catalog replacement as stale after a same-client reconnect", async () => {
@@ -180,7 +186,6 @@ it("reports a group catalog replacement as stale after a same-client reconnect",
   await expect(operation).resolves.toBe("stale");
   expect(sessions.state.groups).toEqual([]);
   expect(sessions.state.error).toBeNull();
-  sessions.dispose();
 });
 
 it("keeps a confirmed group rename completed when its row refresh outlives the connection", async () => {
@@ -199,7 +204,6 @@ it("keeps a confirmed group rename completed when its row refresh outlives the c
   publish(false);
   refreshed.resolve(emptyList());
   await expect(mutation).resolves.toBe("completed");
-  sessions.dispose();
 });
 
 it("excludes lifecycle no-ops from batch deletion results", async () => {
@@ -249,7 +253,6 @@ it("excludes lifecycle no-ops from batch deletion results", async () => {
     { timeoutMs: 10 * 60_000 },
   );
   unsubscribe();
-  sessions.dispose();
 });
 
 it("creates a session while a list refresh is in flight", async () => {
@@ -272,7 +275,6 @@ it("creates a session while a list refresh is in flight", async () => {
   await refresh;
   expect(calls).toBe(2);
   expect(sessions.state.result?.sessions[0]?.key).toBe(key);
-  sessions.dispose();
 });
 
 it("reports a reset as stale when its connection epoch retires", async () => {
@@ -287,7 +289,6 @@ it("reports a reset as stale when its connection epoch retires", async () => {
   publish(true);
   pending.resolve({});
   await expect(reset).resolves.toBe("uncertain");
-  sessions.dispose();
 });
 
 it("reports a same-connection reset rejection as uncertain", async () => {
@@ -300,7 +301,6 @@ it("reports a same-connection reset rejection as uncertain", async () => {
   });
   await expect(sessions.reset(mainKey)).resolves.toBe("uncertain");
   expect(sessions.state.error).toContain("post-commit lifecycle failed");
-  sessions.dispose();
 });
 
 it("keeps background hydration non-blocking and retains an omitted selected row", async () => {
@@ -327,7 +327,6 @@ it("keeps background hydration non-blocking and retains an omitted selected row"
     expect.objectContaining({ key, label: "Oldest" }),
   ]);
   stop();
-  sessions.dispose();
 });
 
 it("publishes terminal run state to shared session subscribers", async () => {
@@ -386,7 +385,6 @@ it("publishes terminal run state to shared session subscribers", async () => {
   expect(terminal("run-1", "done", 360)).toBe(false);
   expect(current()).toMatchObject({ hasActiveRun: true, status: "running" });
   expect(terminal(undefined, "done", 360)).toBe(false);
-  sessions.dispose();
 });
 
 it("publishes remote deletion before refreshing the canonical list", async () => {
@@ -413,7 +411,6 @@ it("publishes remote deletion before refreshing the canonical list", async () =>
   pending.resolve(emptyList());
   await vi.advanceTimersByTimeAsync(0);
   expect(sessions.state.loading).toBe(false);
-  sessions.dispose();
 });
 
 it("refreshes broad lists when the client omits the server-side window limit", async () => {
@@ -436,7 +433,6 @@ it("refreshes broad lists when the client omits the server-side window limit", a
   await vi.advanceTimersByTimeAsync(5_000);
   expect(request).toHaveBeenCalledTimes(2);
   expect(sessions.state.result?.sessions.map((entry) => entry.key)).not.toContain(hiddenKey);
-  sessions.dispose();
 });
 
 it("ignores stale archive state after a newer unarchive via Gateway events", async () => {
@@ -461,7 +457,6 @@ it("ignores stale archive state after a newer unarchive via Gateway events", asy
     archived: false,
     updatedAt: 30,
   });
-  sessions.dispose();
 });
 
 it("does not probe for a group catalog when the method is explicitly absent", async () => {
@@ -470,7 +465,6 @@ it("does not probe for a group catalog when the method is explicitly absent", as
   await sessions.groupsLoad();
   expect(request).not.toHaveBeenCalled();
   expect(sessions.state.groups).toEqual([]);
-  sessions.dispose();
 });
 
 it("refreshes stale active rows after a terminal session message", async () => {
@@ -501,18 +495,15 @@ it("refreshes stale active rows after a terminal session message", async () => {
     status: "done",
   });
   expect(request).toHaveBeenCalledTimes(2);
-  sessions.dispose();
 });
 
 describe("session capability dashboard default acknowledgements", () => {
   const key = "agent:main:dashboard";
   const sessionId = "dashboard-incarnation";
   const patchOptions = { agentId: "main", expectedSessionId: sessionId, deferListRefresh: true };
-  const initial: GatewaySessionRow = {
-    key,
+  const initial = row(key, {
     agentId: "main",
     sessionId,
-    kind: "direct",
     updatedAt: 10,
     boardFace: "dashboard",
     boardPresentation: "split",
@@ -521,7 +512,7 @@ describe("session capability dashboard default acknowledgements", () => {
     unread: true,
     lastReadAt: 1,
     lastActivityAt: 10,
-  };
+  });
 
   function acknowledgement(
     presentation: GatewaySessionRow["boardPresentation"],
@@ -575,6 +566,16 @@ describe("session capability dashboard default acknowledgements", () => {
       client,
       request,
       patchReply,
+      patch: (
+        fields: Parameters<typeof sessions.patch>[1],
+        options: Parameters<typeof sessions.patch>[2] = patchOptions,
+      ) => {
+        const operation = sessions.patch(key, fields, options);
+        expect(request.mock.calls.filter(([method]) => method === "sessions.patch")).toHaveLength(
+          1,
+        );
+        return operation;
+      },
       setCurrent: (next: GatewaySessionRow) => {
         current = next;
       },
@@ -592,12 +593,7 @@ describe("session capability dashboard default acknowledgements", () => {
     });
     const query = { agentId: "main", hasBoard: true, archivedFilter: "all" as const };
     await h.sessions.refreshList({ ...query, force: true });
-    const operation = h.sessions.patch(
-      key,
-      { boardFace: "dashboard", boardPresentation: null },
-      patchOptions,
-    );
-    expect(h.request.mock.calls.filter(([method]) => method === "sessions.patch")).toHaveLength(1);
+    const operation = h.patch({ boardFace: "dashboard", boardPresentation: null });
     for (const result of [h.sessions.state.result, h.sessions.listSnapshot(query).result]) {
       expect(result?.sessions[0]?.boardPresentation).toBe("expanded");
     }
@@ -619,15 +615,13 @@ describe("session capability dashboard default acknowledgements", () => {
   it("retains the acknowledged default when the follow-up list fails and an older read arrives", async () => {
     const h = await createPresentationHarness();
     const reconcileEarlierRead = h.sessions.captureReconcile();
-    const operation = h.sessions.patch(
-      key,
+    const operation = h.patch(
       { boardPresentation: "split" },
       {
         agentId: "main",
         expectedSessionId: sessionId,
       },
     );
-    expect(h.request.mock.calls.filter(([method]) => method === "sessions.patch")).toHaveLength(1);
     h.failList();
     h.patchReply.resolve(acknowledgement("expanded"));
     await expect(operation).resolves.toBeTruthy();
@@ -638,8 +632,7 @@ describe("session capability dashboard default acknowledgements", () => {
 
   it("keeps a newer external default ahead of an older successful patch acknowledgement", async () => {
     const h = await createPresentationHarness();
-    const operation = h.sessions.patch(key, { boardPresentation: "expanded" }, patchOptions);
-    expect(h.request.mock.calls.filter(([method]) => method === "sessions.patch")).toHaveLength(1);
+    const operation = h.patch({ boardPresentation: "expanded" });
     h.emitEvent({
       type: "event",
       event: "sessions.changed",
@@ -662,8 +655,7 @@ describe("session capability dashboard default acknowledgements", () => {
 
   it("does not attach an old incarnation's acknowledgement to a replacement row", async () => {
     const h = await createPresentationHarness();
-    const operation = h.sessions.patch(key, { boardPresentation: "expanded" }, patchOptions);
-    expect(h.request.mock.calls.filter(([method]) => method === "sessions.patch")).toHaveLength(1);
+    const operation = h.patch({ boardPresentation: "expanded" });
     const replacement = { ...initial, sessionId: "replacement-session", updatedAt: 30 };
     h.setCurrent(replacement);
     await h.sessions.refresh({ agentId: "main", force: true });
@@ -677,8 +669,7 @@ describe("session capability dashboard default acknowledgements", () => {
 
   it("does not project a successful acknowledgement into a replacement Gateway", async () => {
     const h = await createPresentationHarness();
-    const operation = h.sessions.patch(key, { boardPresentation: "expanded" }, patchOptions);
-    expect(h.request.mock.calls.filter(([method]) => method === "sessions.patch")).toHaveLength(1);
+    const operation = h.patch({ boardPresentation: "expanded" });
     const replacement = { ...initial, sessionId: "other-gateway-session", updatedAt: 40 };
     const replacementClient = createTestGatewayClient((method) => {
       if (method === "sessions.list") {
@@ -703,7 +694,7 @@ const SESSION_EVENT_REFRESH_DEBOUNCE_MS = 5_000;
 it("ignores recap-only changes for canonical, filtered, and child rosters", async () => {
   vi.useFakeTimers();
   const key = "agent:main:parent";
-  const recapRow = { key, kind: "direct" as const, updatedAt: 1 };
+  const recapRow = row(key);
   const child = { ...recapRow, key: "agent:main:child", spawnedBy: key };
   const request = vi.fn(async (method: string, params?: { spawnedBy?: string }) => {
     if (method !== "sessions.list") {
