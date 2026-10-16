@@ -58,6 +58,7 @@ function oauthGuard(evidence: Record<string, unknown>, pinnedModel = oauthGuardM
     text: JSON.stringify(safeVerdict),
     provider: "openai",
     model: pinnedModel,
+    responseModel: oauthGuardResponseModel,
     stopReason: "stop",
     agentId: "main",
     usage: {},
@@ -195,21 +196,12 @@ describe("createConfiguredGuard", () => {
   );
 
   it.each([
-    [
-      "wrong provider",
-      { provider: "anthropic", responseModel: oauthGuardResponseModel, stopReason: "stop" },
-    ],
-    [
-      "wrong logical model",
-      { model: "gpt-5.6-sol", responseModel: oauthGuardResponseModel, stopReason: "stop" },
-    ],
-    ["missing response model", { responseModel: undefined, stopReason: "stop" }],
-    ["mismatched response model", { responseModel: "gpt-5.6-sol", stopReason: "stop" }],
-    [
-      "non-date response suffix",
-      { responseModel: `${oauthGuardModel}-preview`, stopReason: "stop" },
-    ],
-    ["incomplete response", { responseModel: oauthGuardResponseModel, stopReason: "length" }],
+    ["wrong provider", { provider: "anthropic" }],
+    ["wrong logical model", { model: "gpt-5.6-sol" }],
+    ["missing response model", { responseModel: undefined }],
+    ["mismatched response model", { responseModel: "gpt-5.6-sol" }],
+    ["non-date response suffix", { responseModel: `${oauthGuardModel}-preview` }],
+    ["incomplete response", { stopReason: "length" }],
   ])("fails closed for OAuth guard evidence: %s", async (_label, evidence) => {
     const { classifier } = oauthGuard(evidence);
 

@@ -13,7 +13,7 @@ import {
 } from "./state.test-support.js";
 import type { ReefTransportClient } from "./transport.js";
 import { ReefRelayError } from "./transport.js";
-import { openReefTrustStore } from "./trust-store.js";
+import { openReefTrustStore, type ReefTrustStore } from "./trust-store.js";
 import type { RelayFriend } from "./types.js";
 
 let stateDir: string;
@@ -66,8 +66,13 @@ async function addApproval(
   return token;
 }
 
-function transport(friend: RelayFriend) {
-  return {
+function pairingFixture(
+  friend = relayFriend("alice", "pending"),
+  signal?: AbortSignal,
+  pairing = approvals(),
+  store = trust(signal),
+) {
+  const relay = {
     handle: "me",
     listFriends: vi.fn(async () => ({ friendships: [friend] })),
     requestFriend: vi.fn(async () => ({ status: "pending" })),
@@ -79,15 +84,6 @@ function transport(friend: RelayFriend) {
       friend.status = "blocked";
     }),
   };
-}
-
-function pairingFixture(
-  friend = relayFriend("alice", "pending"),
-  signal?: AbortSignal,
-  pairing = approvals(),
-  store = trust(signal),
-) {
-  const relay = transport(friend);
   const manager = new ReefFriendManager(
     relay as unknown as ReefTransportClient,
     store,
@@ -97,9 +93,7 @@ function pairingFixture(
   return { friend, relay, store, pairing, manager };
 }
 
-function outgoing() {
-  return relayFriend("alice", "pending", generateIdentity(), 1, "me");
-}
+const outgoing = () => relayFriend("alice", "pending", generateIdentity(), 1, "me");
 
 function heldRequest(friend = outgoing(), signal?: AbortSignal, store = trust(signal)) {
   const fixture = pairingFixture(friend, signal, approvals(), store);
@@ -112,11 +106,7 @@ function heldRequest(friend = outgoing(), signal?: AbortSignal, store = trust(si
   return { ...fixture, started: started.promise, result };
 }
 
-function pin(
-  store: ReturnType<typeof trust>,
-  friend: RelayFriend,
-  autonomy: "bounded" | "extended",
-) {
+function pin(store: ReefTrustStore, friend: RelayFriend, autonomy: "bounded" | "extended") {
   return store.set(friend.peer, {
     autonomy,
     ed25519PublicKey: friend.ed25519_pub,
@@ -137,14 +127,12 @@ describe("ReefFriendManager pairing", () => {
     const { friend: pending, relay, store, pairing, manager } = pairingFixture();
     const issue = vi.fn(async () => {});
     await manager.surfacePairingCandidates(issue);
+    const { revision } = await store.snapshot(pending.peer);
     expect(issue).toHaveBeenCalledWith({
       peer: "alice",
       fingerprint: expect.stringMatching(/^[0-9a-f ]+$/),
       code: "alice",
-      approvalToken: store.createPairingApproval(
-        pending,
-        (await store.snapshot(pending.peer)).revision,
-      ),
+      approvalToken: store.createPairingApproval(pending, revision),
     });
     await expect(manager.reconcile()).resolves.toEqual([]);
     expect(await store.get("alice")).toBeUndefined();
@@ -180,8 +168,7 @@ describe("ReefFriendManager pairing", () => {
     expect(await store.get("alice")).toMatchObject({ autonomy: "bounded", keyEpoch: 1 });
     expect(await store.hasOutboundRequest("alice")).toBe(false);
 
-    const reopened = trust();
-    expect(await reopened.get("alice")).toMatchObject({ autonomy: "bounded" });
+    expect(await trust().get("alice")).toMatchObject({ autonomy: "bounded" });
     expect(fs.existsSync(path.join(stateDir, "requested.json"))).toBe(false);
   });
 
@@ -218,16 +205,12 @@ describe("ReefFriendManager pairing", () => {
     });
     const authority = createReefRuntimeAuthority();
     authority.activate({ friends: manager } as never);
-    let ownerCurrent = true;
+    const owner = new AbortController();
     const command = (args: string) =>
       handleReefCommand({
         args,
         senderIsOwner: true,
-        assertOwnerCurrent: () => {
-          if (!ownerCurrent) {
-            throw new Error("owner revoked");
-          }
-        },
+        assertOwnerCurrent: () => owner.signal.throwIfAborted(),
       });
     try {
       const accepted = command("friend request alice");
@@ -239,14 +222,11 @@ describe("ReefFriendManager pairing", () => {
         command("friend block alice"),
         command("friend autonomy alice extended"),
       ]);
-      ownerCurrent = false;
+      owner.abort(new Error("owner revoked"));
       result.resolve({ status: "pending" });
       await expect(accepted).resolves.toEqual({ text: "Reef friend request submitted." });
-      for (const queuedResult of await queued) {
-        expect(queuedResult).toMatchObject({
-          status: "rejected",
-          reason: new Error("owner revoked"),
-        });
+      for (const entry of await queued) {
+        expect(entry).toMatchObject({ status: "rejected", reason: new Error("owner revoked") });
       }
       expect(await store.hasOutboundRequest("alice")).toBe(true);
       expect(await store.hasOutboundRequest("bob")).toBe(false);
@@ -321,8 +301,7 @@ describe("ReefFriendManager pairing", () => {
     const { manager, relay, started, result } = heldRequest(pending, authority.signal);
     const { manager: second } = pairingFixture(pending);
 
-    const rejected = manager.request("alice");
-    const rejection = expect(rejected).rejects.toThrow("invalid request");
+    const rejection = expect(manager.request("alice")).rejects.toThrow("invalid request");
     await started;
     const originalId = Object.keys((await trust().snapshot("alice")).outboundRequests ?? {})[0];
     await expect(second.request("alice")).resolves.toEqual({ status: "pending" });
