@@ -21,6 +21,10 @@ import type { WorkerPlacementDispatchService } from "./placement-dispatch.js";
 import type { WorkerPlacementDispatchRequest } from "./service-contract.js";
 
 type DispatchService = WorkerPlacementDispatchService;
+const coordinate = (
+  overrides: Partial<DispatchService>,
+  admit: Parameters<typeof coordinateWorkerPlacementDispatch>[1] = (_request, run) => run(),
+) => coordinateWorkerPlacementDispatch(createCoordinatorTestService(overrides), admit);
 
 describe("worker placement dispatch coordinator", () => {
   it.each(["dispatch", "move"] as const)(
@@ -63,15 +67,15 @@ describe("worker placement dispatch coordinator", () => {
     const release = createDeferredCore();
     const controller = new AbortController();
     const dispatch = vi.fn(async () => ACTIVE_PLACEMENT);
-    const coordinated = coordinateWorkerPlacementDispatch(
-      createCoordinatorTestService({
+    const coordinated = coordinate(
+      {
         dispatch,
         move: async () => {
           entered.resolve();
           await release.promise;
           return LOCAL_PLACEMENT;
         },
-      }),
+      },
       (_request, run, _authorize, signal) => run(signal),
     );
     const moving = coordinated.move(MOVE_REQUEST);
@@ -93,29 +97,27 @@ describe("worker placement dispatch coordinator", () => {
     const moveAdmission = createDeferredCore();
     let admissions = 0;
     let stopped = false;
-    const service = {
-      dispatch: async () => {
-        dispatchEntered.resolve();
-        await dispatchRelease.promise;
-        return { state: "active" };
+    const coordinated = coordinate(
+      {
+        dispatch: async () => {
+          dispatchEntered.resolve();
+          await dispatchRelease.promise;
+          return ACTIVE_PLACEMENT;
+        },
+        move: async () => LOCAL_PLACEMENT,
+        reclaim: async (_request, _authorize, _beforeDrain, serialize, pending) => {
+          expect(pending?.isCurrent()).toBe(true);
+          await pending!.settled;
+          return await serialize!(async () => ({ ...LOCAL_PLACEMENT, state: "reclaimed" }));
+        },
       },
-      move: async () => ({ state: "local" }),
-      reclaim: async (
-        ...[_request, _authorize, _beforeDrain, serialize, pending]: Parameters<
-          DispatchService["reclaim"]
-        >
-      ) => {
-        expect(pending?.isCurrent()).toBe(true);
-        await pending!.settled;
-        return await serialize!(async () => ({ state: "reclaimed" }) as never);
+      async (_request, run) => {
+        if (++admissions === 2) {
+          await moveAdmission.promise;
+        }
+        return await run();
       },
-    } as unknown as DispatchService;
-    const coordinated = coordinateWorkerPlacementDispatch(service, async (_request, run) => {
-      if (++admissions === 2) {
-        await moveAdmission.promise;
-      }
-      return await run();
-    });
+    );
     const dispatch = coordinated.dispatch(REQUEST);
     await dispatchEntered.promise;
     const moving = coordinated.move(MOVE_REQUEST);
@@ -139,40 +141,40 @@ describe("worker placement dispatch coordinator", () => {
     const finishStop = createDeferredCore();
     const scope = "/tmp/openclaw-coordinator-predecessor-admission.sqlite";
     const identities = [REQUEST.sessionKey, REQUEST.sessionId];
-    const dispatch = vi.fn(async () => ({ state: "active" }));
-    const service = {
-      dispatch,
-      reclaim: async (
-        ...[_request, _authorize, _beforeDrain, serialize]: Parameters<DispatchService["reclaim"]>
-      ) => {
-        const release = closeSessionWorkAdmissions({
+    const dispatch = vi.fn(async () => ACTIVE_PLACEMENT);
+    const coordinated = coordinate(
+      {
+        dispatch,
+        reclaim: async (_request, _authorize, _beforeDrain, serialize) => {
+          const release = closeSessionWorkAdmissions({
+            scope,
+            identities,
+            reason: new Error("older Stop"),
+          });
+          try {
+            stopping.resolve();
+            await finishStop.promise;
+            return await serialize!(async () => ({ ...LOCAL_PLACEMENT, state: "reclaimed" }));
+          } finally {
+            release();
+          }
+        },
+      },
+      async (_request, run) => {
+        const controller = new AbortController();
+        const admission = await beginSessionWorkAdmission({
           scope,
           identities,
-          reason: new Error("older Stop"),
+          assertAllowed: () => {},
+          onInterrupt: (reason) => controller.abort(reason),
         });
         try {
-          stopping.resolve();
-          await finishStop.promise;
-          return await serialize!(async () => ({ state: "reclaimed" }) as never);
+          return await admission.run(() => run(controller.signal));
         } finally {
-          release();
+          admission.release();
         }
       },
-    } as unknown as DispatchService;
-    const coordinated = coordinateWorkerPlacementDispatch(service, async (_request, run) => {
-      const controller = new AbortController();
-      const admission = await beginSessionWorkAdmission({
-        scope,
-        identities,
-        assertAllowed: () => {},
-        onInterrupt: (reason) => controller.abort(reason),
-      });
-      try {
-        return await admission.run(() => run(controller.signal));
-      } finally {
-        admission.release();
-      }
-    });
+    );
     const previous = coordinated.reclaim(REQUEST);
     await stopping.promise;
     const later = coordinated.dispatch(REQUEST);
@@ -192,26 +194,24 @@ describe("worker placement dispatch coordinator", () => {
     async (kind) => {
       const admitted = createDeferredCore();
       const controller = new AbortController();
-      const dispatch = vi.fn(async () => ({ state: "active" }));
-      const move = vi.fn(async () => ({ state: "local" }));
-      const service = {
-        dispatch,
-        move,
-        reclaim: async (
-          ...[_request, _authorize, _beforeDrain, serialize, pending]: Parameters<
-            DispatchService["reclaim"]
-          >
-        ) => {
-          expect(pending?.isCurrent()).toBe(true);
-          controller.abort(new Error("Stop"));
-          await pending!.settled.catch(() => undefined);
-          return await serialize!(async () => ({ state: "reclaimed" }) as never);
+      const dispatch = vi.fn(async () => ACTIVE_PLACEMENT);
+      const move = vi.fn(async () => LOCAL_PLACEMENT);
+      const coordinated = coordinate(
+        {
+          dispatch,
+          move,
+          reclaim: async (_request, _authorize, _beforeDrain, serialize, pending) => {
+            expect(pending?.isCurrent()).toBe(true);
+            controller.abort(new Error("Stop"));
+            await pending!.settled.catch(() => undefined);
+            return await serialize!(async () => ({ ...LOCAL_PLACEMENT, state: "reclaimed" }));
+          },
         },
-      } as unknown as DispatchService;
-      const coordinated = coordinateWorkerPlacementDispatch(service, async (_request, run) => {
-        await admitted.promise;
-        return await run(controller.signal);
-      });
+        async (_request, run) => {
+          await admitted.promise;
+          return await run(controller.signal);
+        },
+      );
       let operationFinished = false;
       let stopFinished = false;
       const operation =
@@ -247,18 +247,16 @@ describe("worker placement dispatch coordinator", () => {
       const release = createDeferredCore();
       const events: string[] = [];
       let stops = 0;
-      const service = {
+      const coordinated = coordinate({
         dispatch: vi.fn(async (request: WorkerPlacementDispatchRequest) => {
           events.push(`dispatch:${request.sessionId}`);
-          return { state: "active" };
+          return ACTIVE_PLACEMENT;
         }),
         move: vi.fn(async () => {
           events.push("move");
-          return { state: "local" };
+          return LOCAL_PLACEMENT;
         }),
-        reclaim: async (
-          ...[_request, _authorize, _beforeDrain, serialize]: Parameters<DispatchService["reclaim"]>
-        ) => {
+        reclaim: async (_request, _authorize, _beforeDrain, serialize) => {
           if (++stops > 1) {
             throw new Error("second Stop failed");
           }
@@ -267,14 +265,13 @@ describe("worker placement dispatch coordinator", () => {
           await coordinated.reconcileActive();
           return await serialize!(async () => {
             events.push("stop");
-            return { state: "reclaimed" } as never;
+            return { ...LOCAL_PLACEMENT, state: "reclaimed" };
           });
         },
         reconcileActive: vi.fn(async () => {
           events.push("recovery");
         }),
-      } as unknown as DispatchService;
-      const coordinated = coordinateWorkerPlacementDispatch(service, (_request, run) => run());
+      });
       const stopping = coordinated.reclaim(REQUEST);
       await entered.promise;
       await expect(coordinated.reclaim(REQUEST)).rejects.toThrow("second Stop failed");
@@ -300,23 +297,17 @@ describe("worker placement dispatch coordinator", () => {
     const observer = vi.fn();
     const authorize = vi.fn();
     const sessionCurrent = vi.fn();
-    const placement = { state: "active" };
-    const dispatch = vi.fn(async (_request, report, assertCurrent) => {
+    const placement = ACTIVE_PLACEMENT;
+    const dispatch = vi.fn<DispatchService["dispatch"]>(async (_request, report, assertCurrent) => {
       assertCurrent?.();
       report?.(placement);
       return placement;
     });
-    const service = {
-      dispatch,
-      forceDestroyEnvironment: vi.fn(),
-      reclaim: vi.fn(),
-      reconcile: vi.fn(async () => {}),
-      reconcileActive: vi.fn(async () => {}),
-    } as unknown as DispatchService;
-
-    await coordinateWorkerPlacementDispatch(service, (_request, run) =>
-      run(undefined, sessionCurrent),
-    ).dispatch(REQUEST, observer, authorize);
+    await coordinate({ dispatch }, (_request, run) => run(undefined, sessionCurrent)).dispatch(
+      REQUEST,
+      observer,
+      authorize,
+    );
 
     expect(dispatch).toHaveBeenCalledWith(
       REQUEST,
@@ -333,50 +324,41 @@ describe("worker placement dispatch coordinator", () => {
   it("coalesces an identical dispatch and rejects a conflicting in-flight request", async () => {
     const dispatchStarted = createDeferredCore();
     const releaseDispatch = createDeferredCore();
-    const active = { state: "active" };
+    const active = ACTIVE_PLACEMENT;
     const dispatch = vi.fn(async () => {
       dispatchStarted.resolve();
       await releaseDispatch.promise;
       return active;
     });
-    const service = {
-      dispatch,
-      forceDestroyEnvironment: vi.fn(),
-      reclaim: vi.fn(),
-      reconcile: vi.fn(async () => {}),
-      reconcileActive: vi.fn(async () => {}),
-    } as unknown as DispatchService;
-    const coordinated = coordinateWorkerPlacementDispatch(service, (_request, run) => run());
+    const coordinated = coordinate({ dispatch });
 
     const first = coordinated.dispatch(REQUEST);
     await dispatchStarted.promise;
-    await expect(
-      coordinated.dispatch({ ...REQUEST, profileId: "another-profile" }),
-    ).rejects.toThrow(`Session ${REQUEST.sessionKey} is already dispatching another request`);
-    await expect(coordinated.dispatch({ ...REQUEST, machineClass: "beast" })).rejects.toThrow(
-      `Session ${REQUEST.sessionKey} is already dispatching another request`,
-    );
-    await expect(coordinated.dispatch({ ...REQUEST, os: "os-a" })).rejects.toThrow(
-      `Session ${REQUEST.sessionKey} is already dispatching another request`,
-    );
-    await expect(
-      coordinated.dispatch({
-        ...REQUEST,
+    const conflictMessage = `Session ${REQUEST.sessionKey} is already dispatching another request`;
+    for (const change of [
+      { profileId: "another-profile" },
+      { machineClass: "beast" },
+      { os: "os-a" },
+      {
         inheritedProfile: {
           providerId: "fake",
           profileSnapshot: { settings: { region: "parent" } },
         },
-      }),
-    ).rejects.toThrow(`Session ${REQUEST.sessionKey} is already dispatching another request`);
+      },
+    ]) {
+      await expect(coordinated.dispatch({ ...REQUEST, ...change })).rejects.toThrow(
+        conflictMessage,
+      );
+    }
     const modeConflict = expect(
       coordinated.dispatch({ ...REQUEST, executionMode: "remote-exec" }),
-    ).rejects.toThrow(`Session ${REQUEST.sessionKey} is already dispatching another request`);
+    ).rejects.toThrow(conflictMessage);
     const devicePlacementConflict = expect(
       coordinated.dispatch({
         ...REQUEST,
         devicePlacement: { requiredNodeCommands: ["system.run"], consumesWorkerSlot: true },
       }),
-    ).rejects.toThrow(`Session ${REQUEST.sessionKey} is already dispatching another request`);
+    ).rejects.toThrow(conflictMessage);
     const retry = coordinated.dispatch(REQUEST);
     releaseDispatch.resolve();
 
@@ -399,21 +381,20 @@ describe("worker placement dispatch coordinator", () => {
     async ({ kind, revokedBeforeJoining }) => {
       const ownerStarted = createDeferredCore();
       const releaseOwner = createDeferredCore();
-      const expectedResult = { state: kind === "dispatch" ? "active" : "local" };
-      const operation = vi.fn(async () => {
+      const expectedResult = kind === "dispatch" ? ACTIVE_PLACEMENT : LOCAL_PLACEMENT;
+      const waitForOwner = async () => {
         ownerStarted.resolve();
         await releaseOwner.promise;
-        return expectedResult;
+      };
+      const dispatch = vi.fn(async () => {
+        await waitForOwner();
+        return ACTIVE_PLACEMENT;
       });
-      const service = {
-        dispatch: kind === "dispatch" ? operation : vi.fn(),
-        forceDestroyEnvironment: vi.fn(),
-        move: kind === "move" ? operation : vi.fn(),
-        reclaim: vi.fn(),
-        reconcile: vi.fn(async () => {}),
-        reconcileActive: vi.fn(async () => {}),
-      } as unknown as DispatchService;
-      const coordinated = coordinateWorkerPlacementDispatch(service, (_request, run) => run());
+      const move = vi.fn(async () => {
+        await waitForOwner();
+        return LOCAL_PLACEMENT;
+      });
+      const coordinated = coordinate({ dispatch, move });
       const invoke = (authorize?: () => void) =>
         kind === "dispatch"
           ? coordinated.dispatch(REQUEST, undefined, authorize)
@@ -439,7 +420,7 @@ describe("worker placement dispatch coordinator", () => {
         { status: "rejected", reason: new Error("session access revoked") },
       ]);
       expect(observedAuthorizationStates).toEqual(revokedBeforeJoining ? [true] : [false, true]);
-      expect(operation).toHaveBeenCalledOnce();
+      expect(kind === "dispatch" ? dispatch : move).toHaveBeenCalledOnce();
     },
   );
 
@@ -453,14 +434,7 @@ describe("worker placement dispatch coordinator", () => {
       throw dispatchError;
     });
     const reconcileActive = vi.fn(async () => {});
-    const service = {
-      dispatch,
-      forceDestroyEnvironment: vi.fn(),
-      reclaim: vi.fn(),
-      reconcile: vi.fn(async () => {}),
-      reconcileActive,
-    } as unknown as DispatchService;
-    const coordinated = coordinateWorkerPlacementDispatch(service, (_request, run) => run());
+    const coordinated = coordinate({ dispatch, reconcileActive });
 
     const first = coordinated.dispatch(REQUEST);
     await dispatchStarted.promise;
@@ -486,21 +460,13 @@ describe("worker placement dispatch coordinator", () => {
   it("serializes a move against new dispatches", async () => {
     const moveStarted = createDeferredCore();
     const releaseMove = createDeferredCore();
-    const dispatch = vi.fn().mockResolvedValue({ state: "active" });
+    const dispatch = vi.fn(async () => ACTIVE_PLACEMENT);
     const move = vi.fn(async () => {
       moveStarted.resolve();
       await releaseMove.promise;
-      return { state: "local" };
+      return LOCAL_PLACEMENT;
     });
-    const service = {
-      dispatch,
-      forceDestroyEnvironment: vi.fn(),
-      move,
-      reclaim: vi.fn(),
-      reconcile: vi.fn(async () => {}),
-      reconcileActive: vi.fn(async () => {}),
-    } as unknown as DispatchService;
-    const coordinated = coordinateWorkerPlacementDispatch(service, (_request, run) => run());
+    const coordinated = coordinate({ dispatch, move });
 
     const moving = coordinated.move(MOVE_REQUEST);
     await moveStarted.promise;
@@ -562,7 +528,7 @@ describe("worker placement dispatch coordinator", () => {
     const fullEntered = createDeferredCore();
     const releaseFull = createDeferredCore();
     const targets: (string | undefined)[] = [];
-    const service = createCoordinatorTestService({
+    const coordinated = coordinate({
       reconcileActive: async (environmentId) => {
         targets.push(environmentId);
         if (environmentId === undefined) {
@@ -571,7 +537,6 @@ describe("worker placement dispatch coordinator", () => {
         }
       },
     });
-    const coordinated = coordinateWorkerPlacementDispatch(service, (_request, run) => run());
     const first = coordinated.reconcileActive();
     await fullEntered.promise;
     const joined = coordinated.reconcileActive();
@@ -603,19 +568,16 @@ describe("worker placement dispatch coordinator", () => {
           environmentPass = undefined;
         }));
       const resumeProvisioning = vi.fn(async (_placement, core) => await core());
-      const coordinated = coordinateWorkerPlacementDispatch(
-        createCoordinatorTestService({
-          dispatch: async () => {
-            dispatchEntered.resolve();
-            await releaseDispatch.promise;
-            return ACTIVE_PLACEMENT;
-          },
-          reconcile: reconcileEnvironmentOnce,
-          reconcileActive: reconcileEnvironmentOnce,
-          resumeProvisioning: admittedRecovery(resumeProvisioning),
-        }),
-        (_request, run) => run(),
-      );
+      const coordinated = coordinate({
+        dispatch: async () => {
+          dispatchEntered.resolve();
+          await releaseDispatch.promise;
+          return ACTIVE_PLACEMENT;
+        },
+        reconcile: reconcileEnvironmentOnce,
+        reconcileActive: reconcileEnvironmentOnce,
+        resumeProvisioning: admittedRecovery(resumeProvisioning),
+      });
       const dispatch = coordinated.dispatch(REQUEST);
       await dispatchEntered.promise;
       const environment = reconcileEnvironmentOnce();
@@ -644,14 +606,14 @@ describe("worker placement dispatch coordinator", () => {
         ...request,
       }));
       const unit = vi.fn(async () => {});
-      const coordinated = coordinateWorkerPlacementDispatch(
-        createCoordinatorTestService({
+      const coordinated = coordinate(
+        {
           dispatch,
           resumeProvisioning: admittedRecovery(recovery),
           reconcile: async (_mode, admit) => {
             expect(await admit!([REQUEST.sessionId], unit)).toBe(false);
           },
-        }),
+        },
         async (_request, run) => {
           try {
             return await run();
@@ -700,19 +662,16 @@ describe("worker placement dispatch coordinator", () => {
         return LOCAL_PLACEMENT;
       };
       const recover = vi.fn(async (_placement, core) => await core());
-      const coordinated = coordinateWorkerPlacementDispatch(
-        createCoordinatorTestService({
-          move: block,
-          reclaim: preparedReclaim(block),
-          readEnvironmentSessionIds: async () => [REQUEST.sessionId],
-          forceDestroyEnvironment: async () => {
-            await block();
-            return createDispatchEnvironmentFixtures().destroyedEnvironment(2);
-          },
-          resumeProvisioning: admittedRecovery(recover),
-        }),
-        (_request, run) => run(),
-      );
+      const coordinated = coordinate({
+        move: block,
+        reclaim: preparedReclaim(block),
+        readEnvironmentSessionIds: async () => [REQUEST.sessionId],
+        forceDestroyEnvironment: async () => {
+          await block();
+          return createDispatchEnvironmentFixtures().destroyedEnvironment(2);
+        },
+        resumeProvisioning: admittedRecovery(recover),
+      });
       const blocking =
         kind === "move"
           ? coordinated.move(MOVE_REQUEST)
