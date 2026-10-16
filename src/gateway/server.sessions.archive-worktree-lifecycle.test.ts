@@ -59,9 +59,43 @@ async function archiveFixture() {
   const scope = { storePath, sessionKey: key };
   return {
     ...fixture,
-    entry: () => loadSessionEntry(scope),
+    scope,
+    entry: (sessionKey = key) => loadSessionEntry({ storePath, sessionKey }),
+    transcript: () => loadSeededTranscriptEvents(fixture.transcriptScope),
+    patch: (fields: Record<string, unknown>, opts?: Parameters<typeof directSessionReq>[2]) =>
+      directSessionReq("sessions.patch", { key, expectedSessionId: sessionId, ...fields }, opts),
+    patchMany: (
+      fields: Record<string, unknown>,
+      identities = [{ key, sessionId }],
+      opts?: Parameters<typeof directSessionReq>[2],
+    ) =>
+      directSessionReq<SessionsPatchManyResult>(
+        "sessions.patchMany",
+        {
+          targets: identities.map((identity) => ({
+            key: identity.key,
+            expectedSessionId: identity.sessionId,
+          })),
+          patch: fields,
+        },
+        opts,
+      ),
+    git: async (...args: string[]) =>
+      (await execFileAsync("git", ["-C", worktree.path, ...args])).stdout,
     registry: () => getRegistryWorktree(process.env, worktree.id),
     write: (file: string, text: string) => fs.writeFile(path.join(worktree.path, file), text),
+    async expectSnapshot() {
+      expect(loadSessionEntry(scope)).toMatchObject({
+        sessionId,
+        archivedAt: expect.any(Number),
+        worktree: { id: worktree.id },
+      });
+      await expect(fs.access(worktree.path)).rejects.toThrow();
+      expect(getRegistryWorktree(process.env, worktree.id)).toMatchObject({
+        removedAt: expect.any(Number),
+        snapshotRef: expect.stringMatching(/^refs\/openclaw\/snapshots\//),
+      });
+    },
     async expectFile(file: string, text: string) {
       await expect(fs.readFile(path.join(worktree.path, file), "utf8")).resolves.toBe(text);
     },
@@ -96,11 +130,11 @@ async function createPeer() {
   return result.payload!;
 }
 
-test("sessions.patchMany releases unrelated writes while restoration waits for allocation", async ({
+test("patchMany releases unrelated writes while restore waits for allocation", async ({
   signal,
 }) => {
   const fixture = await archiveFixture();
-  const { key, sessionId, cleanupWorktrees } = fixture;
+  const { key, cleanupWorktrees } = fixture;
   const peer = await createPeer();
   const batchPeer = await createPeer();
   await fixture.write("draft.txt", "preserved work\n");
@@ -138,13 +172,7 @@ test("sessions.patchMany releases unrelated writes while restoration waits for a
       awaitGateBeforeSettlement(entered.promise, allocation, "allocation lease was not acquired"),
       signal,
     );
-    mutation = directSessionReq("sessions.patchMany", {
-      targets: [
-        { key, expectedSessionId: sessionId },
-        { key: batchPeer.key, expectedSessionId: batchPeer.sessionId },
-      ],
-      patch: { archived: false },
-    });
+    mutation = fixture.patchMany({ archived: false }, [fixture, batchPeer]);
     await withinTest(
       awaitGateBeforeSettlement(operationEntered.promise, mutation, "restore was not attempted"),
       signal,
@@ -177,7 +205,7 @@ test("sessions.patchMany releases unrelated writes while restoration waits for a
   await fixture.expectFile("draft.txt", "preserved work\n");
 });
 
-test("unarchive before the cleanup tick preserves the live checkout", async () => {
+test("unarchive before cleanup preserves the live checkout", async () => {
   const fixture = await archiveFixture();
   const { cleanupWorktrees } = fixture;
   await fixture.write("draft.txt", "never removed\n");
@@ -196,11 +224,9 @@ test("unarchive before the cleanup tick preserves the live checkout", async () =
   }
 });
 
-test("unarchive waits for its in-flight cleanup and restores the finalized snapshot", async ({
-  signal,
-}) => {
+test("unarchive waits for cleanup and restores its finalized snapshot", async ({ signal }) => {
   const fixture = await archiveFixture();
-  const { key, sessionId, cleanupWorktrees } = fixture;
+  const { cleanupWorktrees } = fixture;
   await fixture.write("draft.txt", "preserved across in-flight cleanup\n");
   await fixture.archive(true);
   const entered = createDeferredCore();
@@ -229,11 +255,7 @@ test("unarchive waits for its in-flight cleanup and restores the finalized snaps
       awaitGateBeforeSettlement(entered.promise, cleanup, "cleanup did not enter removal"),
       signal,
     );
-    unarchive = directSessionReq("sessions.patch", {
-      key,
-      expectedSessionId: sessionId,
-      archived: false,
-    });
+    unarchive = fixture.patch({ archived: false });
     await withinTest(
       awaitGateBeforeSettlement(
         submitted.promise,
@@ -257,9 +279,9 @@ test("unarchive waits for its in-flight cleanup and restores the finalized snaps
   }
 });
 
-test("sessions.patchMany leaves a failed restore's label available to a later target", async () => {
+test("patchMany leaves a failed restore's label available to a later target", async () => {
   const fixture = await archiveFixture();
-  const { key, sessionId, storePath, worktree, cleanupWorktrees } = fixture;
+  const { worktree, cleanupWorktrees } = fixture;
   const peer = await createPeer();
   await fixture.archive(true);
   await cleanupWorktrees();
@@ -267,13 +289,10 @@ test("sessions.patchMany leaves a failed restore's label available to a later ta
     .spyOn(ManagedWorktreeService.prototype, "restore")
     .mockRejectedValueOnce(new Error("checkout unavailable"));
   try {
-    const result = await directSessionReq<SessionsPatchManyResult>("sessions.patchMany", {
-      targets: [
-        { key, expectedSessionId: sessionId },
-        { key: peer.key, expectedSessionId: peer.sessionId },
-      ],
-      patch: { archived: false, label: "Available label" },
-    });
+    const result = await fixture.patchMany({ archived: false, label: "Available label" }, [
+      fixture,
+      peer,
+    ]);
     expect(result).toMatchObject({
       ok: true,
       payload: { outcomes: [{ ok: false, error: { code: "UNAVAILABLE" } }, { ok: true }] },
@@ -289,7 +308,7 @@ test("sessions.patchMany leaves a failed restore's label available to a later ta
     });
     expect(fixture.entry()?.archivedAt).toEqual(expect.any(Number));
     expect(fixture.entry()?.label).not.toBe("Available label");
-    expect(loadSessionEntry({ storePath, sessionKey: peer.key })?.label).toBe("Available label");
+    expect(fixture.entry(peer.key)?.label).toBe("Available label");
     await expect(fs.access(worktree.path)).rejects.toThrow();
   } finally {
     restore.mockRestore();
@@ -297,11 +316,10 @@ test("sessions.patchMany leaves a failed restore's label available to a later ta
 });
 
 test.each(["identity", "label-owner", "participants", "removed"] as const)(
-  "sessions.patch preserves owner contracts after %s changes during restoration",
+  "patch preserves %s changes during restoration",
   async (change) => {
     const fixture = await archiveFixture();
-    const { key, sessionId, storePath, worktree, cleanupWorktrees } = fixture;
-    const scope = { storePath, sessionKey: key };
+    const { worktree, cleanupWorktrees, scope } = fixture;
     const peer = await createPeer();
     await fixture.archive(true);
     await cleanupWorktrees();
@@ -344,12 +362,7 @@ test.each(["identity", "label-owner", "participants", "removed"] as const)(
         return restored;
       });
     try {
-      const result = await directSessionReq("sessions.patch", {
-        key,
-        expectedSessionId: sessionId,
-        archived: false,
-        label: "Requested label",
-      });
+      const result = await fixture.patch({ archived: false, label: "Requested label" });
       const entry = loadSessionEntry(scope);
       if (change === "participants" || change === "removed") {
         expect(result.ok).toBe(true);
@@ -366,9 +379,7 @@ test.each(["identity", "label-owner", "participants", "removed"] as const)(
         expect(entry?.sessionId).toBe("replacement-session");
       }
       if (change === "label-owner") {
-        expect(loadSessionEntry({ storePath, sessionKey: peer.key })?.label).toBe(
-          "Requested label",
-        );
+        expect(fixture.entry(peer.key)?.label).toBe("Requested label");
       }
       if (change === "removed") {
         // Manual checkout removal deliberately leaves conversation metadata and binding intact.
@@ -388,12 +399,11 @@ test.each(["identity", "label-owner", "participants", "removed"] as const)(
 );
 
 test.each(["accepted", "revoked", "replacement"] as const)(
-  "sessions.patchMany retains the earlier permission owner across a later restore (%s)",
+  "patchMany retains earlier permission authority across restore (%s)",
   async (scenario) => {
     const fixture = await archiveFixture();
-    const { key, sessionId, storePath, worktree, cleanupWorktrees } = fixture;
-    const created = await createPeer();
-    const earlier = created;
+    const { storePath, worktree, cleanupWorktrees } = fixture;
+    const earlier = await createPeer();
     const earlierScope = { storePath, sessionKey: earlier.key };
     await patchSessionEntryCore(earlierScope, () => ({ permissionMode: "guarded" }), {
       skipMaintenance: true,
@@ -429,15 +439,9 @@ test.each(["accepted", "revoked", "replacement"] as const)(
         return result;
       });
     let revoked = false;
-    const pending = directSessionReq<SessionsPatchManyResult>(
-      "sessions.patchMany",
-      {
-        targets: [
-          { key: earlier.key, expectedSessionId: earlier.sessionId },
-          { key, expectedSessionId: sessionId },
-        ],
-        patch: { archived: false, permissionMode: "read-only" },
-      },
+    const pending = fixture.patchMany(
+      { archived: false, permissionMode: "read-only" },
+      [earlier, fixture],
       {
         // Exercise the handler's supplied live-authority contract independently of row equality.
         sessionMutationAuthorization: {
@@ -467,37 +471,29 @@ test.each(["accepted", "revoked", "replacement"] as const)(
       }
       release.resolve();
       const result = await pending;
+      const forbidden = { ok: false, error: { code: "FORBIDDEN" } };
+      const earlierOutcome =
+        scenario === "revoked"
+          ? forbidden
+          : scenario === "accepted"
+            ? { ok: true }
+            : {
+                ok: false,
+                error: {
+                  code: "UNAVAILABLE",
+                  message: expect.stringContaining("Permissions were saved"),
+                },
+              };
+      expect(result).toMatchObject({
+        ok: true,
+        payload: { outcomes: [earlierOutcome, scenario === "revoked" ? forbidden : { ok: true }] },
+      });
+      expect(loadSessionEntry(earlierScope)?.permissionMode).toBe(
+        scenario === "revoked" ? "guarded" : "read-only",
+      );
       if (scenario === "revoked") {
-        expect(result).toMatchObject({
-          ok: true,
-          payload: {
-            outcomes: [
-              { ok: false, error: { code: "FORBIDDEN" } },
-              { ok: false, error: { code: "FORBIDDEN" } },
-            ],
-          },
-        });
-        expect(loadSessionEntry(earlierScope)?.permissionMode).toBe("guarded");
         expect(fixture.entry()?.archivedAt).toEqual(expect.any(Number));
       } else {
-        expect(result).toMatchObject({
-          ok: true,
-          payload: {
-            outcomes: [
-              scenario === "accepted"
-                ? { ok: true }
-                : {
-                    ok: false,
-                    error: {
-                      code: "UNAVAILABLE",
-                      message: expect.stringContaining("Permissions were saved"),
-                    },
-                  },
-              { ok: true },
-            ],
-          },
-        });
-        expect(loadSessionEntry(earlierScope)?.permissionMode).toBe("read-only");
         expect(fixture.entry()?.archivedAt).toBeUndefined();
       }
       expect(originalApply).toHaveBeenCalledTimes(scenario === "accepted" ? 1 : 0);
@@ -518,18 +514,17 @@ test.each(["accepted", "revoked", "replacement"] as const)(
 );
 
 test.each(["ready", "cleared-selection"] as const)(
-  "sessions.patch restores dirty work only after catalog preparation (%s)",
+  "patch prepares the catalog before restoring dirty work (%s)",
   async (catalogMode) => {
     const fixture = await archiveFixture();
-    const { key, sessionId, storePath, worktree, workspace, cleanupWorktrees } = fixture;
+    const { key, worktree, workspace, cleanupWorktrees } = fixture;
     await fixture.write("committed.txt", "unpushed work\n");
-    await execFileAsync("git", ["-C", worktree.path, "add", "committed.txt"]);
-    await execFileAsync("git", ["-C", worktree.path, "commit", "-m", "session work"]);
-    const originalHead = (await execFileAsync("git", ["-C", worktree.path, "rev-parse", "HEAD"]))
-      .stdout;
+    await fixture.git("add", "committed.txt");
+    await fixture.git("commit", "-m", "session work");
+    const originalHead = await fixture.git("rev-parse", "HEAD");
     await fixture.write("README.md", "tracked changes\n");
     await fixture.write("draft.txt", "untracked changes\n");
-    const transcript = await loadSeededTranscriptEvents(fixture.transcriptScope);
+    const transcript = await fixture.transcript();
     const catalogEntered = createDeferredCore();
     const catalogRelease = createDeferredCore();
     const loadGatewayModelCatalog = vi.fn(async () => {
@@ -547,11 +542,8 @@ test.each(["ready", "cleared-selection"] as const)(
     });
     loadGatewayModelCatalog.mockClear();
     const patch = (archived: boolean) =>
-      directSessionReq(
-        "sessions.patch",
+      fixture.patch(
         {
-          key,
-          expectedSessionId: sessionId,
           archived,
           ...(!archived
             ? catalogMode === "cleared-selection"
@@ -564,24 +556,15 @@ test.each(["ready", "cleared-selection"] as const)(
 
     expect(await patch(true)).toMatchObject({ ok: true });
     await cleanupWorktrees();
-    expect(fixture.entry()).toMatchObject({
-      sessionId,
-      archivedAt: expect.any(Number),
-      worktree: { id: worktree.id },
-    });
-    await expect(fs.access(worktree.path)).rejects.toThrow();
-    expect(fixture.registry()).toMatchObject({
-      removedAt: expect.any(Number),
-      snapshotRef: expect.stringMatching(/^refs\/openclaw\/snapshots\//),
-    });
+    await fixture.expectSnapshot();
     expect(
       (await execFileAsync("git", ["-C", workspace, "worktree", "list", "--porcelain"])).stdout,
     ).not.toContain(worktree.path);
-    await expect(loadSeededTranscriptEvents(fixture.transcriptScope)).resolves.toEqual(transcript);
+    await expect(fixture.transcript()).resolves.toEqual(transcript);
 
     if (catalogMode === "cleared-selection") {
       // Model changes preserve thinking; a stored context window still needs catalog validation.
-      await patchSessionEntryCore({ storePath, sessionKey: key }, () => ({
+      await patchSessionEntryCore(fixture.scope, () => ({
         thinkingLevel: "off",
         contextWindow: "128k",
       }));
@@ -595,7 +578,7 @@ test.each(["ready", "cleared-selection"] as const)(
       expect(fixture.entry()?.archivedAt).toEqual(expect.any(Number));
       await expect(fs.access(worktree.path)).rejects.toThrow();
       if (catalogMode === "cleared-selection") {
-        await patchSessionEntryCore({ storePath, sessionKey: key }, () => ({
+        await patchSessionEntryCore(fixture.scope, () => ({
           contextWindow: undefined,
         }));
       }
@@ -615,19 +598,17 @@ test.each(["ready", "cleared-selection"] as const)(
     expect(fixture.registry()?.removedAt).toBeUndefined();
     await fixture.expectFile("README.md", "tracked changes\n");
     await fixture.expectFile("draft.txt", "untracked changes\n");
-    expect((await execFileAsync("git", ["-C", worktree.path, "rev-parse", "HEAD"])).stdout).toBe(
-      originalHead,
-    );
-    await expect(loadSeededTranscriptEvents(fixture.transcriptScope)).resolves.toEqual(transcript);
+    expect(await fixture.git("rev-parse", "HEAD")).toBe(originalHead);
+    await expect(fixture.transcript()).resolves.toEqual(transcript);
     const lease = await acquireWorktreeRunLease(worktree.id);
     await lease.release();
   },
 );
 
-test("sessions.patchMany preserves the checkout when the archive commit is refused", async () => {
+test("patchMany preserves the checkout on archive commit refusal", async () => {
   const fixture = await archiveFixture();
-  const { key, sessionId, cleanupWorktrees } = fixture;
-  const transcript = await loadSeededTranscriptEvents(fixture.transcriptScope);
+  const { key, cleanupWorktrees } = fixture;
+  const transcript = await fixture.transcript();
   await fixture.write("README.md", "uncommitted edit\n");
   await fixture.write("draft.txt", "untracked draft\n");
   let rejectedCommit = false;
@@ -646,12 +627,7 @@ test("sessions.patchMany preserves the checkout when the archive commit is refus
     admit(request, grant);
   });
   try {
-    const outcome = (
-      await directSessionReq<SessionsPatchManyResult>("sessions.patchMany", {
-        targets: [{ key, expectedSessionId: sessionId }],
-        patch: { archived: true },
-      })
-    ).payload?.outcomes[0];
+    const outcome = (await fixture.patchMany({ archived: true })).payload?.outcomes[0];
     expect(outcome).toMatchObject({
       ok: false,
       error: { code: "UNAVAILABLE", retryable: true },
@@ -662,7 +638,7 @@ test("sessions.patchMany preserves the checkout when the archive commit is refus
     expect(fixture.registry()?.removedAt).toBeUndefined();
     await fixture.expectFile("README.md", "uncommitted edit\n");
     await fixture.expectFile("draft.txt", "untracked draft\n");
-    await expect(loadSeededTranscriptEvents(fixture.transcriptScope)).resolves.toEqual(transcript);
+    await expect(fixture.transcript()).resolves.toEqual(transcript);
   } finally {
     admission.mockRestore();
   }
@@ -676,7 +652,7 @@ test.each([
   async (method, failure) => {
     const fixture = await archiveFixture();
     const { key, sessionId, storePath, worktree, cleanupWorktrees } = fixture;
-    const transcript = await loadSeededTranscriptEvents(fixture.transcriptScope);
+    const transcript = await fixture.transcript();
     const targets = [{ key, expectedSessionId: sessionId }];
     if (method === "sessions.patchMany") {
       const peer = await createPeer();
@@ -733,9 +709,7 @@ test.each([
       }
       expect(fixture.registry()?.removedAt).toBeUndefined();
       await fixture.expectFile("draft.txt", "preserved for cleanup retry\n");
-      await expect(loadSeededTranscriptEvents(fixture.transcriptScope)).resolves.toEqual(
-        transcript,
-      );
+      await expect(fixture.transcript()).resolves.toEqual(transcript);
     } finally {
       remove?.mockRestore();
       await lease?.release();
@@ -744,60 +718,48 @@ test.each([
     expect(fixture.entry()?.archivedAt).toEqual(expect.any(Number));
     expect(fixture.registry()?.removedAt).toEqual(expect.any(Number));
     await expect(fs.access(worktree.path)).rejects.toThrow();
-    await expect(loadSeededTranscriptEvents(fixture.transcriptScope)).resolves.toEqual(transcript);
+    await expect(fixture.transcript()).resolves.toEqual(transcript);
   },
 );
 
-test("automatic dashboard archive snapshots the checkout and can restore its conversation", async () => {
+test("automatic archive snapshots the checkout and restores its conversation", async () => {
   const fixture = await archiveFixture();
-  const { sessionId, storePath, worktree, cleanupWorktrees } = fixture;
+  const { storePath, worktree, cleanupWorktrees } = fixture;
   await fixture.age();
-  const transcript = await loadSeededTranscriptEvents(fixture.transcriptScope);
+  const transcript = await fixture.transcript();
   await fixture.write("draft.txt", "automatic archive keeps work\n");
 
   const reads = observeMainThreadReads();
   const worktreeReads: string[] = [];
   let grants = 0;
-  const createAdmission = workerAdmission.createSqliteWorkerOperationAdmission;
-  const admission = vi
-    .spyOn(workerAdmission, "createSqliteWorkerOperationAdmission")
-    .mockImplementation((handler, ...options) =>
-      createAdmission(
-        (request, grant) => {
-          if (
-            !isRecord(request.facts) ||
-            request.facts.kind !== "state-leases" ||
-            !Array.isArray(request.facts.leases) ||
-            !request.facts.leases.some(
-              (member: unknown) =>
-                isRecord(member) &&
-                isRecord(member.identity) &&
-                member.identity.scope === WORKTREE_MUTATION_LEASE_SCOPE &&
-                member.identity.key === worktree.id,
-            )
-          ) {
-            return handler(request, grant);
-          }
-          grants += 1;
-          reads.clear();
-          try {
-            return handler(request, grant);
-          } finally {
-            for (const call of reads.calls) {
-              for (const statement of call.mock.contexts) {
-                if (
-                  statement instanceof StatementSync &&
-                  /\bworktrees\b/u.test(statement.sourceSQL)
-                ) {
-                  worktreeReads.push(statement.sourceSQL);
-                }
-              }
-            }
-          }
-        },
-        ...options,
-      ),
-    );
+  const admission = probe.admission(workerAdmission, (request, grant, admit) => {
+    const facts = request.facts;
+    if (
+      !isRecord(facts) ||
+      facts.kind !== "state-leases" ||
+      !Array.isArray(facts.leases) ||
+      !facts.leases.some(
+        (member: unknown) =>
+          isRecord(member) &&
+          isRecord(member.identity) &&
+          member.identity.scope === WORKTREE_MUTATION_LEASE_SCOPE &&
+          member.identity.key === worktree.id,
+      )
+    ) {
+      return admit(request, grant);
+    }
+    grants += 1;
+    reads.clear();
+    try {
+      admit(request, grant);
+    } finally {
+      for (const statement of reads.calls.flatMap((call) => call.mock.contexts)) {
+        if (statement instanceof StatementSync && /\bworktrees\b/u.test(statement.sourceSQL)) {
+          worktreeReads.push(statement.sourceSQL);
+        }
+      }
+    }
+  });
   onTestFinished(() => {
     admission.mockRestore();
     reads.restore();
@@ -825,32 +787,23 @@ test("automatic dashboard archive snapshots the checkout and can restore its con
   await cleanupWorktrees();
   const cleanupGrants = grants;
   expect(cleanupGrants).toBeGreaterThan(0);
-  expect(fixture.entry()).toMatchObject({
-    sessionId,
-    archivedAt: expect.any(Number),
-    worktree: { id: worktree.id },
-  });
-  await expect(fs.access(worktree.path)).rejects.toThrow();
-  expect(fixture.registry()).toMatchObject({
-    removedAt: expect.any(Number),
-    snapshotRef: expect.stringMatching(/^refs\/openclaw\/snapshots\//),
-  });
-  await expect(loadSeededTranscriptEvents(fixture.transcriptScope)).resolves.toEqual(transcript);
+  await fixture.expectSnapshot();
+  await expect(fixture.transcript()).resolves.toEqual(transcript);
   await fixture.archive(false);
   expect(fixture.entry()?.archivedAt).toBeUndefined();
   await fixture.expectFile("draft.txt", "automatic archive keeps work\n");
-  await expect(loadSeededTranscriptEvents(fixture.transcriptScope)).resolves.toEqual(transcript);
+  await expect(fixture.transcript()).resolves.toEqual(transcript);
   const lease = await acquireWorktreeRunLease(worktree.id);
   await lease.release();
   expect(grants).toBeGreaterThan(cleanupGrants);
   expect(worktreeReads).toEqual([]);
 });
 
-test("automatic archive preserves a checkout rearchived while cleanup awaited", async () => {
+test("automatic archive preserves a checkout rearchived during cleanup", async () => {
   const fixture = await archiveFixture();
-  const { key, storePath, worktree, cleanupWorktrees } = fixture;
+  const { storePath, worktree, cleanupWorktrees } = fixture;
   await fixture.age();
-  const transcript = await loadSeededTranscriptEvents(fixture.transcriptScope);
+  const transcript = await fixture.transcript();
   const successorArchive = Date.now() + 1000;
   let archivedBeforeCleanup: number | undefined;
   const originalRemove = managedWorktrees.remove.bind(managedWorktrees);
@@ -858,11 +811,9 @@ test("automatic archive preserves a checkout rearchived while cleanup awaited", 
     .spyOn(ManagedWorktreeService.prototype, "remove")
     .mockImplementationOnce(async (params) => {
       archivedBeforeCleanup = fixture.entry()?.archivedAt;
-      await patchSessionEntryCore(
-        { storePath, sessionKey: key },
-        () => ({ archivedAt: successorArchive }),
-        { skipMaintenance: true },
-      );
+      await patchSessionEntryCore(fixture.scope, () => ({ archivedAt: successorArchive }), {
+        skipMaintenance: true,
+      });
       return await originalRemove(params);
     });
   try {
@@ -878,21 +829,21 @@ test("automatic archive preserves a checkout rearchived while cleanup awaited", 
     expect(fixture.entry()?.archivedAt).toBe(successorArchive);
     expect(fixture.registry()?.removedAt).toBeUndefined();
     await fs.access(worktree.path);
-    await expect(loadSeededTranscriptEvents(fixture.transcriptScope)).resolves.toEqual(transcript);
+    await expect(fixture.transcript()).resolves.toEqual(transcript);
   } finally {
     remove.mockRestore();
   }
 });
 
 test.each(["expired", "source-missing"] as const)(
-  "sessions.patch keeps an archived conversation when its worktree cannot be restored (%s)",
+  "patch preserves an archived conversation on %s restore failure",
   async (failure) => {
     const fixture = await archiveFixture();
-    const { key, sessionId, storePath, worktree, workspace } = fixture;
-    const transcript = await loadSeededTranscriptEvents(fixture.transcriptScope);
+    const { worktree, workspace } = fixture;
+    const transcript = await fixture.transcript();
     await managedWorktrees.remove({ id: worktree.id, reason: "session-archive" });
     await patchSessionEntryCore(
-      { storePath, sessionKey: key },
+      fixture.scope,
       (entry) => ({
         ...entry!,
         archivedAt: 1,
@@ -904,11 +855,7 @@ test.each(["expired", "source-missing"] as const)(
     } else if (failure === "source-missing") {
       await fs.rename(workspace, `${workspace}-offline`);
     }
-    const restored = await directSessionReq("sessions.patch", {
-      key,
-      expectedSessionId: sessionId,
-      archived: false,
-    });
+    const restored = await fixture.patch({ archived: false });
     expect(restored).toMatchObject({
       ok: false,
       error: { code: "UNAVAILABLE", retryable: true },
@@ -916,13 +863,10 @@ test.each(["expired", "source-missing"] as const)(
     expect(restored.error?.message).toContain("worktree");
     expect(restored.error?.message).not.toMatch(/worktree slot/i);
     expect(restored.error?.message).toContain("new worktree task");
-    if (failure === "expired") {
-      expect(restored.error?.message).toContain("expired");
-    }
-    if (failure === "source-missing") {
-      expect(restored.error?.message).toContain("source repository is missing");
-    }
-    await expect(loadSeededTranscriptEvents(fixture.transcriptScope)).resolves.toEqual(transcript);
+    expect(restored.error?.message).toContain(
+      failure === "expired" ? "expired" : "source repository is missing",
+    );
+    await expect(fixture.transcript()).resolves.toEqual(transcript);
     expect(fixture.entry()?.archivedAt).toBe(1);
     await expect(fs.access(worktree.path)).rejects.toThrow();
   },
