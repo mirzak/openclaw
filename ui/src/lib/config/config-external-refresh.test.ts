@@ -5,24 +5,42 @@ import { createDeferred as deferred } from "../../../../test/helpers/promise.js"
 import type { ConfigSnapshot } from "../../api/types.ts";
 import { loadConfig } from "./config-gateway-operations.ts";
 import { nextRequestVersion } from "./config-state-model.ts";
-import { configSnapshot } from "./config-suite.test-support.ts";
-import { createConfigCapabilityHarness } from "./config-test-harness.ts";
+import { configSnapshot, configHarness, disposeConfig } from "./config-suite.test-support.ts";
 
-function snapshot(count: number): ConfigSnapshot {
-  return configSnapshot({ count }, `hash-${count}`);
-}
+const snapshot = (count: number) => configSnapshot({ count }, `hash-${count}`);
+const refreshError = "current refresh unavailable";
 
-function mutationHarness(read: () => Promise<ConfigSnapshot>) {
-  const request = vi.fn((method: string) =>
-    method === "config.get" ? read() : Promise.resolve({ ok: true }),
-  );
-  return createConfigCapabilityHarness(request);
+function mutationHarness(
+  tail: (read: number, pending: Promise<ConfigSnapshot>) => Promise<ConfigSnapshot>,
+) {
+  const read = deferred<ConfigSnapshot>();
+  const started = deferred();
+  let reads = 0;
+  const request = vi.fn((method: string) => {
+    if (method !== "config.get") {
+      return Promise.resolve({ ok: true });
+    }
+    if (++reads === 1) {
+      return Promise.resolve(snapshot(1));
+    }
+    if (reads === 2) {
+      started.resolve();
+      return read.promise;
+    }
+    return tail(reads, read.promise);
+  });
+  return { ...configHarness(request), read, started, reads: () => reads };
 }
 
 function mutate(runtimeConfig: ReturnType<typeof mutationHarness>["runtimeConfig"]) {
   return runtimeConfig.runExternalMutation((client) =>
     client.request("plugins.setEnabled", { pluginId: "test-plugin", enabled: true }),
   );
+}
+
+type MutationRefresh = { ok: true } | { ok: false; error: string };
+function expectMutation(result: Promise<unknown>, refresh: MutationRefresh = { ok: true }) {
+  return expect(result).resolves.toEqual({ ok: true, value: { ok: true }, refresh });
 }
 
 describe("external mutation config refresh", () => {
@@ -34,113 +52,77 @@ describe("external mutation config refresh", () => {
   ])(
     "uses the actual successor result with $order (failure: $failure)",
     async ({ order, failure }) => {
-      const mutationRead = deferred<ConfigSnapshot>();
       const successorRead = deferred<ConfigSnapshot>();
-      const mutationReadStarted = deferred();
-      let reads = 0;
-      const { runtimeConfig } = mutationHarness(() => {
-        reads += 1;
-        if (reads === 1) {
-          return Promise.resolve(snapshot(1));
-        }
-        if (reads === 2) {
-          mutationReadStarted.resolve();
-          return mutationRead.promise;
-        }
+      const flight = mutationHarness((reads) => {
         if (reads === 3) {
           return successorRead.promise;
         }
         throw new Error(`Unexpected configuration read ${reads}`);
       });
-      try {
-        await runtimeConfig.ensureLoaded();
-        const mutation = mutate(runtimeConfig);
-        await mutationReadStarted.promise;
-        runtimeConfig.setRaw('{"count":9}');
-        // The generation-triggered page refresh starts after the RPC and its own fresh read.
-        const refresh = runtimeConfig.refresh();
-        expect(reads).toBe(3);
-        const finishSuccessor = () =>
-          failure
-            ? successorRead.reject(new Error("current refresh unavailable"))
-            : successorRead.resolve(snapshot(3));
-        if (order === "mutation read first") {
-          mutationRead.resolve(snapshot(2));
-          await mutationRead.promise;
-          finishSuccessor();
-        } else {
-          finishSuccessor();
-          await refresh;
-          mutationRead.resolve(snapshot(2));
-        }
+      const { runtimeConfig, state } = flight;
+      await runtimeConfig.ensureLoaded();
+      const mutation = mutate(runtimeConfig);
+      await flight.started.promise;
+      runtimeConfig.setRaw('{"count":9}');
+      // The generation-triggered page refresh starts after the RPC and its own fresh read.
+      const refresh = runtimeConfig.refresh();
+      expect(flight.reads()).toBe(3);
+      const finishSuccessor = () =>
+        failure
+          ? successorRead.reject(new Error(refreshError))
+          : successorRead.resolve(snapshot(3));
+      if (order === "mutation read first") {
+        flight.read.resolve(snapshot(2));
+        await flight.read.promise;
+        finishSuccessor();
+      } else {
+        finishSuccessor();
         await refresh;
-        await expect(mutation).resolves.toEqual({
-          ok: true,
-          value: { ok: true },
-          refresh: failure ? { ok: false, error: "current refresh unavailable" } : { ok: true },
-        });
-        expect(runtimeConfig.state.configSnapshot?.hash).toBe(failure ? "hash-1" : "hash-3");
-        expect(runtimeConfig.state.lastError).toBe(failure ? "current refresh unavailable" : null);
-        expect(runtimeConfig.state.configRaw).toBe('{"count":9}');
-        expect(runtimeConfig.state.configDraftBaseHash).toBe("hash-1");
-        expect(runtimeConfig.state.configFormDirty).toBe(true);
-      } finally {
-        runtimeConfig.dispose();
+        flight.read.resolve(snapshot(2));
       }
+      await refresh;
+      await expectMutation(mutation, failure ? { ok: false, error: refreshError } : { ok: true });
+      expect(state.configSnapshot?.hash).toBe(failure ? "hash-1" : "hash-3");
+      expect(state).toMatchObject({
+        lastError: failure ? refreshError : null,
+        configRaw: '{"count":9}',
+        configDraftBaseHash: "hash-1",
+        configFormDirty: true,
+      });
     },
   );
   it.each(["write acknowledgement", "disconnect", "same-client reconnect", "dispose"] as const)(
     "ends a pending mutation refresh on %s without waiting for its transport reply",
     async (retirement) => {
-      const pendingRead = deferred<ConfigSnapshot>();
-      const readStarted = deferred();
-      let reads = 0;
-      const { runtimeConfig, publish } = mutationHarness(() => {
-        if (++reads === 1) {
-          return Promise.resolve(snapshot(1));
+      const flight = mutationHarness((reads, pending) =>
+        reads === 3 ? Promise.resolve(snapshot(3)) : pending,
+      );
+      const { runtimeConfig, state, publish } = flight;
+      await runtimeConfig.ensureLoaded();
+      const mutation = mutate(runtimeConfig);
+      await flight.started.promise;
+      if (retirement === "write acknowledgement") {
+        // Config write acknowledgements invalidate older reads without issuing a replacement.
+        nextRequestVersion(state, "config");
+      } else if (retirement === "disconnect" || retirement === "same-client reconnect") {
+        publish(false);
+        if (retirement === "same-client reconnect") {
+          publish(true);
         }
-        if (reads === 3) {
-          return Promise.resolve(snapshot(3));
-        }
-        readStarted.resolve();
-        return pendingRead.promise;
-      });
-      try {
-        await runtimeConfig.ensureLoaded();
-        const mutation = mutate(runtimeConfig);
-        await readStarted.promise;
-        if (retirement === "write acknowledgement") {
-          // Config write acknowledgements invalidate older reads without issuing a replacement.
-          nextRequestVersion(runtimeConfig.state, "config");
-        } else if (retirement === "disconnect" || retirement === "same-client reconnect") {
-          publish(false);
-          if (retirement === "same-client reconnect") {
-            publish(true);
-          }
-        } else {
-          runtimeConfig.dispose();
-        }
-        await expect(mutation).resolves.toEqual({
-          ok: true,
-          value: { ok: true },
-          refresh: {
-            ok: false,
-            error:
-              retirement === "write acknowledgement"
-                ? "The configuration refresh was superseded by a configuration write."
-                : "Connection changed before the configuration update was refreshed.",
-          },
-        });
-        expect(reads).toBe(retirement === "same-client reconnect" ? 3 : 2);
-        pendingRead.resolve(snapshot(99));
-        await pendingRead.promise;
-        expect(runtimeConfig.state.configSnapshot?.hash).toBe(
-          retirement === "same-client reconnect" ? "hash-3" : "hash-1",
-        );
-      } finally {
-        pendingRead.resolve(snapshot(99));
-        runtimeConfig.dispose();
+      } else {
+        disposeConfig(runtimeConfig);
       }
+      const error =
+        retirement === "write acknowledgement"
+          ? "The configuration refresh was superseded by a configuration write."
+          : "Connection changed before the configuration update was refreshed.";
+      await expectMutation(mutation, { ok: false, error });
+      expect(flight.reads()).toBe(retirement === "same-client reconnect" ? 3 : 2);
+      flight.read.resolve(snapshot(99));
+      await flight.read.promise;
+      expect(state.configSnapshot?.hash).toBe(
+        retirement === "same-client reconnect" ? "hash-3" : "hash-1",
+      );
     },
   );
 
@@ -152,66 +134,44 @@ describe("external mutation config refresh", () => {
       }
       return request.mock.calls.length === 1 ? stale.promise : Promise.resolve(snapshot(2));
     });
-    const { runtimeConfig } = createConfigCapabilityHarness(request);
+    const { state } = configHarness(request);
     const captureDraft = vi.fn();
-    try {
-      const original = loadConfig(runtimeConfig.state, { beforeApplySnapshot: captureDraft });
-      await expect(loadConfig(runtimeConfig.state)).resolves.toBe(true);
-      stale.resolve(snapshot(1));
-      await expect(original).resolves.toBe(false);
-      expect(captureDraft).not.toHaveBeenCalled();
-      expect(runtimeConfig.state.configSnapshot?.hash).toBe("hash-2");
-    } finally {
-      runtimeConfig.dispose();
-    }
+    const original = loadConfig(state, { beforeApplySnapshot: captureDraft });
+    await expect(loadConfig(state)).resolves.toBe(true);
+    stale.resolve(snapshot(1));
+    await expect(original).resolves.toBe(false);
+    expect(captureDraft).not.toHaveBeenCalled();
+    expect(state.configSnapshot?.hash).toBe("hash-2");
   });
 
   it("rechecks connection ownership after the pre-adoption recovery callback", async () => {
     const request = vi.fn(async () => snapshot(1));
-    const { runtimeConfig, publish } = createConfigCapabilityHarness(request);
-    try {
-      await expect(
-        loadConfig(runtimeConfig.state, { beforeApplySnapshot: () => publish(false) }),
-      ).resolves.toBe(false);
-      expect(runtimeConfig.state.configSnapshot).toBeNull();
-    } finally {
-      runtimeConfig.dispose();
-    }
+    const { state, publish } = configHarness(request);
+    await expect(loadConfig(state, { beforeApplySnapshot: () => publish(false) })).resolves.toBe(
+      false,
+    );
+    expect(state.configSnapshot).toBeNull();
   });
   it("records a successor started synchronously by a loading-state subscriber", async () => {
-    const staleRead = deferred<ConfigSnapshot>();
-    let reads = 0;
-    const { runtimeConfig } = mutationHarness(() => {
-      reads += 1;
-      return reads === 2 ? staleRead.promise : Promise.resolve(snapshot(reads));
-    });
+    const flight = mutationHarness((reads) => Promise.resolve(snapshot(reads)));
+    const { runtimeConfig, state } = flight;
     let successor: Promise<void> | undefined;
     let observe = false;
-    const stop = runtimeConfig.subscribe((state) => {
-      if (observe && state.configLoading) {
+    runtimeConfig.subscribe((current) => {
+      if (observe && current.configLoading) {
         observe = false;
         successor = runtimeConfig.refresh();
       }
     });
-    try {
-      await runtimeConfig.ensureLoaded();
-      observe = true;
-      const mutation = mutate(runtimeConfig);
-      await expect(mutation).resolves.toEqual({
-        ok: true,
-        value: { ok: true },
-        refresh: { ok: true },
-      });
-      await successor;
-      expect(reads).toBe(3);
-      expect(runtimeConfig.state.configSnapshot?.hash).toBe("hash-3");
-      staleRead.resolve(snapshot(2));
-      await staleRead.promise;
-      expect(runtimeConfig.state.configSnapshot?.hash).toBe("hash-3");
-    } finally {
-      staleRead.resolve(snapshot(2));
-      stop();
-      runtimeConfig.dispose();
-    }
+    await runtimeConfig.ensureLoaded();
+    observe = true;
+    const mutation = mutate(runtimeConfig);
+    await expectMutation(mutation);
+    await successor;
+    expect(flight.reads()).toBe(3);
+    expect(state.configSnapshot?.hash).toBe("hash-3");
+    flight.read.resolve(snapshot(2));
+    await flight.read.promise;
+    expect(state.configSnapshot?.hash).toBe("hash-3");
   });
 });
