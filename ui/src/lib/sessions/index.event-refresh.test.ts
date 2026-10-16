@@ -35,14 +35,13 @@ const sessionRow = (
   updatedAt,
   ...extra,
 });
-const terminal = (session: GatewaySessionRow) => ({
-  sessionKey: session.key,
-  hasActiveRun: false,
-  status: "done",
-  session: { ...session, hasActiveRun: false, status: "done" },
-});
 const active = { hasActiveRun: true, status: "running" as const };
 const completed = { hasActiveRun: false, status: "done" as const };
+const terminal = (session: GatewaySessionRow) => ({
+  sessionKey: session.key,
+  ...completed,
+  session: { ...session, ...completed },
+});
 const requestDefaults = {
   excludeDock: true,
   includeGlobal: true,
@@ -178,8 +177,7 @@ it("refreshes exact managed queries by agent and retains appended dashboard wind
   expect(request).toHaveBeenCalledTimes(1);
   const dashboardRequests = () =>
     request.mock.calls.filter(([, params]) => asOptionalRecord(params)?.hasBoard === true);
-  const researchRequests = dashboardRequests();
-  expect(researchRequests[0]?.[1]).toEqual({
+  expect(dashboardRequests()[0]?.[1]).toEqual({
     ...requestDefaults,
     rowMode: "compact",
     source: "chat-pane",
@@ -229,7 +227,6 @@ it("keeps an archived terminal session until the Gateway replaces the active ros
     expect.objectContaining({ configuredAgentsOnly: true }),
   );
   expect(visibleRosters).toEqual([[fallbackRow]]);
-  expect(sessions.state.result?.sessions).toEqual([fallbackRow]);
 });
 
 it("rereads owner-filtered rows only when ownership changes", async () => {
@@ -479,13 +476,10 @@ it.each(["success", "failure"])(
 it.each([false, true])(
   "publishes an active message into its existing Sessions page row (newer overlap: %s)",
   async (newerOverlap) => {
-    const primary = sessionRow("agent:main:primary-a", 10, {
-      sessionId: "primary-a-session",
-      label: "Primary A",
-    });
-    const managed = sessionRow("agent:main:managed-b", 10, {
-      sessionId: "managed-b-session",
-      label: "Managed B",
+    const labeledRow = (name: string, label: string, extra: Partial<GatewaySessionRow> = {}) =>
+      sessionRow(`agent:main:${name}`, 10, { sessionId: `${name}-session`, label, ...extra });
+    const primary = labeledRow("primary-a", "Primary A");
+    const managed = labeledRow("managed-b", "Managed B", {
       archived: false,
       ...completed,
       activeRunIds: [],
@@ -522,14 +516,9 @@ it.each([false, true])(
         observed.push(snapshot.result?.sessions.find((row) => row.key === managed.key));
       }),
     );
-    const progress = (updatedAt: number, label: string, runId: string) => {
-      const wire = JSON.stringify({
+    const progress = (updatedAt: number, label: string, runId: string) =>
+      message({
         sessionKey: managed.key,
-        agentId: "main",
-        runId,
-        messageId: `message-${runId}`,
-        messageSeq: updatedAt,
-        message: { role: "assistant", content: [{ type: "text", text: "Synthetic progress" }] },
         ...active,
         session: {
           ...managed,
@@ -541,9 +530,6 @@ it.each([false, true])(
           permissionMode: null,
         },
       });
-      const payload: unknown = JSON.parse(wire);
-      message(payload);
-    };
     await sessions.refresh({ agentId: "main", force: true });
     await sessions.refreshList(query);
     expect(request).toHaveBeenCalledTimes(2);

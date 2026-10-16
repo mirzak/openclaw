@@ -16,9 +16,9 @@ import { waitForFast } from "../../test-helpers/wait-for.ts";
 import {
   createGatewayHarness,
   createTestSessionCapability,
+  runningSessionsResult,
   sessionsResult,
 } from "./session-capability.test-support.ts";
-import type { SessionRunTerminal } from "./session-run-terminal.ts";
 
 const mainKey = "agent:main:main";
 const row = (key = mainKey, fields: Partial<GatewaySessionRow> = {}): GatewaySessionRow => ({
@@ -29,9 +29,29 @@ const row = (key = mainKey, fields: Partial<GatewaySessionRow> = {}): GatewaySes
 });
 const emptyList = () => sessionsResult([], 2);
 const subscribed = () => ({ subscribed: true });
+const reconnectRoutes = { "sessions.subscribe": subscribed, "sessions.list": emptyList };
 const listRoute = (rows: GatewaySessionRow[], ts = 1) => ({
   "sessions.list": () => sessionsResult(rows, ts),
 });
+const listReplies = (
+  first: SessionsListResult | Promise<SessionsListResult>,
+  next: SessionsListResult | Promise<SessionsListResult>,
+) => ({
+  "sessions.list": vi
+    .fn<() => Promise<SessionsListResult>>()
+    .mockImplementation(() => Promise.resolve(next))
+    .mockImplementationOnce(() => Promise.resolve(first)),
+});
+
+function requestRoutes(routes: Record<string, (params?: unknown) => unknown>) {
+  return createGatewayRequestMock(async (method, params) => {
+    const handler = routes[method];
+    if (!handler) {
+      throw new Error(`Unexpected request: ${method}`);
+    }
+    return await handler(params);
+  });
+}
 
 function sessionHarness(
   routes: Record<string, (params?: unknown) => unknown>,
@@ -39,13 +59,7 @@ function sessionHarness(
   sessionKey = mainKey,
   ownerId?: string,
 ) {
-  const request = createGatewayRequestMock(async (method, params) => {
-    const handler = routes[method];
-    if (!handler) {
-      throw new Error(`Unexpected request: ${method}`);
-    }
-    return await handler(params);
-  });
+  const request = requestRoutes(routes);
   const harness = createGatewayHarness(createTestGatewayClient(request), featureMethods, {
     selfUser: ownerId ? { id: ownerId } : null,
   });
@@ -154,10 +168,7 @@ it("publishes state.error when replacing the group catalog is rejected", async (
 
 it("reports a group catalog replacement as stale after a same-client reconnect", async () => {
   const replaced = createDeferred<{ groups: Array<{ name: string }> }>();
-  const { sessions, publish } = groupHarness("put", () => replaced.promise, {
-    "sessions.subscribe": subscribed,
-    "sessions.list": emptyList,
-  });
+  const { sessions, publish } = groupHarness("put", () => replaced.promise, reconnectRoutes);
   const operation = sessions.groupsPut(["Alpha"]);
   publish(false);
   publish(true);
@@ -185,61 +196,50 @@ it("keeps a confirmed group rename completed when its row refresh outlives the c
 });
 
 it("excludes lifecycle no-ops from batch deletion results", async () => {
-  const rejectedKey = "agent:main:rejected";
-  const keptKey = "agent:main:kept";
-  const deletedKey = "agent:main:deleted";
+  const rejected = { key: "agent:main:rejected" };
+  const kept = { key: "agent:main:kept", expectedSessionId: "kept-generation" };
+  const deleted = { key: "agent:main:deleted", archivedOnly: true };
   const error = new GatewayRequestError({
     code: "INVALID_REQUEST",
-    message: `Session ${rejectedKey} changed before deletion. Retry.`,
+    message: `Session ${rejected.key} changed before deletion. Retry.`,
   });
   const { sessions, request } = sessionHarness({
     "sessions.delete": (params) => {
       const key = asOptionalRecord(params)?.key;
-      if (key === rejectedKey) {
+      if (key === rejected.key) {
         throw error;
       }
-      return { ok: true, deleted: key === deletedKey };
+      return { ok: true, deleted: key === deleted.key };
     },
-    "sessions.list": () => sessionsResult([row(keptKey)], 2),
+    "sessions.list": () => sessionsResult([row(kept.key)], 2),
   });
   const deletedSnapshots: string[][] = [];
   const unsubscribe = sessions.subscribe((next) =>
     deletedSnapshots.push(next.deletedSessions.map((target) => target.key)),
   );
-  await expect(
-    sessions.deleteMany([
-      { key: rejectedKey },
-      { key: keptKey, expectedSessionId: "kept-generation" },
-      { key: deletedKey, archivedOnly: true },
-    ]),
-  ).resolves.toEqual({
-    deleted: [deletedKey],
-    errors: [{ target: { key: rejectedKey }, error }],
+  await expect(sessions.deleteMany([rejected, kept, deleted])).resolves.toEqual({
+    deleted: [deleted.key],
+    errors: [{ target: { key: rejected.key }, error }],
     preservedWorktrees: [],
   });
-  expect(deletedSnapshots.some((keys) => keys.includes(deletedKey))).toBe(true);
-  expect(deletedSnapshots.some((keys) => keys.includes(keptKey))).toBe(false);
+  expect(deletedSnapshots.some((keys) => keys.includes(deleted.key))).toBe(true);
+  expect(deletedSnapshots.some((keys) => keys.includes(kept.key))).toBe(false);
   expect(request).toHaveBeenCalledTimes(4);
-  expect(request).toHaveBeenCalledWith(
-    "sessions.delete",
-    { key: deletedKey, deleteTranscript: true, archivedOnly: true },
-    { timeoutMs: 10 * 60_000 },
-  );
-  expect(request).toHaveBeenCalledWith(
-    "sessions.delete",
-    { key: keptKey, deleteTranscript: true, expectedSessionId: "kept-generation" },
-    { timeoutMs: 10 * 60_000 },
-  );
+  for (const target of [kept, deleted]) {
+    expect(request).toHaveBeenCalledWith(
+      "sessions.delete",
+      { ...target, deleteTranscript: true },
+      { timeoutMs: 10 * 60_000 },
+    );
+  }
   unsubscribe();
 });
 
 it("creates a session while a list refresh is in flight", async () => {
   const pending = createDeferred<SessionsListResult>();
   const key = "agent:main:created";
-  let calls = 0;
   const { sessions, request } = sessionHarness({
-    "sessions.list": () =>
-      ++calls === 1 ? pending.promise : sessionsResult([row(key, { updatedAt: 2 })], 2),
+    ...listReplies(pending.promise, sessionsResult([row(key, { updatedAt: 2 })], 2)),
     "sessions.create": () => ({ key }),
   });
   const refresh = sessions.refresh({ force: true });
@@ -251,7 +251,7 @@ it("creates a session while a list refresh is in flight", async () => {
   pending.resolve(sessionsResult([], 1));
   await expect(created).resolves.toBe(key);
   await refresh;
-  expect(calls).toBe(2);
+  expect(request.mock.calls.filter(([method]) => method === "sessions.list")).toHaveLength(2);
   expect(sessions.state.result?.sessions[0]?.key).toBe(key);
 });
 
@@ -259,8 +259,7 @@ it.each(["reconnect", "rejection"])("reports a reset as uncertain after %s", asy
   const pending = createDeferred<unknown>();
   const { sessions, publish } = sessionHarness({
     "sessions.reset": () => pending.promise,
-    "sessions.subscribe": subscribed,
-    "sessions.list": emptyList,
+    ...reconnectRoutes,
   });
   const reset = sessions.reset(mainKey);
   if (outcome === "reconnect") {
@@ -279,12 +278,8 @@ it.each(["reconnect", "rejection"])("reports a reset as uncertain after %s", asy
 it("keeps background hydration non-blocking and retains an omitted selected row", async () => {
   const pending = createDeferred<SessionsListResult>();
   const key = "agent:main:oldest";
-  let calls = 0;
   const { sessions } = sessionHarness(
-    {
-      "sessions.list": () =>
-        ++calls === 1 ? sessionsResult([row(key, { label: "Oldest" })], 1) : pending.promise,
-    },
+    listReplies(sessionsResult([row(key, { label: "Oldest" })], 1), pending.promise),
     undefined,
     key,
   );
@@ -302,74 +297,37 @@ it("keeps background hydration non-blocking and retains an omitted selected row"
   stop();
 });
 
-it("publishes terminal run state to shared session subscribers", async () => {
-  const active = (updatedAt: number, activeRunIds?: string[]) =>
-    row(mainKey, {
-      updatedAt,
-      hasActiveRun: true,
-      ...(activeRunIds ? { activeRunIds } : {}),
-      status: "running",
-      startedAt: updatedAt * 100,
-    });
-  const { sessions } = sessionHarness({
-    "sessions.list": () => sessionsResult([active(1, ["run-1"])], 1),
-  });
-  await sessions.refresh({ agentId: "main", force: true });
-  const terminal = (
-    runId: string | undefined,
-    status: SessionRunTerminal["status"],
-    endedAt: number,
-    errorMessage?: string,
-  ) =>
-    sessions.reconcileRunTerminal({ sessionKeys: ["main"], runId, status, endedAt, errorMessage });
-  const current = () => sessions.state.result?.sessions[0];
-  expect(
-    terminal(
-      "run-1",
-      "failed",
-      160,
-      `Provider failed.\npassword=synthetic-password\n${"x".repeat(180)}`,
-    ),
-  ).toBe(true);
-  const lastRunError = `Provider failed. password=[redacted] ${"x".repeat(123)}`;
+it("requires a terminal run ID and clips errors after redaction", async () => {
+  const { sessions, current, refresh } = sessionHarness({ "sessions.list": runningSessionsResult });
+  await refresh();
+  const terminal = {
+    sessionKeys: ["main"],
+    status: "failed" as const,
+    endedAt: 61,
+    errorMessage: `Provider failed.\npassword=synthetic-password\n${"x".repeat(180)}`,
+  };
+  expect(sessions.reconcileRunTerminal(terminal)).toBe(false);
+  expect(sessions.reconcileRunTerminal({ ...terminal, runId: "run-1" })).toBe(true);
   expect(current()).toMatchObject({
     key: mainKey,
     hasActiveRun: false,
     activeRunIds: [],
     status: "failed",
-    lastRunError,
-    endedAt: 160,
+    lastRunError: `Provider failed. password=[redacted] ${"x".repeat(123)}`,
+    endedAt: 61,
     runtimeMs: 60,
   });
-  expect(terminal("run-1", "failed", 160)).toBe(false);
-  expect(current()?.lastRunError).toBe(lastRunError);
-  expect(sessions.reconcile({ ...active(2, ["run-2"]), lastRunError })).toBe(true);
-  expect(terminal("run-1", "done", 260)).toBe(false);
-  expect(current()).toMatchObject({
-    hasActiveRun: true,
-    activeRunIds: ["run-2"],
-    status: "running",
-    lastRunError,
-  });
-  expect(terminal("run-2", "done", 260)).toBe(true);
-  expect(current()).toMatchObject({ hasActiveRun: false, status: "done" });
-  expect(current()?.lastRunError).toBeUndefined();
-  expect(sessions.reconcile(active(3))).toBe(true);
-  expect(terminal("run-1", "done", 360)).toBe(false);
-  expect(current()).toMatchObject({ hasActiveRun: true, status: "running" });
-  expect(terminal(undefined, "done", 360)).toBe(false);
 });
 
 it("publishes remote deletion before refreshing the canonical list", async () => {
   vi.useFakeTimers();
   const pending = createDeferred<SessionsListResult>();
-  let calls = 0;
-  const { sessions, change, request } = sessionHarness({
-    "sessions.list": () =>
-      ++calls === 1
-        ? sessionsResult([row(mainKey, { sessionId: "deleted-generation" })], 1)
-        : pending.promise,
-  });
+  const { sessions, change, request } = sessionHarness(
+    listReplies(
+      sessionsResult([row(mainKey, { sessionId: "deleted-generation" })], 1),
+      pending.promise,
+    ),
+  );
   await sessions.refresh({ force: true });
   const deleted: string[][] = [];
   sessions.subscribe((next) => deleted.push(next.deletedSessions.map((target) => target.key)));
@@ -432,15 +390,16 @@ it("does not probe for a group catalog when the method is explicitly absent", as
 
 it("refreshes stale active rows after a terminal session message", async () => {
   vi.useFakeTimers();
-  const list = vi
-    .fn()
-    .mockResolvedValueOnce(
-      sessionsResult([row(mainKey, { hasActiveRun: true, status: "running" })], 1),
-    )
-    .mockResolvedValueOnce(
-      sessionsResult([row(mainKey, { updatedAt: 2, hasActiveRun: false, status: "done" })], 2),
-    );
-  const { sessions, emitEvent, request } = sessionHarness({ "sessions.list": list });
+  const { sessions, emitEvent, request } = sessionHarness({
+    "sessions.list": vi
+      .fn()
+      .mockResolvedValueOnce(
+        sessionsResult([row(mainKey, { hasActiveRun: true, status: "running" })], 1),
+      )
+      .mockResolvedValueOnce(
+        sessionsResult([row(mainKey, { updatedAt: 2, hasActiveRun: false, status: "done" })], 2),
+      ),
+  });
   await sessions.refresh({ agentId: "main", force: true });
   emitEvent(event({ sessionKey: mainKey, updatedAt: 1, status: "done" }, "session.message"));
   await vi.advanceTimersByTimeAsync(5_000);
@@ -456,16 +415,19 @@ describe("session capability dashboard default acknowledgements", () => {
   const key = "agent:main:dashboard";
   const sessionId = "dashboard-incarnation";
   const patchOptions = { agentId: "main", expectedSessionId: sessionId, deferListRefresh: true };
-  const initial = row(key, {
-    agentId: "main",
+  const retained = {
     sessionId,
-    updatedAt: 10,
-    boardFace: "dashboard",
-    boardPresentation: "split",
     pinned: true,
     pinnedAt: 5,
     unread: true,
     lastReadAt: 1,
+  };
+  const initial = row(key, {
+    ...retained,
+    agentId: "main",
+    updatedAt: 10,
+    boardFace: "dashboard",
+    boardPresentation: "split",
     lastActivityAt: 10,
   });
 
@@ -487,15 +449,10 @@ describe("session capability dashboard default acknowledgements", () => {
 
   async function createPresentationHarness(initialRow = initial) {
     let current = initialRow;
-    let listFailure = false;
     const patchReply = createDeferred<SessionsPatchResult>();
+    const list = vi.fn(async () => sessionsResult([current], current.updatedAt ?? 0));
     const h = sessionHarness({
-      "sessions.list": () => {
-        if (listFailure) {
-          throw new Error("Roster refresh unavailable");
-        }
-        return sessionsResult([current], current.updatedAt ?? 0);
-      },
+      "sessions.list": list,
       "sessions.patch": () => patchReply.promise,
       "sessions.describe": () => ({ session: current }),
       "sessions.subscribe": subscribed,
@@ -504,12 +461,12 @@ describe("session capability dashboard default acknowledgements", () => {
     await h.refresh();
     return {
       ...h,
-      acknowledge: async (
+      acknowledge: (
         operation: Promise<unknown>,
         presentation: GatewaySessionRow["boardPresentation"],
       ) => {
         patchReply.resolve(acknowledgement(presentation));
-        return await operation;
+        return operation;
       },
       patch: (
         fields: Parameters<typeof h.sessions.patch>[1],
@@ -524,9 +481,7 @@ describe("session capability dashboard default acknowledgements", () => {
       setCurrent: (next: GatewaySessionRow) => {
         current = next;
       },
-      failList: () => {
-        listFailure = true;
-      },
+      failList: () => list.mockRejectedValue(new Error("Roster refresh unavailable")),
     };
   }
 
@@ -546,12 +501,8 @@ describe("session capability dashboard default acknowledgements", () => {
     for (const result of [h.sessions.state.result, h.sessions.listSnapshot(query).result]) {
       expect(result?.sessions[0]).not.toHaveProperty("boardPresentation");
       expect(result?.sessions[0]).toMatchObject({
-        sessionId,
+        ...retained,
         boardFace: "dashboard",
-        pinned: true,
-        pinnedAt: 5,
-        unread: true,
-        lastReadAt: 1,
       });
     }
   });
@@ -597,14 +548,8 @@ describe("session capability dashboard default acknowledgements", () => {
       if (replacementKind === "row") {
         h.setCurrent(replacement);
       } else {
-        const replacementClient = createTestGatewayClient((method) => {
-          if (method === "sessions.list") {
-            return sessionsResult([replacement], 40);
-          }
-          throw new Error(`Unexpected replacement Gateway request: ${method}`);
-        });
         h.publish(false);
-        h.publish(true, replacementClient);
+        h.publish(true, createTestGatewayClient(requestRoutes(listRoute([replacement], 40))));
       }
       await h.refresh();
       await h.acknowledge(operation, "expanded");

@@ -12,6 +12,7 @@ import {
 
 const parentKey = "agent:main:parent";
 const childQuery = { spawnedBy: parentKey };
+const activeRun = { status: "running" as const, hasActiveRun: true, activeRunIds: ["new-run"] };
 function childRow(sessionId: string, fields: Partial<GatewaySessionRow> = {}): GatewaySessionRow {
   return {
     key: "agent:main:subagent:child",
@@ -54,23 +55,16 @@ function emitRuntime(harness: ReturnType<typeof createGatewayHarness>, session: 
 }
 
 it("orders runtime events and cached list pages by their sampling clock", async () => {
-  const row = background;
-  const running: GatewaySessionRow = {
-    ...row,
-    snapshotAt: 200,
-    status: "running",
-    hasActiveRun: true,
-    activeRunIds: ["background-run"],
-  };
-  let page = sessionsResult([row], 100);
+  const running = { ...background, ...activeRun, snapshotAt: 200 };
+  let page = sessionsResult([background], 100);
   const harness = setup(async () => structuredClone(page));
   const { sessions } = harness;
   await sessions.refresh({ agentId: "main", force: true });
-  const completed = { ...row, snapshotAt: 300 };
-  const settled = { ...row, snapshotAt: 500 };
+  const completed = { ...background, snapshotAt: 300 };
+  const settled = { ...background, snapshotAt: 500 };
   const steps: Array<["event" | "list", GatewaySessionRow, GatewaySessionRow?]> = [
     ["event", running, running],
-    ["list", row, running],
+    ["list", background, running],
     ["list", completed, completed],
     ["event", running, completed],
     ["list", { ...running, snapshotAt: 400 }],
@@ -97,13 +91,7 @@ it("keeps fresh child facts when a later root request returns an older cached pa
     childSessions: ["agent:main:subagent:child"],
   };
   const child = childRow("child-session", { updatedAt: 10, status: "done", activeRunIds: [] });
-  const freshChild = {
-    ...child,
-    snapshotAt: 200,
-    status: "running" as const,
-    hasActiveRun: true,
-    activeRunIds: ["new-run"],
-  };
+  const freshChild = { ...child, ...activeRun, snapshotAt: 200 };
   let root = sessionsResult([parent, child], 100);
   const children = sessionsResult([freshChild], 200);
   const { sessions } = setup(async (method, params) => {
@@ -182,15 +170,14 @@ it.each(["disconnects", "replaces the client"] as const)(
   async (transition) => {
     const disconnected = transition === "disconnects";
     const child = childRow("child-session");
-    const client = createTestGatewayClient(async (_method, params) =>
+    const { gateway, publish, sessions } = setup(async (_method, params) =>
       isRecord(params) && params.spawnedBy
         ? sessionsResult([{ ...child, snapshotAt: 200, hasActiveRun: true }], 200)
         : sessionsResult([child], 100),
     );
     const replacementRead = createDeferred<ReturnType<typeof sessionsResult>>();
     const replacementClient = createTestGatewayClient(async () => replacementRead.promise);
-    const { gateway, publish } = createGatewayHarness(client);
-    const sessions = createTestSessionCapability(gateway);
+    const client = gateway.snapshot.client;
     await sessions.refresh({ agentId: "main", force: true });
     sessions.subscribe((state) => {
       if (state.result?.sessions.some((row) => row.hasActiveRun)) {
