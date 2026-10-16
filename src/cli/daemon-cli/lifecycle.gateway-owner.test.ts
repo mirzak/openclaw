@@ -1,6 +1,7 @@
 import "../../test-utils/prepare-compiled-subprocesses.js";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { mockSystemAccountHome } from "../../daemon/service.test-helpers.js";
+import { expectNoCalls, expectPartialCall } from "./lifecycle-assertions.test-support.js";
 import {
   lifecycleTestRuntime,
   lifecycleRuntimeLogs,
@@ -21,13 +22,14 @@ const owner = vi.hoisted(() => ({
   state: "live" as const,
   expired: false,
 }));
+const readyProbe = vi.hoisted(() => ({
+  ok: true,
+  configSnapshot: { commands: { restart: true } },
+}));
 const mocks = vi.hoisted(() => ({
   readOwner: vi.fn<(params?: { env?: NodeJS.ProcessEnv }) => typeof owner | undefined>(() => owner),
   readLock: vi.fn<typeof import("../../infra/gateway-lock.js").readActiveGatewayLockIdentity>(),
-  probeGateway: vi.fn(async () => ({
-    ok: true,
-    configSnapshot: { commands: { restart: true } },
-  })),
+  probeGateway: vi.fn(async () => readyProbe),
   writeIntent: vi.fn(() => true),
   clearIntent: vi.fn(),
   signalPid: vi.fn(),
@@ -42,14 +44,7 @@ const lock = {
   startTime: owner.startedAt,
 };
 const command = {
-  programArguments: [
-    "node",
-    "C:\\OpenClaw\\dist\\index.js",
-    "gateway",
-    "--port",
-    "18789",
-    "--task-supervisor",
-  ],
+  programArguments: ["gateway", "--port", "18789"],
   environment: {},
 };
 
@@ -122,14 +117,10 @@ beforeEach(() => {
     params?.env?.OPENCLAW_STATE_DIR === "foreign-service-state" ? undefined : owner,
   );
   mocks.readLock.mockReset().mockResolvedValue(lock);
-  mocks.probeGateway.mockReset().mockResolvedValue({
-    ok: true,
-    configSnapshot: { commands: { restart: true } },
-  });
+  mocks.probeGateway.mockReset().mockResolvedValue(readyProbe);
   mocks.writeIntent.mockReset().mockReturnValue(true);
   vi.spyOn(process, "platform", "get").mockReturnValue("win32");
   service.readCommand.mockResolvedValue(command);
-  service.readRuntime.mockResolvedValue({ status: "stopped" });
   service.restart.mockRejectedValue(new Error("gateway port 18789 is still busy before restart"));
 });
 
@@ -147,32 +138,36 @@ async function expectChangedOwnerRefusal() {
       auditSource: "cli",
     }),
   ).rejects.toThrow("gateway lock owner changed");
-  expect(mocks.signalPid).not.toHaveBeenCalled();
-  expect(mocks.callGatewayCli).not.toHaveBeenCalled();
+  expectNoCalls(mocks.signalPid, mocks.callGatewayCli);
 }
 
-it("does not restart a replacement owner discovered during the config probe", async () => {
-  mocks.probeGateway.mockImplementationOnce(async () => {
-    mocks.readLock.mockResolvedValue({ ...lock, ownerId: "replacement-owner" });
-    return { ok: true, configSnapshot: { commands: { restart: true } } };
-  });
-
-  await expectChangedOwnerRefusal();
-  expect(mocks.writeIntent).not.toHaveBeenCalled();
-});
-
-it("does not send a legacy restart signal when an owner ID appears at intent write", async () => {
-  vi.spyOn(process, "platform", "get").mockReturnValue("linux");
-  mocks.readLock.mockResolvedValue({ ...lock, ownerId: undefined });
-  mocks.writeIntent.mockImplementationOnce(() => {
-    mocks.readLock.mockResolvedValue({ ...lock, ownerId: "replacement-owner" });
-    return true;
-  });
-
-  await expectChangedOwnerRefusal();
-  expect(mocks.writeIntent).toHaveBeenCalledOnce();
-  expect(mocks.clearIntent).toHaveBeenCalledOnce();
-});
+it.each(["config probe", "legacy intent write"])(
+  "refuses a replacement owner at %s",
+  async (phase) => {
+    const replaceOwner = () =>
+      mocks.readLock.mockResolvedValue({ ...lock, ownerId: "replacement-owner" });
+    if (phase === "config probe") {
+      mocks.probeGateway.mockImplementationOnce(async () => {
+        replaceOwner();
+        return readyProbe;
+      });
+    } else {
+      vi.spyOn(process, "platform", "get").mockReturnValue("linux");
+      mocks.readLock.mockResolvedValue({ ...lock, ownerId: undefined });
+      mocks.writeIntent.mockImplementationOnce(() => {
+        replaceOwner();
+        return true;
+      });
+    }
+    await expectChangedOwnerRefusal();
+    if (phase === "config probe") {
+      expect(mocks.writeIntent).not.toHaveBeenCalled();
+    } else {
+      expect(mocks.writeIntent).toHaveBeenCalledOnce();
+      expect(mocks.clearIntent).toHaveBeenCalledOnce();
+    }
+  },
+);
 
 it("restarts the selected foreground owner before reporting healthy recovery", async () => {
   service.readCommand.mockResolvedValue({
@@ -186,16 +181,13 @@ it("restarts the selected foreground owner before reporting healthy recovery", a
     ok: true,
     result: "restarted",
   });
-  expect(mocks.callGatewayCli).toHaveBeenCalledWith(
-    expect.objectContaining({
-      method: "gateway.restart.request",
-      params: expect.objectContaining({
-        target: { pid: owner.pid, ownerId: owner.owner, port: owner.port },
-      }),
+  expectPartialCall(mocks.callGatewayCli, {
+    method: "gateway.restart.request",
+    params: expect.objectContaining({
+      target: { pid: owner.pid, ownerId: owner.owner, port: owner.port },
     }),
-  );
-  expect(service.restart).not.toHaveBeenCalled();
-  expect(service.install).not.toHaveBeenCalled();
+  });
+  expectNoCalls(service.restart, service.install);
   expect(mocks.callGatewayCli).toHaveBeenCalledOnce();
   expect(mocks.waitForGatewayHealthyListener).toHaveBeenCalledTimes(2);
   expect(mocks.waitForGatewayHealthyListener).toHaveBeenNthCalledWith(
