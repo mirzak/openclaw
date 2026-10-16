@@ -1,5 +1,4 @@
-// Doctor config analysis tests cover schema analysis, model fallback values, and issue generation.
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { resolveConfiguredModelFallbacks } from "../agents/model-selection-resolve.js";
 import { retainLegacyDefaultAgentId } from "../config/legacy.default-agent-owner.js";
 import {
@@ -7,7 +6,7 @@ import {
   setConfigResolutionFacts,
 } from "../config/resolution-facts.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { captureEnv } from "../test-utils/env.js";
+import { withEnv } from "../test-utils/env.js";
 import {
   noteDoctorHookConfigWarnings,
   noteImplicitFallbackClobberWarnings,
@@ -22,11 +21,16 @@ const noteMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../../packages/terminal-core/src/note.js", () => ({ note: noteMock }));
 
-function collectImplicitFallbackClobberWarnings(cfg: unknown): string[] {
+function collectWarnings(run: () => void): string[] {
   noteMock.mockClear();
-  noteImplicitFallbackClobberWarnings(cfg);
-  const body = noteMock.mock.calls.at(-1)?.[0];
-  return typeof body === "string" ? body.split(/\n(?=- )/) : [];
+  run();
+  return noteMock.mock.calls.map(([message]) => String(message));
+}
+
+function collectImplicitFallbackClobberWarnings(cfg: unknown): string[] {
+  return collectWarnings(() => noteImplicitFallbackClobberWarnings(cfg)).flatMap((body) =>
+    body.split(/\n(?=- )/),
+  );
 }
 
 describe("doctor config analysis helpers", () => {
@@ -71,14 +75,6 @@ describe("doctor config analysis helpers", () => {
           enabled: true,
           token: "hook-secret",
           transformsDir: "/virtual/.openclaw/workspace/skills/linear-webhook",
-          mappings: [
-            {
-              match: { path: "linear" },
-              action: "agent",
-              messageTemplate: "Linear event",
-              transform: { module: "./openclaw-linear-transform.js" },
-            },
-          ],
         },
       },
       "/virtual/.openclaw/openclaw.json",
@@ -112,19 +108,16 @@ describe("doctor config analysis helpers", () => {
   it("classifies external OpenCode overrides only while their plugins are active", () => {
     noteMock.mockClear();
 
+    const provider = (baseUrl: string) => ({
+      baseUrl,
+      api: "openai-completions" as const,
+      models: [],
+    });
     const cfg: OpenClawConfig = {
       models: {
         providers: {
-          opencode: {
-            baseUrl: "https://opencode.ai/zen/v1",
-            api: "openai-completions",
-            models: [],
-          },
-          "opencode-go": {
-            baseUrl: "https://opencode.ai/zen/go/v1",
-            api: "openai-completions",
-            models: [],
-          },
+          opencode: provider("https://opencode.ai/zen/v1"),
+          "opencode-go": provider("https://opencode.ai/zen/go/v1"),
         },
       },
     };
@@ -161,19 +154,8 @@ describe("doctor config analysis helpers", () => {
     expect(result.config).toEqual({ agents });
   });
 
-  describe("stripUnknownConfigKeys during update", () => {
-    const savedEnv = captureEnv(["OPENCLAW_UPDATE_IN_PROGRESS"]);
-
-    beforeEach(() => {
-      delete process.env.OPENCLAW_UPDATE_IN_PROGRESS;
-    });
-
-    afterEach(() => {
-      savedEnv.restore();
-    });
-
-    it("returns input unchanged when OPENCLAW_UPDATE_IN_PROGRESS=true", () => {
-      process.env.OPENCLAW_UPDATE_IN_PROGRESS = "true";
+  it("returns input unchanged when OPENCLAW_UPDATE_IN_PROGRESS=true", () => {
+    withEnv({ OPENCLAW_UPDATE_IN_PROGRESS: "true" }, () => {
       const input = { hooks: {}, unexpected: true } as never;
       const result = stripUnknownConfigKeys(input);
       expect(result.config).toBe(input);
@@ -183,10 +165,11 @@ describe("doctor config analysis helpers", () => {
 });
 
 describe("collectImplicitFallbackClobberWarnings", () => {
+  const defaults = { primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.4"] };
   it("warns when a canonical agent model suppresses default fallbacks", () => {
     const cfg: OpenClawConfig = {
       agents: {
-        defaults: { model: { primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.4"] } },
+        defaults: { model: defaults },
         entries: { ops: { model: { primary: "openai/gpt-5.3" } } },
       },
     };
@@ -218,7 +201,7 @@ describe("collectImplicitFallbackClobberWarnings", () => {
 
   it("returns empty when no per-agent model is configured", () => {
     const cfg = buildConfig({
-      defaults: { primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.4"] },
+      defaults,
       list: [{ id: "ops" }, { id: "researcher" }],
     });
     expect(collectImplicitFallbackClobberWarnings(cfg)).toEqual([]);
@@ -227,7 +210,7 @@ describe("collectImplicitFallbackClobberWarnings", () => {
   it("returns empty when agents.list is malformed", () => {
     const cfg = {
       agents: {
-        defaults: { model: { primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.4"] } },
+        defaults: { model: defaults },
         list: { ops: { id: "ops", model: "openai/gpt-5.3" } },
       },
     };
@@ -237,7 +220,7 @@ describe("collectImplicitFallbackClobberWarnings", () => {
 
   it("warns for each offending agent independently", () => {
     const cfg = buildConfig({
-      defaults: { primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.4"] },
+      defaults,
       list: [
         { id: "ops", model: "openai/gpt-5.3" },
         { id: "researcher", model: { primary: "openai/gpt-5.4" } },
@@ -259,9 +242,7 @@ describe("collectImplicitFallbackClobberWarnings", () => {
 
 describe("noteSandboxOriginProxyWarning", () => {
   function warningsFor(cfg: OpenClawConfig): string[] {
-    noteMock.mockClear();
-    noteSandboxOriginProxyWarning(cfg);
-    return noteMock.mock.calls.map((call) => String(call[0]));
+    return collectWarnings(() => noteSandboxOriginProxyWarning(cfg));
   }
 
   it("warns for trusted-proxy gateways without a sandbox origin", () => {
@@ -283,23 +264,22 @@ describe("noteSandboxOriginProxyWarning", () => {
 });
 
 describe("noteMcpOriginWarning", () => {
+  const perRequester: OpenClawConfig["mcp"] = {
+    servers: {
+      docs: {
+        url: "https://mcp.example.com",
+        auth: "oauth",
+        oauth: { identity: "per-requester" },
+      },
+    },
+  };
   function warningsFor(cfg: OpenClawConfig): string[] {
-    noteMock.mockClear();
-    noteMcpOriginWarning(cfg);
-    return noteMock.mock.calls.map((call) => String(call[0]));
+    return collectWarnings(() => noteMcpOriginWarning(cfg));
   }
 
   it("warns for per-requester MCP OAuth without a public Gateway origin", () => {
     const warnings = warningsFor({
-      mcp: {
-        servers: {
-          docs: {
-            url: "https://mcp.example.com",
-            auth: "oauth",
-            oauth: { identity: "per-requester" },
-          },
-        },
-      },
+      mcp: perRequester,
     });
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain("gateway.publicOrigin is not set");
@@ -310,15 +290,7 @@ describe("noteMcpOriginWarning", () => {
     expect(
       warningsFor({
         gateway: { publicOrigin: "https://gateway.example.com" },
-        mcp: {
-          servers: {
-            docs: {
-              url: "https://mcp.example.com",
-              auth: "oauth",
-              oauth: { identity: "per-requester" },
-            },
-          },
-        },
+        mcp: perRequester,
       }),
     ).toHaveLength(0);
   });

@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, expect, it, vi } from "vitest";
 import { readConfigFileSnapshot, transformConfigFile } from "../config/config.js";
@@ -37,7 +37,14 @@ import {
 } from "./doctor-config-flow.test-support.js";
 import { maybeRepairLegacyCronStore } from "./doctor/cron/index.js";
 
+const readText = (file: string) => fs.readFile(file, "utf8");
+
 afterEach(() => vi.restoreAllMocks());
+
+const statement = (sql: string) => openOpenClawStateDatabase().db.prepare(sql);
+const runSql = (sql: string, ...args: SQLInputValue[]) => statement(sql).run(...args);
+const getSql = (sql: string, ...args: SQLInputValue[]) => statement(sql).get(...args);
+const allSql = (sql: string, ...args: SQLInputValue[]) => statement(sql).all(...args);
 
 function sourceConfig(storePath?: string) {
   return {
@@ -83,6 +90,21 @@ async function backups() {
   return (await fs.readdir(path.dirname(databasePath)))
     .filter((name) => name.startsWith(`${path.basename(databasePath)}.doctor-cron-`))
     .map((name) => path.join(path.dirname(databasePath), name));
+}
+
+async function withSeededState(
+  label: string,
+  run: (state: OpenClawTestState, storePath: string) => Promise<void>,
+) {
+  return withOpenClawTestState(
+    { label, env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" } },
+    async (state) => {
+      await state.writeConfig(sourceConfig());
+      const storePath = state.statePath("cron", "jobs.json");
+      await seedJobs(storePath);
+      await run(state, storePath);
+    },
+  );
 }
 
 async function repair(state: OpenClawTestState) {
@@ -132,7 +154,7 @@ it.each(["retains", "removes"])(
         const storePath = state.statePath("cron", "jobs.json");
         await seedJobs(storePath);
         const beforeRows = rows(storePath);
-        const beforeConfig = await fs.readFile(state.configPath, "utf8");
+        const beforeConfig = await readText(state.configPath);
         const write = transformConfigFile({
           transform: (current) => {
             const canonical = createCanonicalAgentConfigFixture(current).config;
@@ -156,7 +178,7 @@ it.each(["retains", "removes"])(
         });
         await expect(write).rejects.toThrow("openclaw doctor --fix");
         expect(rows(storePath)).toEqual(beforeRows);
-        expect(await fs.readFile(state.configPath, "utf8")).toBe(beforeConfig);
+        expect(await readText(state.configPath)).toBe(beforeConfig);
         expect(await backups()).toEqual([]);
       },
     );
@@ -166,30 +188,24 @@ it.each(["retains", "removes"])(
 it.each(["update", "remove"])(
   "refuses an operator %s before changing an unresolved historical job",
   async (operation) => {
-    await withOpenClawTestState(
-      { label: "cron-owner-mutation-refusal", env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" } },
-      async (state) => {
-        await state.writeConfig(sourceConfig());
-        const storePath = state.statePath("cron", "jobs.json");
-        await seedJobs(storePath);
-        const { cron } = createCron(storePath);
-        try {
-          expect(
-            (await cron.list({ includeDisabled: true })).some((job) => job.id === "historical"),
-          ).toBe(true);
-          const beforeRows = rows(storePath);
-          const operationResult =
-            operation === "update"
-              ? cron.update("historical", { name: "changed" })
-              : cron.remove("historical");
-          await expect(operationResult).rejects.toThrow(CRON_AGENT_SELECTION_REQUIRED_MESSAGE);
-          expect(rows(storePath)).toEqual(beforeRows);
-          expect(await backups()).toEqual([]);
-        } finally {
-          cron.stop();
-        }
-      },
-    );
+    await withSeededState("cron-owner-mutation-refusal", async (_state, storePath) => {
+      const { cron } = createCron(storePath);
+      try {
+        expect(
+          (await cron.list({ includeDisabled: true })).some((job) => job.id === "historical"),
+        ).toBe(true);
+        const beforeRows = rows(storePath);
+        const operationResult =
+          operation === "update"
+            ? cron.update("historical", { name: "changed" })
+            : cron.remove("historical");
+        await expect(operationResult).rejects.toThrow(CRON_AGENT_SELECTION_REQUIRED_MESSAGE);
+        expect(rows(storePath)).toEqual(beforeRows);
+        expect(await backups()).toEqual([]);
+      } finally {
+        cron.stop();
+      }
+    });
   },
 );
 
@@ -210,7 +226,7 @@ it("preserves historical and explicit jobs when agent deletion needs Doctor", as
       try {
         await cron.list({ includeDisabled: true });
         const beforeRows = rows(storePath);
-        const beforeConfig = await fs.readFile(state.configPath, "utf8");
+        const beforeConfig = await readText(state.configPath);
         await expect(
           cron.removeAgentJobsTransactional("research", () =>
             transformConfigFile({
@@ -226,7 +242,7 @@ it("preserves historical and explicit jobs when agent deletion needs Doctor", as
           ),
         ).rejects.toMatchObject({ code: "CONFIG_WRITE_REJECTED", refusal: "cron-owner-safety" });
         expect(rows(storePath)).toEqual(beforeRows);
-        expect(await fs.readFile(state.configPath, "utf8")).toBe(beforeConfig);
+        expect(await readText(state.configPath)).toBe(beforeConfig);
         expect(await backups()).toEqual([]);
       } finally {
         cron.stop();
@@ -236,25 +252,18 @@ it("preserves historical and explicit jobs when agent deletion needs Doctor", as
 });
 
 it("preserves malformed cron bytes and the historical marker when Doctor cannot verify ownership", async () => {
-  await withOpenClawTestState(
-    { label: "cron-owner-corrupt", env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" } },
-    async (state) => {
-      await state.writeConfig(sourceConfig());
-      const storePath = state.statePath("cron", "jobs.json");
-      await seedJobs(storePath);
-      openOpenClawStateDatabase()
-        .db.prepare(
-          "UPDATE cron_jobs SET job_json = '{malformed' WHERE store_key = ? AND job_id = 'historical'",
-        )
-        .run(cronStoreKey(storePath));
-      const before = rows(storePath);
-      const beforeConfig = await fs.readFile(state.configPath, "utf8");
-      await expect(repair(state)).rejects.toThrow("Cannot verify ownership of malformed cron job");
-      expect(rows(storePath)).toEqual(before);
-      expect(await fs.readFile(state.configPath, "utf8")).toBe(beforeConfig);
-      expect(await backups()).toEqual([]);
-    },
-  );
+  await withSeededState("cron-owner-corrupt", async (state, storePath) => {
+    runSql(
+      "UPDATE cron_jobs SET job_json = '{malformed' WHERE store_key = ? AND job_id = 'historical'",
+      cronStoreKey(storePath),
+    );
+    const before = rows(storePath);
+    const beforeConfig = await readText(state.configPath);
+    await expect(repair(state)).rejects.toThrow("Cannot verify ownership of malformed cron job");
+    expect(rows(storePath)).toEqual(before);
+    expect(await readText(state.configPath)).toBe(beforeConfig);
+    expect(await backups()).toEqual([]);
+  });
 });
 
 it("leaves SQLite owners unchanged on ordinary cron startup", async () => {
@@ -262,11 +271,10 @@ it("leaves SQLite owners unchanged on ordinary cron startup", async () => {
     await state.writeConfig(sourceConfig());
     const storePath = state.statePath("cron", "jobs.json");
     await seedJobs(storePath);
-    openOpenClawStateDatabase()
-      .db.prepare(
-        "UPDATE cron_jobs SET state_json = json_set(state_json, '$.nextRunAtMs', 123), job_json = json_set(job_json, '$.notify', json('true')) WHERE store_key = ? AND job_id = 'sql-owner'",
-      )
-      .run(cronStoreKey(storePath));
+    runSql(
+      "UPDATE cron_jobs SET state_json = json_set(state_json, '$.nextRunAtMs', 123), job_json = json_set(job_json, '$.notify', json('true')) WHERE store_key = ? AND job_id = 'sql-owner'",
+      cronStoreKey(storePath),
+    );
     const beforeDefinitions = rows(storePath).map(({ job_id, job_json, agent_id }) => ({
       job_id,
       job_json,
@@ -320,11 +328,9 @@ it("preserves a due legacy one-shot through Doctor ownership repair, then runs i
       expect((await readConfigFileSnapshot()).valid).toBe(false);
       expect(rows(storePath)).toEqual(original);
       const readReceipts = () =>
-        openOpenClawStateDatabase()
-          .db.prepare(
-            "SELECT status FROM cron_run_receipts WHERE job_id = 'pending-one-shot' ORDER BY started_at_ms",
-          )
-          .all();
+        allSql(
+          "SELECT status FROM cron_run_receipts WHERE job_id = 'pending-one-shot' ORDER BY started_at_ms",
+        );
       expect(readReceipts()).toEqual([]);
       await repair(state);
       expect(await backups()).toHaveLength(1);
@@ -571,24 +577,23 @@ it.each([
         });
       }
       const readOtherRows = () =>
-        openOpenClawStateDatabase()
-          .db.prepare("SELECT * FROM cron_jobs WHERE store_key = ? ORDER BY sort_order, job_id")
-          .all(cronStoreKey(otherStorePath));
+        allSql(
+          "SELECT * FROM cron_jobs WHERE store_key = ? ORDER BY sort_order, job_id",
+          cronStoreKey(otherStorePath),
+        );
       const otherRowsBefore = machineStore ? readOtherRows() : undefined;
       const unsupportedDelivery = entry === "health write with unsupported delivery";
       if (unsupportedDelivery) {
-        openOpenClawStateDatabase()
-          .db.prepare(
-            "UPDATE cron_jobs SET job_json = json_set(job_json, '$.delivery.mode', 'not-a-route') WHERE store_key = ? AND job_id = 'historical'",
-          )
-          .run(cronStoreKey(storePath));
+        runSql(
+          "UPDATE cron_jobs SET job_json = json_set(job_json, '$.delivery.mode', 'not-a-route') WHERE store_key = ? AND job_id = 'historical'",
+          cronStoreKey(storePath),
+        );
       }
       const original = rows(storePath);
-      const originalGrant = openOpenClawStateDatabase()
-        .db.prepare(
-          "SELECT grant_definition_generation FROM cron_jobs WHERE store_key = ? AND job_id = 'historical'",
-        )
-        .get(cronStoreKey(storePath));
+      const originalGrant = getSql(
+        "SELECT grant_definition_generation FROM cron_jobs WHERE store_key = ? AND job_id = 'historical'",
+        cronStoreKey(storePath),
+      );
       const ctx = await repair(state);
       expect(ctx.configWriteRefusal).toBeUndefined();
       const saved = await readConfigFileSnapshot();
@@ -608,11 +613,10 @@ it.each([
         authoredNote: "keep me",
         ...(unsupportedDelivery ? { delivery: { mode: "not-a-route" } } : {}),
       });
-      const repairedGrant = openOpenClawStateDatabase()
-        .db.prepare(
-          "SELECT grant_definition_generation, grant_definition_revision, grant_definition_updated_at FROM cron_jobs WHERE store_key = ? AND job_id = 'historical'",
-        )
-        .get(cronStoreKey(storePath));
+      const repairedGrant = getSql(
+        "SELECT grant_definition_generation, grant_definition_revision, grant_definition_updated_at FROM cron_jobs WHERE store_key = ? AND job_id = 'historical'",
+        cronStoreKey(storePath),
+      );
       expect(repairedGrant?.grant_definition_generation).toBeGreaterThan(
         Number(originalGrant?.grant_definition_generation),
       );
@@ -622,14 +626,10 @@ it.each([
         expect(originalGrant?.grant_definition_generation).toBeNull();
         expect(repairedGrant?.grant_definition_generation).toBe(retainedGrantGeneration + 1);
         expect(
-          openOpenClawStateDatabase()
-            .db.prepare(
-              `SELECT grants.revoked_at_ms, generations.job_definition_generation
+          getSql(`SELECT grants.revoked_at_ms, generations.job_definition_generation
                FROM operator_approval_standing_grants AS grants
                JOIN operator_approval_standing_grant_generations AS generations USING (grant_id)
-               WHERE grants.minted_by_approval_id = 'historical-approval'`,
-            )
-            .get(),
+               WHERE grants.minted_by_approval_id = 'historical-approval'`),
         ).toEqual({ revoked_at_ms: null, job_definition_generation: retainedGrantGeneration });
       }
       for (const id of ["explicit", "session", "sql-owner"]) {
@@ -674,32 +674,25 @@ it.each([
 });
 
 it("retains the marker and a verified backup when SQL ownership changes after inspection", async () => {
-  await withOpenClawTestState(
-    { label: "cron-owner-currentness", env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" } },
-    async (state) => {
-      await state.writeConfig(sourceConfig());
-      const storePath = state.statePath("cron", "jobs.json");
-      await seedJobs(storePath);
-      const originalConfig = await fs.readFile(state.configPath, "utf8");
-      const createSnapshot = sqliteSnapshot.createVerifiedSqliteSnapshot;
-      const snapshot = vi
-        .spyOn(sqliteSnapshot, "createVerifiedSqliteSnapshot")
-        .mockImplementationOnce(async (params) => {
-          const result = await createSnapshot(params);
-          openOpenClawStateDatabase()
-            .db.prepare(
-              "UPDATE cron_jobs SET agent_id = 'research' WHERE store_key = ? AND job_id = 'historical'",
-            )
-            .run(cronStoreKey(storePath));
-          return result;
-        });
-      await expect(repair(state)).rejects.toThrow("Cron ownership changed during Doctor repair");
-      snapshot.mockRestore();
-      expect(await fs.readFile(state.configPath, "utf8")).toBe(originalConfig);
-      const historical = rows(storePath).find((row) => row.job_id === "historical");
-      expect(historical?.agent_id).toBe("research");
-      expect(JSON.parse(historical?.job_json ?? "null")).not.toHaveProperty("agentId");
-      expect(await backups()).toHaveLength(1);
-    },
-  );
+  await withSeededState("cron-owner-currentness", async (state, storePath) => {
+    const originalConfig = await readText(state.configPath);
+    const createSnapshot = sqliteSnapshot.createVerifiedSqliteSnapshot;
+    const snapshot = vi
+      .spyOn(sqliteSnapshot, "createVerifiedSqliteSnapshot")
+      .mockImplementationOnce(async (params) => {
+        const result = await createSnapshot(params);
+        runSql(
+          "UPDATE cron_jobs SET agent_id = 'research' WHERE store_key = ? AND job_id = 'historical'",
+          cronStoreKey(storePath),
+        );
+        return result;
+      });
+    await expect(repair(state)).rejects.toThrow("Cron ownership changed during Doctor repair");
+    snapshot.mockRestore();
+    expect(await readText(state.configPath)).toBe(originalConfig);
+    const historical = rows(storePath).find((row) => row.job_id === "historical");
+    expect(historical?.agent_id).toBe("research");
+    expect(JSON.parse(historical?.job_json ?? "null")).not.toHaveProperty("agentId");
+    expect(await backups()).toHaveLength(1);
+  });
 });

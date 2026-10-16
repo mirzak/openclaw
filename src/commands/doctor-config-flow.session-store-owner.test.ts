@@ -15,9 +15,24 @@ import { prepareDoctorContext } from "./doctor-config-flow.test-support.js";
 import { useDoctorConfigPreflightHome } from "./doctor-config-preflight.test-support.js";
 import { createDoctorPrompter } from "./doctor-prompter.js";
 
+const readText = (file: string) => fs.readFile(file, "utf8");
+const readJson = async (file: string) => JSON.parse(await readText(file));
+async function expectBytes(file: string, expected: string) {
+  await expect(fs.readFile(file, "utf8")).resolves.toBe(expected);
+}
+
 const note = vi.hoisted(() => vi.fn<(message: string, title?: string) => void>());
 vi.mock("../../packages/terminal-core/src/note.js", () => ({ note }));
 const withDoctorConfigPreflightHome = useDoctorConfigPreflightHome();
+afterEach(() => {
+  note.mockClear();
+  closeOpenClawStateDatabaseForTest();
+  vi.restoreAllMocks();
+});
+
+function expectNote(text: string) {
+  expect(note.mock.calls.some(([message]) => message.includes(text))).toBe(true);
+}
 
 function fixture(home: string, owner?: string, store?: string): OpenClawConfig {
   return {
@@ -50,19 +65,20 @@ function recoveryPrompter(confirm: () => Promise<boolean>) {
   return { ...prompter, confirmRuntimeRepair: vi.fn(confirm) };
 }
 
-describe("Doctor session-store owner recovery", () => {
-  afterEach(() => {
-    note.mockClear();
-    closeOpenClawStateDatabaseForTest();
-  });
+function withCoreHome(run: (home: string) => Promise<void>) {
+  return withDoctorConfigPreflightHome((home) =>
+    withEnvAsync({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" }, () => run(home)),
+  );
+}
 
+describe("Doctor session-store owner recovery", () => {
   it.each(["accepted", "declined", "noninteractive update"] as const)(
     "recovers the backed-up owner only with current consent: %s",
     async (scenario) => {
       await withDoctorConfigPreflightHome(async (home) => {
         const config = fixture(home);
         const configPath = await writeOpenClawConfig(home, config);
-        const original = await fs.readFile(configPath, "utf8");
+        const original = await readText(configPath);
         const reviewingHistory = scenario === "accepted" || scenario === "declined";
         await fs.writeFile(
           `${configPath}.bak`,
@@ -84,11 +100,7 @@ describe("Doctor session-store owner recovery", () => {
             );
             if (scenario === "noninteractive update") {
               expect(ctx.cfg.agents?.defaults?.sessionStore?.agentId).toBeUndefined();
-              expect(
-                note.mock.calls.some(([message]) =>
-                  message.includes("removal may have been intentional"),
-                ),
-              ).toBe(true);
+              expectNote("removal may have been intentional");
               return;
             }
             expect(prompter.confirmRuntimeRepair).toHaveBeenCalledWith({
@@ -105,17 +117,13 @@ describe("Doctor session-store owner recovery", () => {
               agentId: "ops",
             });
             if (scenario === "accepted") {
-              await expect(fs.readFile(`${configPath}.bak`, "utf8")).resolves.toBe(original);
+              await expectBytes(`${configPath}.bak`, original);
             }
-            expect(
-              note.mock.calls.some(([message]) =>
-                message.includes(
-                  scenario === "accepted"
-                    ? "Restored agents.defaults.sessionStore.agentId"
-                    : "openclaw config set agents.defaults.sessionStore.agentId ops",
-                ),
-              ),
-            ).toBe(true);
+            expectNote(
+              scenario === "accepted"
+                ? "Restored agents.defaults.sessionStore.agentId"
+                : "openclaw config set agents.defaults.sessionStore.agentId ops",
+            );
           },
         );
       });
@@ -145,11 +153,7 @@ describe("Doctor session-store owner recovery", () => {
         expect(prompter.confirmRuntimeRepair).not.toHaveBeenCalled();
         expect(ctx.cfg.agents?.defaults?.sessionStore?.agentId).toBeUndefined();
         if (scenario === "retired-agent") {
-          expect(
-            note.mock.calls.some(([message]) =>
-              message.includes("Re-author agents.defaults.sessionStore.agentId"),
-            ),
-          ).toBe(true);
+          expectNote("Re-author agents.defaults.sessionStore.agentId");
         }
       });
     },
@@ -179,177 +183,134 @@ function expectConflictWarning() {
 }
 
 describe("Doctor repair confirmation conflicts", () => {
-  afterEach(() => {
-    note.mockClear();
-    closeOpenClawStateDatabaseForTest();
-    vi.restoreAllMocks();
-  });
-
   it.each([
     { scenario: "accepting repairs after an edit", saveEdit: true, accept: true },
     { scenario: "accepting repairs without an edit", saveEdit: false, accept: true },
     { scenario: "declining repairs after an edit", saveEdit: true, accept: false },
   ])("preserves saved settings when $scenario", async ({ saveEdit, accept }) => {
-    await withDoctorConfigPreflightHome(async (home) => {
-      await withEnvAsync({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" }, async () => {
-        const config = createRepairableConfig(home);
-        const configPath = await writeOpenClawConfig(home, config);
-        const original = await fs.readFile(configPath, "utf8");
-        const edited = JSON.stringify(
-          { ...config, logging: { ...config.logging, level: "debug" } },
-          null,
-          2,
-        );
+    await withCoreHome(async (home) => {
+      const config = createRepairableConfig(home);
+      const configPath = await writeOpenClawConfig(home, config);
+      const original = await readText(configPath);
+      const edited = JSON.stringify(
+        { ...config, logging: { ...config.logging, level: "debug" } },
+        null,
+        2,
+      );
+      let confirmationShown = false;
+      await using ctx = await prepareDoctorContext(configPath, {
+        options: {},
+        confirm: async ({ message }) => {
+          expect(message).toBe("Apply recommended config repairs now?");
+          confirmationShown = true;
+          if (saveEdit) {
+            await fs.writeFile(configPath, edited);
+          }
+          return accept;
+        },
+      });
+      expect(confirmationShown).toBe(true);
+
+      await expect(runInitialConfigWriteHealth(ctx)).resolves.toBeUndefined();
+
+      if (saveEdit) {
+        // The final writer must not revive a declined or refused candidate.
+        await runWriteConfigHealth(ctx);
+        await expectBytes(configPath, edited);
+        await expect(fs.access(`${configPath}.bak`)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(ctx.configResultWriteCommitted).not.toBe(true);
+        if (accept) {
+          expectConflictWarning();
+        }
+        return;
+      }
+
+      const saved = await readJson(configPath);
+      expect(saved.browser).toEqual({ enabled: false });
+      expect(saved.logging.level).toBe("info");
+      await expectBytes(`${configPath}.bak`, original);
+      expect(ctx.configResultWriteCommitted).toBe(true);
+
+      // A later health repair is based on the committed candidate, so the
+      // confirmation's original source must no longer block that write.
+      ctx.cfg = { ...ctx.cfg, gateway: { ...ctx.cfg.gateway, bind: "lan" } };
+      await runWriteConfigHealth(ctx);
+      const afterHealthRepair = await readJson(configPath);
+      expect(afterHealthRepair.gateway.bind).toBe("lan");
+      expect(afterHealthRepair.browser).toEqual({ enabled: false });
+      expect(afterHealthRepair.logging.level).toBe("info");
+    });
+  });
+
+  it("refuses a config path switch during confirmation even when both files have identical bytes", async () => {
+    await withCoreHome(async (home) => {
+      const configPath = await writeOpenClawConfig(home, createRepairableConfig(home));
+      const original = await readText(configPath);
+      const otherPath = path.join(path.dirname(configPath), "other.json");
+      await fs.writeFile(otherPath, original);
+
+      await withEnvAsync({ OPENCLAW_CONFIG_PATH: configPath }, async () => {
         let confirmationShown = false;
         await using ctx = await prepareDoctorContext(configPath, {
           options: {},
           confirm: async ({ message }) => {
             expect(message).toBe("Apply recommended config repairs now?");
             confirmationShown = true;
-            if (saveEdit) {
-              await fs.writeFile(configPath, edited);
-            }
-            return accept;
+            setTestEnvValue("OPENCLAW_CONFIG_PATH", otherPath);
+            return true;
           },
         });
         expect(confirmationShown).toBe(true);
 
         await expect(runInitialConfigWriteHealth(ctx)).resolves.toBeUndefined();
-
-        if (saveEdit) {
-          // The final writer must not revive a declined or refused candidate.
-          await runWriteConfigHealth(ctx);
-          await expect(fs.readFile(configPath, "utf8")).resolves.toBe(edited);
-          await expect(fs.access(`${configPath}.bak`)).rejects.toMatchObject({ code: "ENOENT" });
-          expect(ctx.configResultWriteCommitted).not.toBe(true);
-          if (accept) {
-            expectConflictWarning();
-          }
-          return;
-        }
-
-        const saved = JSON.parse(await fs.readFile(configPath, "utf8"));
-        expect(saved.browser).toEqual({ enabled: false });
-        expect(saved.logging.level).toBe("info");
-        await expect(fs.readFile(`${configPath}.bak`, "utf8")).resolves.toBe(original);
-        expect(ctx.configResultWriteCommitted).toBe(true);
-
-        // A later health repair is based on the committed candidate, so the
-        // confirmation's original source must no longer block that write.
-        ctx.cfg = { ...ctx.cfg, gateway: { ...ctx.cfg.gateway, bind: "lan" } };
         await runWriteConfigHealth(ctx);
-        const afterHealthRepair = JSON.parse(await fs.readFile(configPath, "utf8"));
-        expect(afterHealthRepair.gateway.bind).toBe("lan");
-        expect(afterHealthRepair.browser).toEqual({ enabled: false });
-        expect(afterHealthRepair.logging.level).toBe("info");
-      });
-    });
-  });
 
-  it("refuses a config path switch during confirmation even when both files have identical bytes", async () => {
-    await withDoctorConfigPreflightHome(async (home) => {
-      await withEnvAsync({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" }, async () => {
-        const configPath = await writeOpenClawConfig(home, createRepairableConfig(home));
-        const original = await fs.readFile(configPath, "utf8");
-        const otherPath = path.join(path.dirname(configPath), "other.json");
-        await fs.writeFile(otherPath, original);
-
-        await withEnvAsync({ OPENCLAW_CONFIG_PATH: configPath }, async () => {
-          let confirmationShown = false;
-          await using ctx = await prepareDoctorContext(configPath, {
-            options: {},
-            confirm: async ({ message }) => {
-              expect(message).toBe("Apply recommended config repairs now?");
-              confirmationShown = true;
-              setTestEnvValue("OPENCLAW_CONFIG_PATH", otherPath);
-              return true;
-            },
-          });
-          expect(confirmationShown).toBe(true);
-
-          await expect(runInitialConfigWriteHealth(ctx)).resolves.toBeUndefined();
-          await runWriteConfigHealth(ctx);
-
-          for (const file of [configPath, otherPath]) {
-            await expect(fs.readFile(file, "utf8")).resolves.toBe(original);
-            await expect(fs.access(`${file}.bak`)).rejects.toMatchObject({ code: "ENOENT" });
-          }
-          expect(ctx.configResultWriteCommitted).not.toBe(true);
-          expectConflictWarning();
-        });
+        for (const file of [configPath, otherPath]) {
+          await expectBytes(file, original);
+          await expect(fs.access(`${file}.bak`)).rejects.toMatchObject({ code: "ENOENT" });
+        }
+        expect(ctx.configResultWriteCommitted).not.toBe(true);
+        expectConflictWarning();
       });
     });
   });
 });
 
-type ActivationCase = {
-  name: string;
-  entry: PluginEntryConfig;
-  allow?: string[];
-  persistedAllow?: string[];
-  warning: boolean;
-};
+type ActivationCase = [
+  name: string,
+  entry: PluginEntryConfig,
+  allow: string[] | undefined,
+  warning: boolean,
+  persistedAllow?: string[],
+];
 
 const optOut = { sessionCatalog: { enabled: false } };
+const enabledEntry = { enabled: true, config: optOut };
+const bothProviders = ["anthropic", "codex"];
 
 describe("Doctor Codex activation advisory", () => {
-  afterEach(() => {
-    note.mockClear();
-    closeOpenClawStateDatabaseForTest();
-  });
-
   it.each<ActivationCase>([
-    {
-      name: "a first-write opt-out with a non-Codex model",
-      entry: { config: optOut },
-      allow: ["anthropic"],
-      warning: false,
-    },
-    {
-      name: "historical enablement without an allowlist",
-      entry: { enabled: true, config: optOut },
-      warning: true,
-    },
-    {
-      name: "historical enablement with an empty allowlist",
-      entry: { enabled: true, config: optOut },
-      allow: [],
-      warning: true,
-    },
-    {
-      name: "historical enablement with an expanded allowlist",
-      entry: { enabled: true, config: optOut },
-      allow: ["anthropic", "codex"],
-      warning: true,
-    },
-    {
-      name: "authored catalog settings",
-      entry: { enabled: true, config: { sessionCatalog: { enabled: false, homes: [] } } },
-      allow: ["anthropic", "codex"],
-      warning: false,
-    },
-    {
-      name: "authored entry settings",
-      entry: { enabled: true, config: optOut, hooks: { allowPromptInjection: false } },
-      allow: ["anthropic", "codex"],
-      warning: false,
-    },
-    {
-      name: "explicit disablement",
-      entry: { enabled: false, config: optOut },
-      allow: ["anthropic"],
-      warning: false,
-    },
-    {
-      name: "a restrictive allowlist without Codex",
-      entry: { enabled: true, config: optOut },
-      allow: ["anthropic"],
-      persistedAllow: ["anthropic", "codex"],
-      warning: false,
-    },
+    ["a first-write opt-out with a non-Codex model", { config: optOut }, ["anthropic"], false],
+    ["historical enablement without an allowlist", enabledEntry, undefined, true],
+    ["historical enablement with an empty allowlist", enabledEntry, [], true],
+    ["historical enablement with an expanded allowlist", enabledEntry, bothProviders, true],
+    [
+      "authored catalog settings",
+      { ...enabledEntry, config: { sessionCatalog: { enabled: false, homes: [] } } },
+      bothProviders,
+      false,
+    ],
+    [
+      "authored entry settings",
+      { ...enabledEntry, hooks: { allowPromptInjection: false } },
+      bothProviders,
+      false,
+    ],
+    ["explicit disablement", { enabled: false, config: optOut }, ["anthropic"], false],
+    ["a restrictive allowlist without Codex", enabledEntry, ["anthropic"], false, bothProviders],
   ])(
-    "preserves plugin choices and reports $name",
-    async ({ entry, allow, persistedAllow, warning }) => {
+    "preserves plugin choices and reports %s",
+    async (_name, entry, allow, warning, persistedAllow) => {
       await withDoctorConfigPreflightHome(async (home) => {
         const configPath = await writeOpenClawConfig(home, {
           gateway: { mode: "local" },
@@ -357,9 +318,9 @@ describe("Doctor Codex activation advisory", () => {
           agents: { defaults: { model: "anthropic/claude-sonnet-4-6" } },
           plugins: { ...(allow === undefined ? {} : { allow }), entries: { codex: entry } },
         });
-        const before = await fs.readFile(configPath, "utf8");
+        const before = await readText(configPath);
         await using ctx = await prepareDoctorContext(configPath);
-        expect(await fs.readFile(configPath, "utf8")).toBe(before);
+        expect(await readText(configPath)).toBe(before);
         const advisory = note.mock.calls
           .filter(
             ([message, title]) =>
