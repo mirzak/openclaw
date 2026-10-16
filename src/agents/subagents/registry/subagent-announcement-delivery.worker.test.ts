@@ -72,18 +72,19 @@ const nativeRegistryRead = await vi.importActual<typeof registryRead>(
 const nativeWake = await vi.importActual<
   typeof import("../announce/subagent-announce.requester-settle-wake.js")
 >("../announce/subagent-announce.requester-settle-wake.js");
+
+function acceptTurn(io: Parameters<AgentTurnService["startTurn"]>[0]["io"], runId: string) {
+  io.emitAcceptance([
+    true,
+    { runId, status: "ok", result: { payloads: [{ text: "Reviewed synthetic child." }] } },
+    undefined,
+  ]);
+}
+
 beforeEach(() => {
   turns.start.mockReset().mockImplementation(async ({ io, assertAdmissionCurrent }) => {
     assertAdmissionCurrent?.();
-    io.emitAcceptance([
-      true,
-      {
-        runId: "synthetic-requester-turn",
-        status: "ok",
-        result: { payloads: [{ text: "Reviewed synthetic child." }] },
-      },
-      undefined,
-    ]);
+    acceptTurn(io, "synthetic-requester-turn");
   });
   turns.wait.mockReset();
 });
@@ -142,6 +143,21 @@ async function registerCompletion(
     gatewayContextResolver: () => context,
   });
   return { runId, childSessionKey };
+}
+
+function registerSuccessor(run: SubagentRunRecord, task: string) {
+  return registerSubagentRun({
+    runId: run.runId,
+    childSessionKey: run.childSessionKey,
+    sessionEntry: run.childSessionIdentity,
+    childAgentId: "main",
+    requesterSessionKey: "agent:main:main",
+    requesterAgentId: "main",
+    requesterDisplayKey: "main",
+    task,
+    cleanup: "keep",
+    expectsCompletionMessage: false,
+  });
 }
 
 function completeRegistered(
@@ -276,18 +292,12 @@ it("defers registered parent delivery until its descendant settles without host 
     const continuationRunId = "deferred-parent-continuation";
     turns.start.mockImplementation(async ({ io, assertAdmissionCurrent, preflight }) => {
       assertAdmissionCurrent?.();
-      io.emitAcceptance([
-        true,
-        {
-          runId:
-            preflight.request.sessionKey === parent.childSessionKey
-              ? continuationRunId
-              : "deferred-parent-outward-delivery",
-          status: "ok",
-          result: { payloads: [{ text: "Reviewed synthetic child." }] },
-        },
-        undefined,
-      ]);
+      acceptTurn(
+        io,
+        preflight.request.sessionKey === parent.childSessionKey
+          ? continuationRunId
+          : "deferred-parent-outward-delivery",
+      );
     });
     const reads: { phase: "announce" | "cleanup"; counts: ReturnType<typeof emptySqliteCounts> }[] =
       [];
@@ -530,17 +540,7 @@ it("refuses an old registered wake after its descendant read outlives a successo
       completeRegistered(run);
       await ready.promise;
       expect(loadSubagentRegistryFromSqlite().get(run.runId)?.requesterSettleWake).toBeDefined();
-      await registerSubagentRun({
-        ...run,
-        childAgentId: "main",
-        sessionEntry: original.childSessionIdentity,
-        requesterSessionKey: "agent:main:main",
-        requesterAgentId: "main",
-        requesterDisplayKey: "main",
-        task: "legitimate successor after the held wake",
-        cleanup: "keep",
-        expectsCompletionMessage: false,
-      });
+      await registerSuccessor(original, "legitimate successor after the held wake");
       const successor = subagentRuns.get(run.runId)!;
       expect(successor).not.toBe(original);
       const durableSuccessor = loadSubagentRegistryFromSqlite().get(run.runId);
@@ -645,17 +645,7 @@ it.for(["current", "successor", "revoked", "source switched"] as const)(
       let successor: SubagentRunRecord | undefined;
       let authorityChange: Promise<unknown> | undefined;
       if (change === "successor") {
-        authorityChange = registerSubagentRun({
-          ...run,
-          childAgentId: "main",
-          sessionEntry: original.childSessionIdentity,
-          requesterSessionKey: "agent:main:main",
-          requesterAgentId: "main",
-          requesterDisplayKey: "main",
-          task: "successor after observed hook",
-          cleanup: "keep",
-          expectsCompletionMessage: false,
-        });
+        authorityChange = registerSuccessor(original, "successor after observed hook");
       } else if (change === "revoked") {
         authorityChange = prepareSubagentSessionCleanupRevocation(run.childSessionKey).then(
           (guard) => guard(),

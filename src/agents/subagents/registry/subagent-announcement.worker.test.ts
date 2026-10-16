@@ -13,6 +13,7 @@ import {
 import { emitAgentEvent } from "../../../infra/agent-events.js";
 import { SqliteWorkerError } from "../../../infra/sqlite-worker-contract.js";
 import type { SqliteWorkerOperationAdmission } from "../../../infra/sqlite-worker-operation-admission.js";
+import { sqliteWorkerOwnerProbe as probe } from "../../../infra/sqlite-worker-owner-probe.test-support.js";
 import * as hookRuntime from "../../../plugins/hook-runner-global.js";
 import { createHookRunnerWithRegistry } from "../../../plugins/hooks.test-fixtures.js";
 import {
@@ -84,6 +85,35 @@ const nativePersistence = await vi.importActual<
   typeof import("./subagent-registry-persistence.js")
 >("./subagent-registry-persistence.js");
 
+const registrationDefaults = {
+  childAgentId: "main",
+  requesterSessionKey: "agent:main:main",
+  requesterAgentId: "main",
+  requesterDisplayKey: "main",
+  cleanup: "keep" as const,
+  expectsCompletionMessage: false,
+};
+
+function installEndedHook(handler: () => Promise<void>) {
+  const { registry, runner } = createHookRunnerWithRegistry([
+    { hookName: "subagent_ended", handler },
+  ]);
+  vi.mocked(loadAgentRuntimePluginRegistryHandle).mockReturnValue(registry);
+  vi.spyOn(hookRuntime, "getGlobalHookRunner").mockReturnValue(runner);
+  return registry;
+}
+
+function suspendRun(runId: string) {
+  return updateRun(runId, (draft) => {
+    draft.delivery = {
+      ...draft.delivery,
+      status: "suspended",
+      suspendedAt: Date.now() - 8 * 24 * 60 * 60_000,
+      suspendedReason: "expiry",
+    };
+  });
+}
+
 async function registerCompletion(
   runId: string,
   options: { holdForRequester?: boolean; cleanup?: "keep" | "delete" } = {},
@@ -99,16 +129,13 @@ async function registerCompletion(
   fixture.capture.mockResolvedValue("Synthetic completed result.");
   fixture.wake.mockResolvedValue(false);
   await registerSubagentRun({
+    ...registrationDefaults,
     runId,
     childSessionKey,
-    childAgentId: "main",
     sessionEntry: {
       sessionId: "ordinary-child-session",
       lifecycleRevision: "ordinary-child-revision",
     },
-    requesterSessionKey: "agent:main:main",
-    requesterAgentId: "main",
-    requesterDisplayKey: "main",
     task: "finish ordinary cleanup",
     cleanup: options.cleanup ?? "keep",
     expectsCompletionMessage: options.holdForRequester === true,
@@ -118,7 +145,10 @@ async function registerCompletion(
   return { runId, childSessionKey };
 }
 
-function completeRegistered(run: { runId: string; childSessionKey: string }) {
+function completeRegistered(
+  run: { runId: string; childSessionKey: string },
+  text = "Synthetic completed result.",
+) {
   emitAgentEvent({
     ...run,
     sessionKey: run.childSessionKey,
@@ -126,7 +156,7 @@ function completeRegistered(run: { runId: string; childSessionKey: string }) {
     data: {
       phase: "end",
       endedAt: Date.now(),
-      terminalReply: { disposition: "visible", text: "Synthetic completed result." },
+      terminalReply: { disposition: "visible", text },
     },
   });
 }
@@ -290,16 +320,11 @@ it.each(["not-committed", "unknown", "successor"] as const)(
       resumeSubagentRun(run.runId);
       if (change === "successor") {
         registration = registerSubagentRun({
+          ...registrationDefaults,
           runId: `${run.runId}-successor`,
           childSessionKey: run.childSessionKey,
-          childAgentId: "main",
           sessionEntry: entry.childSessionIdentity,
-          requesterSessionKey: "agent:main:main",
-          requesterAgentId: "main",
-          requesterDisplayKey: "main",
           task: "new child generation",
-          cleanup: "keep",
-          expectsCompletionMessage: false,
         });
         await successorQueued.promise;
       }
@@ -428,20 +453,16 @@ it.each(["current", "revoked", "source switched", "yielded"] as const)(
       });
     }
     await registerSubagentRun({
+      ...registrationDefaults,
       runId,
       childSessionKey,
-      childAgentId: "main",
       sessionEntry: {
         sessionId: "suspended-child-session",
         lifecycleRevision: "suspended-child-revision",
       },
-      requesterSessionKey: "agent:main:main",
-      requesterAgentId: "main",
-      requesterDisplayKey: "main",
       requesterTurnRunId: "held-parent-turn",
       completionTarget: "parent",
       task: "discard a suspended result without stale hook effects",
-      cleanup: "keep",
       retainAttachmentsOnKeep: true,
       expectsCompletionMessage: true,
     });
@@ -453,16 +474,7 @@ it.each(["current", "revoked", "source switched", "yielded"] as const)(
 
     const settleCompletion = observeRootWork();
     try {
-      emitAgentEvent({
-        runId,
-        sessionKey: childSessionKey,
-        stream: "lifecycle",
-        data: {
-          phase: "end",
-          endedAt: Date.now(),
-          terminalReply: { disposition: "visible", text: "Suspended synthetic result." },
-        },
-      });
+      completeRegistered({ runId, childSessionKey }, "Suspended synthetic result.");
     } finally {
       await settleCompletion();
     }
@@ -480,20 +492,9 @@ it.each(["current", "revoked", "source switched", "yielded"] as const)(
     let pausedRecord: typeof entry | undefined;
     expect(entry.execution.status).toBe("terminal");
     expect(entry.endedHookEmittedAt).toBeUndefined();
-    await updateRun(runId, (draft) => {
-      draft.delivery = {
-        ...draft.delivery,
-        status: "suspended",
-        suspendedAt: Date.now() - 8 * 24 * 60 * 60_000,
-        suspendedReason: "expiry",
-      };
-    });
+    await suspendRun(runId);
     const ended = vi.fn(async () => {});
-    const { registry, runner } = createHookRunnerWithRegistry([
-      { hookName: "subagent_ended", handler: ended },
-    ]);
-    vi.mocked(loadAgentRuntimePluginRegistryHandle).mockReturnValue(registry);
-    vi.spyOn(hookRuntime, "getGlobalHookRunner").mockReturnValue(runner);
+    const registry = installEndedHook(ended);
     const ready = createDeferredCore();
     const release = createDeferredCore();
     const preparingHook = vi
@@ -604,21 +605,10 @@ it.each([false, true])(
     await fixture.settle();
     let entry = subagentRuns.get(run.runId)!;
     expect(entry.execution.status).toBe("terminal");
-    await updateRun(run.runId, (draft) => {
-      draft.delivery = {
-        ...draft.delivery,
-        status: "suspended",
-        suspendedAt: Date.now() - 8 * 24 * 60 * 60_000,
-        suspendedReason: "expiry",
-      };
-    });
+    await suspendRun(run.runId);
     entry = subagentRuns.get(run.runId)!;
     const ended = vi.fn(async () => {});
-    const { registry, runner } = createHookRunnerWithRegistry([
-      { hookName: "subagent_ended", handler: ended },
-    ]);
-    vi.mocked(loadAgentRuntimePluginRegistryHandle).mockReturnValue(registry);
-    vi.spyOn(hookRuntime, "getGlobalHookRunner").mockReturnValue(runner);
+    installEndedHook(ended);
 
     const context = createContext();
     context.localEmbedded = true;
@@ -649,31 +639,24 @@ it.each([false, true])(
         return removeAttachments(retired, isCurrent);
       });
     let held = false;
-    const worker = vi
-      .spyOn(stateWorker, "runOpenClawStateWorkerOperation")
-      .mockImplementation((stateContext, operation, options) => {
-        return nativeWorker.runOpenClawStateWorkerOperation(
-          stateContext,
-          (scope) =>
-            operation({
-              async execute(command, executeOptions) {
-                const result = await scope.execute(command, executeOptions);
-                if (
-                  !held &&
-                  isSubagentRegistryWriteCommand(command) &&
-                  command.input.deleteRunIds.includes(run.runId)
-                ) {
-                  held = true;
-                  // The real transaction has settled; only its host acknowledgement waits.
-                  ready.resolve();
-                  await release.promise;
-                }
-                return result;
-              },
-            }),
-          options,
-        );
-      });
+    const worker = probe.command(
+      stateWorker,
+      async (command, executeOptions, scope) => {
+        const result = await scope.execute(command, executeOptions);
+        if (
+          !held &&
+          isSubagentRegistryWriteCommand(command) &&
+          command.input.deleteRunIds.includes(run.runId)
+        ) {
+          held = true;
+          // The real transaction has settled; only its host acknowledgement waits.
+          ready.resolve();
+          await release.promise;
+        }
+        return result;
+      },
+      { original: nativeWorker.runOpenClawStateWorkerOperation },
+    );
     const sweeping = testing.sweepOnceForTests();
     const outcome = sweeping.then(
       () => ({ completed: true as const }),
@@ -684,15 +667,11 @@ it.each([false, true])(
         { client, context, resolveGatewayContext, isWebchatConnect: () => false },
         () =>
           registerSubagentRun({
+            ...registrationDefaults,
             runId: run.runId,
             childSessionKey: run.childSessionKey,
-            childAgentId: "main",
             sessionEntry: entry.childSessionIdentity,
-            requesterSessionKey: "agent:main:main",
-            requesterAgentId: "main",
-            requesterDisplayKey: "main",
             task: "live retirement successor",
-            cleanup: "keep",
             expectsCompletionMessage: true,
           }),
       );
