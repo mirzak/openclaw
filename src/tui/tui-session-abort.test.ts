@@ -25,34 +25,40 @@ function abortHarness(
   aborted = true,
   local = false,
 ) {
-  const abortChat = vi.fn().mockResolvedValue({ ok: true, aborted });
-  const loadHistory = vi.fn().mockResolvedValue({ sessionInfo: { hasActiveRun: false } });
-  const addSystem = vi.fn();
-  const dropPendingUser = vi.fn();
-  const setActivityStatus = vi.fn();
-  const requestRender = vi.fn();
-  const invalidateRunOwnership = vi.fn();
+  const spies = {
+    abortChat: vi.fn<TuiBackend["abortChat"]>().mockResolvedValue({ ok: true, aborted }),
+    loadHistory: vi
+      .fn<TuiBackend["loadHistory"]>()
+      .mockResolvedValue({ sessionInfo: { hasActiveRun: false } }),
+    addSystem: vi.fn(),
+    dropPendingUser: vi.fn(),
+    setActivityStatus: vi.fn(),
+    requestRender: vi.fn(),
+    invalidateRunOwnership: vi.fn(),
+  };
   const state = createBaseState({ historyLoaded: true, ...overrides });
   const actions = createTestSessionActions({
-    client: makeTuiBackend({ loadHistory, abortChat }),
-    chatLog: makeChatLog({ addSystem, clearAll: vi.fn(), dropPendingUser }),
-    tui: makeTui({ requestRender }),
+    client: makeTuiBackend({
+      describeSession: vi.fn(),
+      abortChat: spies.abortChat,
+      loadHistory: spies.loadHistory,
+    }),
+    chatLog: makeChatLog({
+      addSystem: spies.addSystem,
+      clearAll: vi.fn(),
+      dropPendingUser: spies.dropPendingUser,
+    }),
+    tui: makeTui({ requestRender: spies.requestRender }),
     opts: { local },
     state,
-    setActivityStatus,
-    invalidateRunOwnership,
+    setActivityStatus: spies.setActivityStatus,
+    invalidateRunOwnership: spies.invalidateRunOwnership,
+    resolveSessionSelection: (raw = state.currentSessionKey, agentId = state.currentAgentId) => ({
+      key: raw,
+      agentId,
+    }),
   });
-  return {
-    ...actions,
-    abortChat,
-    loadHistory,
-    addSystem,
-    dropPendingUser,
-    setActivityStatus,
-    requestRender,
-    invalidateRunOwnership,
-    state,
-  };
+  return { ...actions, ...spies, state };
 }
 
 describe("TUI selected-session abort", () => {
@@ -106,31 +112,20 @@ describe("TUI selected-session abort", () => {
 
   it("drops a queued row that terminalizes while session abort is pending", async () => {
     const abort = createDeferred<{ ok: boolean; aborted: boolean; runIds: string[] }>();
-    const abortChat = vi.fn(() => abort.promise);
-    const dropPendingUser = vi.fn();
-    const state = createBaseState({
-      historyLoaded: true,
+    const h = abortHarness({
       activeChatRunId: "run-active",
       pendingSubmit: acceptedSubmit("run-queued", "queued"),
     });
-    const { abortActive } = createTestSessionActions({
-      client: makeTuiBackend({ describeSession: vi.fn(), abortChat }),
-      chatLog: makeChatLog({
-        addSystem: vi.fn(),
-        clearAll: vi.fn(),
-        dropPendingUser,
-      }),
-      state,
-    });
+    h.abortChat.mockImplementation(() => abort.promise);
 
-    const pendingAbort = abortActive();
-    expect(abortChat).toHaveBeenCalledOnce();
-    state.pendingSubmit = null;
+    const pendingAbort = h.abortActive();
+    expect(h.abortChat).toHaveBeenCalledOnce();
+    h.state.pendingSubmit = null;
     abort.resolve({ ok: true, aborted: true, runIds: ["run-active", "run-queued"] });
     await pendingAbort;
 
-    expect(dropPendingUser).toHaveBeenCalledTimes(1);
-    expect(dropPendingUser).toHaveBeenCalledWith("run-queued");
+    expect(h.dropPendingUser).toHaveBeenCalledTimes(1);
+    expect(h.dropPendingUser).toHaveBeenCalledWith("run-queued");
   });
 
   it.each([true, undefined])(
@@ -161,60 +156,28 @@ describe("TUI selected-session abort", () => {
 
   it("preserves a newer run when an older abort reports no active run", async () => {
     const deferred = createDeferred<Awaited<ReturnType<TuiBackend["abortChat"]>>>();
-    const state = createBaseState({ historyLoaded: true, activeChatRunId: "run-old" });
-    const invalidateRunOwnership = vi.fn();
-    const setActivityStatus = vi.fn();
-    const { abortActive } = createTestSessionActions({
-      state,
-      client: makeTuiBackend({ abortChat: vi.fn(() => deferred.promise) }),
-      invalidateRunOwnership,
-      setActivityStatus,
-    });
+    const h = abortHarness({ activeChatRunId: "run-old" });
+    h.abortChat.mockImplementation(() => deferred.promise);
+    h.loadHistory.mockResolvedValue({ messages: [] });
 
-    const pendingAbort = abortActive();
-    state.activeChatRunId = "run-new";
+    const pendingAbort = h.abortActive();
+    h.state.activeChatRunId = "run-new";
     deferred.resolve({ ok: true, aborted: false });
     await pendingAbort;
 
-    expect(state.activeChatRunId).toBe("run-new");
-    expect(invalidateRunOwnership).not.toHaveBeenCalled();
-    expect(setActivityStatus).not.toHaveBeenCalled();
+    expect(h.state.activeChatRunId).toBe("run-new");
+    expect(h.invalidateRunOwnership).not.toHaveBeenCalled();
+    expect(h.setActivityStatus).not.toHaveBeenCalled();
   });
 
   it.each([
-    [
-      "successful abort after a session switch",
-      "agent:main:first",
-      "agent:main:second",
-      true,
-      false,
-    ],
-    ["rejected abort after a session switch", "agent:main:first", "agent:main:second", false, true],
-    ["successful global abort after an agent switch", "global", "global", true, false],
-    [
-      "successful abort after the same session is replaced",
-      "agent:main:main",
-      "agent:main:main",
-      true,
-      false,
-    ],
+    ["successful session switch", "agent:main:first", "agent:main:second", true, false],
+    ["rejected session switch", "agent:main:first", "agent:main:second", false, true],
+    ["successful global agent switch", "global", "global", true, false],
+    ["successful same-session replacement", "agent:main:main", "agent:main:main", true, false],
   ])("ignores a %s", async (_name, initialKey, nextKey, aborted, rejected) => {
     const deferred = createDeferred<Awaited<ReturnType<TuiBackend["abortChat"]>>>();
-    const abortChat = vi.fn(() => deferred.promise);
-    const loadHistory = vi.fn().mockResolvedValue({
-      sessionInfo: {
-        key: nextKey,
-        sessionId: "second-session",
-        model: "current-model",
-      },
-      messages: [],
-    });
-    const addSystem = vi.fn();
-    const chatLog = makeChatLog({ addSystem });
-    const dropPendingUser = vi.fn();
-    const setActivityStatus = vi.fn();
-    const state = createBaseState({
-      historyLoaded: true,
+    const h = abortHarness({
       currentSessionKey: initialKey,
       currentAgentId: "main",
       currentSessionId: "first-session",
@@ -222,19 +185,19 @@ describe("TUI selected-session abort", () => {
       activeChatRunId: "first-active-run",
       pendingSubmit: acceptedSubmit("first-pending-run"),
     });
-    const { abortActive, setSession } = createTestSessionActions({
-      client: makeTuiBackend({ describeSession: vi.fn(), loadHistory, abortChat }),
-      chatLog: Object.assign(chatLog, { dropPendingUser }),
-      state,
-      setActivityStatus,
-      resolveSessionSelection: vi.fn((raw?: string, agentId?: string) => ({
-        key: raw ?? state.currentSessionKey,
-        agentId: agentId ?? state.currentAgentId,
-      })),
+    h.abortChat.mockImplementation(() => deferred.promise);
+    h.loadHistory.mockResolvedValue({
+      sessionInfo: {
+        key: nextKey,
+        sessionId: "second-session",
+        model: "current-model",
+      },
+      messages: [],
     });
+    const { state, abortActive, setSession, addSystem, dropPendingUser, setActivityStatus } = h;
 
     const pendingAbort = abortActive();
-    expect(abortChat).toHaveBeenCalledWith({
+    expect(h.abortChat).toHaveBeenCalledWith({
       sessionKey: initialKey,
       ...(initialKey === "global" ? { agentId: "main" } : {}),
     });
@@ -260,10 +223,12 @@ describe("TUI selected-session abort", () => {
     }
     await pendingAbort;
 
-    expect(state.currentSessionKey).toBe(nextKey);
-    expect(state.currentAgentId).toBe(initialKey === "global" ? "work" : "main");
-    expect(state.currentSessionId).toBe("second-session");
-    expect(state.activeChatRunId).toBe("second-active-run");
+    expect(state).toMatchObject({
+      currentSessionKey: nextKey,
+      currentAgentId: initialKey === "global" ? "work" : "main",
+      currentSessionId: "second-session",
+      activeChatRunId: "second-active-run",
+    });
     expect(getPendingSubmitAcceptedRunId(state)).toBe("second-pending-run");
     expect(getPendingSubmitDraft(state)).toEqual({
       runId: "second-pending-run",

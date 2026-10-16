@@ -1,32 +1,25 @@
-// Verifies canonical and provider-owned TUI session event routing.
 import { describe, expect, it } from "vitest";
+import { createBaseState } from "./tui-session-actions-test-support.js";
 import { matchesSelectedTuiSession, readTuiSessionUserMessage } from "./tui-session-events.js";
 import type { SessionMessageEvent, TuiStateAccess } from "./tui-types.js";
 
 function makeState(overrides?: Partial<TuiStateAccess>): TuiStateAccess {
-  return {
-    agentDefaultId: "main",
-    sessionMainKey: "agent:main:main",
-    sessionScope: "global",
-    agents: [],
-    currentAgentId: "main",
-    currentSessionKey: "agent:main:main",
+  return createBaseState({
     currentSessionId: "session-main",
-    activeChatRunId: null,
-    pendingSubmit: null,
     historyLoaded: true,
-    sessionInfo: {},
-    initialSessionApplied: true,
-    isConnected: true,
-    autoMessageSent: false,
-    toolsExpanded: false,
-    showThinking: false,
-    connectionStatus: "connected",
-    activityStatus: "idle",
-    statusTimeout: null,
-    lastCtrlCAt: 0,
     ...overrides,
-  };
+  });
+}
+
+function readUserMessage(
+  content: unknown,
+  metadata: Record<string, unknown> = {},
+  envelope: Omit<SessionMessageEvent, "message"> = {},
+) {
+  return readTuiSessionUserMessage({
+    ...envelope,
+    message: { role: "user", content, __openclaw: metadata },
+  });
 }
 
 describe("matchesSelectedTuiSession", () => {
@@ -69,6 +62,11 @@ describe("matchesSelectedTuiSession", () => {
 });
 
 describe("readTuiSessionUserMessage", () => {
+  const importedIdentity = {
+    id: "provider-local-id",
+    importedFrom: "claude-cli",
+    externalId: "provider-local-id",
+  };
   it.each([
     {
       name: "image block",
@@ -100,20 +98,16 @@ describe("readTuiSessionUserMessage", () => {
     "accepts an authoritative attachment-only $name event",
     ({ content, media, expected, images }) => {
       expect(
-        readTuiSessionUserMessage({
-          sessionKey: "agent:main:main",
-          messageId: "attachment-user-1",
-          message: {
-            role: "user",
-            content,
-            __openclaw: {
-              id: "attachment-user-1",
-              idempotencyKey: "attachment-run-1:user",
-              seq: 1,
-              ...(media ? { media } : {}),
-            },
+        readUserMessage(
+          content,
+          {
+            id: "attachment-user-1",
+            idempotencyKey: "attachment-run-1:user",
+            seq: 1,
+            ...(media ? { media } : {}),
           },
-        } satisfies SessionMessageEvent),
+          { sessionKey: "agent:main:main", messageId: "attachment-user-1" },
+        ),
       ).toEqual({
         messageId: "attachment-user-1",
         runId: "attachment-run-1",
@@ -125,28 +119,19 @@ describe("readTuiSessionUserMessage", () => {
   );
 
   it("prefers persisted sequence over a conflicting Gateway envelope without a message ID", () => {
-    expect(
-      readTuiSessionUserMessage({
-        messageSeq: 99,
-        message: {
-          role: "user",
-          content: "sequenced persisted prompt",
-          __openclaw: { seq: 7 },
-        },
-      }),
-    ).toEqual({ messageId: "seq:7", text: "sequenced persisted prompt" });
+    expect(readUserMessage("sequenced persisted prompt", { seq: 7 }, { messageSeq: 99 })).toEqual({
+      messageId: "seq:7",
+      text: "sequenced persisted prompt",
+    });
   });
 
   it("normalizes exactly one persisted user-turn suffix", () => {
     expect(
-      readTuiSessionUserMessage({
-        clientRunId: "another-client-run",
-        message: {
-          role: "user",
-          content: "nested user suffix",
-          __openclaw: { id: "persisted-message", idempotencyKey: "actual:user:user" },
-        },
-      }),
+      readUserMessage(
+        "nested user suffix",
+        { id: "persisted-message", idempotencyKey: "actual:user:user" },
+        { clientRunId: "another-client-run" },
+      ),
     ).toEqual({
       messageId: "persisted-message",
       runId: "actual:user",
@@ -157,19 +142,11 @@ describe("readTuiSessionUserMessage", () => {
 
   it("keys imported messages by their complete provider and CLI session identity", () => {
     const readImportedMessage = (cliSessionId: string) =>
-      readTuiSessionUserMessage({
-        messageId: "native-or-other-provider-id",
-        message: {
-          role: "user",
-          content: "imported prompt",
-          __openclaw: {
-            id: "provider-local-id",
-            importedFrom: "claude-cli",
-            cliSessionId,
-            externalId: "provider-local-id",
-          },
-        },
-      });
+      readUserMessage(
+        "imported prompt",
+        { ...importedIdentity, cliSessionId },
+        { messageId: "native-or-other-provider-id" },
+      );
 
     expect(readImportedMessage("cli-session-1")).toEqual({
       messageId: `external:${JSON.stringify(["claude-cli", "cli-session-1", "provider-local-id"])}`,
@@ -182,37 +159,19 @@ describe("readTuiSessionUserMessage", () => {
 
   it("uses the persisted transcript position for an incomplete imported identity", () => {
     expect(
-      readTuiSessionUserMessage({
-        messageId: "native-message",
-        messageSeq: 99,
-        message: {
-          role: "user",
-          content: "partially imported prompt",
-          __openclaw: {
-            id: "provider-local-id",
-            importedFrom: "claude-cli",
-            externalId: "provider-local-id",
-            seq: 7,
-          },
-        },
-      }),
+      readUserMessage(
+        "partially imported prompt",
+        { ...importedIdentity, seq: 7 },
+        { messageId: "native-message", messageSeq: 99 },
+      ),
     ).toEqual({ messageId: "imported-seq:7", text: "partially imported prompt" });
   });
 
   it("does not use envelope sequence to deduplicate incomplete imported ownership", () => {
     expect(
-      readTuiSessionUserMessage({
+      readUserMessage("imported prompt", importedIdentity, {
         messageId: "native-message",
         messageSeq: 7,
-        message: {
-          role: "user",
-          content: "imported prompt",
-          __openclaw: {
-            id: "provider-local-id",
-            importedFrom: "claude-cli",
-            externalId: "provider-local-id",
-          },
-        },
       }),
     ).toBeNull();
   });

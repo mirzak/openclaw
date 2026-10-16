@@ -25,6 +25,35 @@ import {
 import type { TuiHistoryLoadResult, TuiStateAccess } from "./tui-types.js";
 
 type TuiSessionDescription = Awaited<ReturnType<TuiBackend["describeSession"]>>;
+const renderChat = (chatLog: ChatLog) => chatLog.render(120).join("\n");
+const flushImmediate = () =>
+  new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+const mainSession = { key: "agent:main:main", sessionId: "session-main" };
+const userMessage = (
+  content: string,
+  id: string,
+  seq: number,
+  imported: Record<string, unknown> = {},
+) => ({
+  role: "user",
+  content,
+  __openclaw: { id, seq, ...imported },
+});
+const createDeferredHistory = (
+  stateOverrides: Partial<TuiStateAccess> = { currentSessionId: "session-main" },
+  chatLog = new ChatLog(),
+) => {
+  const history = createDeferred<unknown>();
+  const state = createBaseState(stateOverrides);
+  const actions = createTestSessionActions({
+    client: makeTuiBackend({ describeSession: vi.fn(), loadHistory: vi.fn(() => history.promise) }),
+    state,
+    chatLog,
+  });
+  return { history, state, chatLog, ...actions };
+};
 
 describe("tui session actions", () => {
   const acceptedSubmit = (
@@ -165,7 +194,7 @@ describe("tui session actions", () => {
     expect(state.pendingSubmit).toBeNull();
     expect(state.historyLoaded).toBe(false);
     expect(state.sessionProjection?.entries).toEqual([]);
-    expect(chatLog.render(120).join("\n")).not.toContain("PRIVATE RESEARCH HISTORY");
+    expect(renderChat(chatLog)).not.toContain("PRIVATE RESEARCH HISTORY");
     expect(invalidateRunOwnership).toHaveBeenCalledOnce();
     expect(clearLocalRunIds).toHaveBeenCalledOnce();
     expect(loadHistory).toHaveBeenCalledWith({ sessionKey: "global", agentId: "ops", limit: 200 });
@@ -427,9 +456,7 @@ describe("tui session actions", () => {
     const second = refreshSessionInfo();
     const third = refreshSessionInfo();
 
-    await new Promise<void>((resolve) => {
-      setImmediate(resolve);
-    });
+    await flushImmediate();
     expect(describeSession).toHaveBeenCalledTimes(1);
     expect(describeSession).toHaveBeenNthCalledWith(1, {
       sessionKey: "agent:main:main",
@@ -445,9 +472,7 @@ describe("tui session actions", () => {
       },
     });
 
-    await new Promise<void>((resolve) => {
-      setImmediate(resolve);
-    });
+    await flushImmediate();
 
     expect(describeSession).toHaveBeenCalledTimes(2);
 
@@ -555,10 +580,10 @@ describe("tui session actions", () => {
 
     await refreshSessionInfo();
 
-    expect(state.sessionInfo.model).toBe("new-model");
-    expect(state.sessionInfo.modelProvider).toBe("openai");
-    expect(state.sessionInfo.updatedAt).toBe(200);
     expect(state.sessionInfo).toMatchObject({
+      model: "new-model",
+      modelProvider: "openai",
+      updatedAt: 200,
       fastMode: true,
       verboseLevel: "full",
       traceLevel: "raw",
@@ -710,20 +735,15 @@ describe("tui session actions", () => {
   ])(
     "reconciles an authoritative live user against $snapshot history",
     async ({ included, scrollback, userSeq, replySeq }) => {
-      const deferredHistory = createDeferred<unknown>();
       const chatLog = new ChatLog(scrollback ? 20 : undefined);
       chatLog.addUser("Deleted prompt from an earlier branch", {
         messageId: "deleted-history-user",
       });
-      const state = createBaseState({ currentSessionId: "session-main" });
-      const { loadHistory } = createTestSessionActions({
-        client: makeTuiBackend({
-          describeSession: vi.fn(),
-          loadHistory: vi.fn(() => deferredHistory.promise),
-        }),
-        chatLog,
+      const {
+        history: deferredHistory,
         state,
-      });
+        loadHistory,
+      } = createDeferredHistory(undefined, chatLog);
 
       const loading = loadHistory();
       persistLiveUser(state, {
@@ -734,7 +754,7 @@ describe("tui session actions", () => {
       });
       deferredHistory.resolve({
         sessionId: "session-main",
-        sessionInfo: { key: "agent:main:main", sessionId: "session-main" },
+        sessionInfo: mainSession,
         messages: [
           ...(scrollback
             ? Array.from({ length: 18 }, (_, index) => ({
@@ -763,7 +783,7 @@ describe("tui session actions", () => {
       });
 
       await expect(loading).resolves.toMatchObject({ loaded: true });
-      const rendered = chatLog.render(120).join("\n");
+      const rendered = renderChat(chatLog);
       expect(rendered).not.toContain("Deleted prompt from an earlier branch");
       expect(rendered.match(/Browser prompt received during refresh/g)).toHaveLength(1);
       expect(rendered).toContain("Current branch reply");
@@ -777,17 +797,7 @@ describe("tui session actions", () => {
   );
 
   it("preserves distinct imported live users through a stale history snapshot", async () => {
-    const deferredHistory = createDeferred<unknown>();
-    const chatLog = new ChatLog();
-    const state = createBaseState({ currentSessionId: "session-main" });
-    const { loadHistory } = createTestSessionActions({
-      client: makeTuiBackend({
-        describeSession: vi.fn(),
-        loadHistory: vi.fn(() => deferredHistory.promise),
-      }),
-      chatLog,
-      state,
-    });
+    const { history: deferredHistory, state, chatLog, loadHistory } = createDeferredHistory();
 
     const loading = loadHistory();
     for (const [index, cliSessionId] of ["first-cli-session", "second-cli-session"].entries()) {
@@ -809,7 +819,7 @@ describe("tui session actions", () => {
     }
     deferredHistory.resolve({
       sessionId: "session-main",
-      sessionInfo: { key: "agent:main:main", sessionId: "session-main" },
+      sessionInfo: mainSession,
       messages: [
         {
           role: "assistant",
@@ -820,7 +830,7 @@ describe("tui session actions", () => {
     });
 
     await expect(loading).resolves.toMatchObject({ loaded: true });
-    const rendered = chatLog.render(120).join("\n");
+    const rendered = renderChat(chatLog);
     expect(rendered.match(/Imported live prompt 1/g)).toHaveLength(1);
     expect(rendered.match(/Imported live prompt 2/g)).toHaveLength(1);
     expect(rendered).toContain("Current branch reply");
@@ -835,55 +845,27 @@ describe("tui session actions", () => {
         describeSession: vi.fn(),
         loadHistory: vi.fn().mockResolvedValue({
           sessionId: "session-main",
-          sessionInfo: { key: "agent:main:main", sessionId: "session-main" },
+          sessionInfo: mainSession,
           messages: [
-            {
-              role: "user",
-              content: "Native canonical prompt",
-              __openclaw: { id: sharedId, seq: 1 },
-            },
-            {
-              role: "user",
-              content: "First imported prompt",
-              __openclaw: {
-                id: sharedId,
-                importedFrom: "claude-cli",
-                cliSessionId: "first-cli-session",
-                externalId: sharedId,
-                seq: 2,
-              },
-            },
-            {
-              role: "user",
-              content: "Second imported prompt",
-              __openclaw: {
-                id: sharedId,
-                importedFrom: "claude-cli",
-                cliSessionId: "second-cli-session",
-                externalId: sharedId,
-                seq: 3,
-              },
-            },
-            {
-              role: "user",
-              content: "First partially imported prompt",
-              __openclaw: {
-                id: sharedId,
-                importedFrom: "claude-cli",
-                externalId: sharedId,
-                seq: 4,
-              },
-            },
-            {
-              role: "user",
-              content: "Second partially imported prompt",
-              __openclaw: {
-                id: sharedId,
-                importedFrom: "claude-cli",
-                externalId: sharedId,
-                seq: 5,
-              },
-            },
+            userMessage("Native canonical prompt", sharedId, 1),
+            userMessage("First imported prompt", sharedId, 2, {
+              importedFrom: "claude-cli",
+              cliSessionId: "first-cli-session",
+              externalId: sharedId,
+            }),
+            userMessage("Second imported prompt", sharedId, 3, {
+              importedFrom: "claude-cli",
+              cliSessionId: "second-cli-session",
+              externalId: sharedId,
+            }),
+            userMessage("First partially imported prompt", sharedId, 4, {
+              importedFrom: "claude-cli",
+              externalId: sharedId,
+            }),
+            userMessage("Second partially imported prompt", sharedId, 5, {
+              importedFrom: "claude-cli",
+              externalId: sharedId,
+            }),
           ],
         }),
       }),
@@ -893,7 +875,7 @@ describe("tui session actions", () => {
 
     await expect(loadHistory()).resolves.toMatchObject({ loaded: true });
 
-    const rendered = chatLog.render(120).join("\n");
+    const rendered = renderChat(chatLog);
     expect(rendered.match(/Native canonical prompt/g)).toHaveLength(1);
     expect(rendered.match(/First imported prompt/g)).toHaveLength(1);
     expect(rendered.match(/Second imported prompt/g)).toHaveLength(1);
@@ -902,23 +884,12 @@ describe("tui session actions", () => {
   });
 
   it("preserves new-session live users without leaking the previous session during a switch", async () => {
-    const deferredHistory = createDeferred<unknown>();
-    const chatLog = new ChatLog();
-    const state = createBaseState({ currentSessionId: "session-main" });
+    const { history: deferredHistory, state, chatLog, setSession } = createDeferredHistory();
     persistLiveUser(state, {
       text: "Private prompt from previous session",
       messageId: "previous-user",
       runId: "previous-run",
     });
-    const { setSession } = createTestSessionActions({
-      client: makeTuiBackend({
-        describeSession: vi.fn(),
-        loadHistory: vi.fn(() => deferredHistory.promise),
-      }),
-      chatLog,
-      state,
-    });
-
     const switching = setSession("agent:main:other");
     persistLiveUser(state, {
       text: "Browser prompt in selected session",
@@ -939,7 +910,7 @@ describe("tui session actions", () => {
     });
 
     await switching;
-    const rendered = chatLog.render(120).join("\n");
+    const rendered = renderChat(chatLog);
     expect(rendered).toContain("Browser prompt in selected session");
     expect(rendered.match(/Browser prompt in selected session/g)).toHaveLength(1);
     expect(rendered).toContain("Other session reply");
@@ -950,16 +921,13 @@ describe("tui session actions", () => {
   });
 
   it("discards old live users when a same-key history response rotates the session id", async () => {
-    const deferredHistory = createDeferred<unknown>();
-    const chatLog = new ChatLog();
-    const state = createBaseState({ currentSessionId: "session-before-reset" });
-    const { loadHistory } = createTestSessionActions({
-      client: makeTuiBackend({
-        describeSession: vi.fn(),
-        loadHistory: vi.fn(() => deferredHistory.promise),
-      }),
-      chatLog,
+    const {
+      history: deferredHistory,
       state,
+      chatLog,
+      loadHistory,
+    } = createDeferredHistory({
+      currentSessionId: "session-before-reset",
     });
 
     const loading = loadHistory();
@@ -975,7 +943,7 @@ describe("tui session actions", () => {
     });
 
     await expect(loading).resolves.toMatchObject({ loaded: true });
-    const rendered = chatLog.render(120).join("\n");
+    const rendered = renderChat(chatLog);
     expect(rendered).toContain("Fresh session reply");
     expect(rendered).not.toContain("Private prompt from before reset");
   });
@@ -1201,7 +1169,7 @@ describe("tui session actions", () => {
               content: [{ type: "text", text: "late complete reply" }],
             },
           });
-          expect(chatLog.render(120).join("\n")).toContain("late complete reply");
+          expect(renderChat(chatLog)).toContain("late complete reply");
           expect(state.activeChatRunId).toBeNull();
         }
         handlers.dispose();
@@ -1250,7 +1218,7 @@ describe("tui session actions", () => {
       expect(state.activeChatRunId).toBe(activeRunId);
       expect(state.pendingSubmit).toEqual(acceptedSubmit(pendingRunId, pendingText));
       expect(state.activityStatus).toBe("streaming");
-      expect(chatLog.render(120).join("\n")).toContain(pendingText);
+      expect(renderChat(chatLog)).toContain(pendingText);
       expect(invalidateRunOwnership).not.toHaveBeenCalled();
       expect(clearLocalRunIds).not.toHaveBeenCalled();
       expect(loadHistory).not.toHaveBeenCalled();
@@ -1646,7 +1614,7 @@ describe("tui session actions", () => {
         }
         await Promise.all(histories);
         await vi.waitFor(() => {
-          const rendered = chatLog.render(120).join("\n");
+          const rendered = renderChat(chatLog);
           expect(rendered).not.toContain("before reset");
           expect(rendered.match(/session agent:main:main reset/g)).toHaveLength(1);
         });
@@ -1999,7 +1967,7 @@ describe("tui session actions", () => {
       await loadHistory();
 
       expect(startTool).toHaveBeenCalledTimes(showsTool ? 1 : 0);
-      expect(chatLog.render(120).join("\n").includes(privateOutput)).toBe(showsOutput);
+      expect(renderChat(chatLog).includes(privateOutput)).toBe(showsOutput);
     },
   );
 
@@ -2055,11 +2023,11 @@ describe("tui session actions", () => {
         state.activityStatus = value;
       };
       const { loadHistory } = createTestSessionActions({
+        client: makeTuiBackend({ loadHistory: vi.fn(() => history.promise) }),
         state,
         chatLog,
         tui,
         setActivityStatus,
-        client: makeTuiBackend({ loadHistory: vi.fn(() => history.promise) }),
       });
       const handlers = createEventHandlers({
         state,
@@ -2098,16 +2066,14 @@ describe("tui session actions", () => {
           { role: "assistant", content: "Delivered reply" },
         ],
       });
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
+      await flushImmediate();
 
       expect(state.activeChatRunId).toBe(phase === "concurrent" ? "run-other" : null);
       expect(getPendingSubmitAcceptedRunId(state)).toBe(phase === "superseded" ? "run-new" : null);
       expect(state.activityStatus).toBe(
         phase === "concurrent" ? "streaming" : phase === "superseded" ? "waiting" : "idle",
       );
-      expect(chatLog.render(120).join("\n")).toContain("Delivered reply");
+      expect(renderChat(chatLog)).toContain("Delivered reply");
       handlers.dispose();
     },
   );
@@ -2130,9 +2096,7 @@ describe("tui session actions", () => {
           describeSession: vi.fn(),
           loadHistory: vi.fn().mockResolvedValue({
             sessionId: "session-main",
-            ...(persistedRunId
-              ? { sessionInfo: { key: "agent:main:main", sessionId: "session-main" } }
-              : {}),
+            ...(persistedRunId ? { sessionInfo: mainSession } : {}),
             messages: persistedRunId
               ? [
                   {
