@@ -1,4 +1,3 @@
-// Sms tests cover send plugin behavior.
 import { isChannelPartialDeliveryError } from "openclaw/plugin-sdk/channel-inbound";
 import { PlatformMessageNotDispatchedError } from "openclaw/plugin-sdk/error-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -16,12 +15,7 @@ type SendModule = typeof import("./send.js");
 type SendSmsMediaParams = Parameters<SendModule["prepareSmsMediaAttempt"]>[0] &
   Omit<Parameters<SendModule["sendPreparedSmsMediaAttempt"]>[0], "attempt">;
 
-const sendSmsViaTwilio = vi.hoisted(() =>
-  vi.fn<typeof sendSmsViaTwilioType>(async ({ to, onPlatformSendDispatch }) => {
-    await onPlatformSendDispatch?.();
-    return { sid: `SM-${to}`, to };
-  }),
-);
+const sendSmsViaTwilio = vi.hoisted(() => vi.fn<typeof sendSmsViaTwilioType>());
 const assertSmsCredentialOwnerAvailable = vi.hoisted(() => vi.fn());
 const hostedMediaMocks = vi.hoisted(() => {
   const cleanup = vi.fn(async () => undefined);
@@ -99,28 +93,27 @@ async function sendSmsMedia(params: SendSmsMediaParams) {
   });
 }
 
+function mediaParams(overrides: Partial<SendSmsMediaParams> = {}): SendSmsMediaParams {
+  return {
+    account: createAccount(1500),
+    to: "+15551234567",
+    text: "photo",
+    mediaUrl: "/tmp/photo.jpg",
+    mediaLocalRoots: ["/tmp"],
+    ...overrides,
+  };
+}
+
 describe("sendSmsTextChunks", () => {
   it("records chunk results independently after one observation write fails", async () => {
     sendSmsViaTwilio
-      .mockResolvedValueOnce({
-        sid: "SM-1",
-        to: "+15551234567",
-        status: "queued",
-      })
-      .mockResolvedValueOnce({
-        sid: "SM-2",
-        to: "+15551234567",
-        status: "queued",
-      });
+      .mockResolvedValueOnce({ sid: "SM-1", to: "+15551234567", status: "queued" })
+      .mockResolvedValueOnce({ sid: "SM-2", to: "+15551234567", status: "queued" });
     recordInitialSmsDeliveryResult
       .mockRejectedValueOnce(new Error("first write failed"))
       .mockResolvedValueOnce(null);
 
-    await sendSmsTextChunks({
-      account: createAccount(5),
-      to: "+15551234567",
-      text: "alpha beta",
-    });
+    await sendSmsTextChunks({ account: createAccount(5), to: "+15551234567", text: "alpha beta" });
 
     expect(sendSmsViaTwilio).toHaveBeenCalledTimes(2);
     expect(recordInitialSmsDeliveryResult).toHaveBeenCalledTimes(2);
@@ -146,18 +139,12 @@ describe("sendSmsTextChunks", () => {
   });
 
   it("labels assistant-authored transcript role headers in plain text", () => {
-    expect(toSmsPlainText("user[Thu 2026-07-02] question")).toBe(
-      "[assistant-authored transcript] user[Thu 2026-07-02] question",
-    );
-    expect(toSmsPlainText("`user[Thu 2026-07-02] question`")).toBe(
-      "[assistant-authored transcript] user[Thu 2026-07-02] question",
-    );
-    expect(toSmsPlainText("\u00a0user[Thu 2026-07-02] question")).toBe(
-      "[assistant-authored transcript] user[Thu 2026-07-02] question",
-    );
-    expect(toSmsPlainText("- user[Thu 2026-07-02] question")).toBe(
-      "• [assistant-authored transcript] user[Thu 2026-07-02] question",
-    );
+    const header = "user[Thu 2026-07-02] question";
+    const labeled = `[assistant-authored transcript] ${header}`;
+    expect(toSmsPlainText(header)).toBe(labeled);
+    expect(toSmsPlainText(`\`${header}\``)).toBe(labeled);
+    expect(toSmsPlainText(`\u00a0${header}`)).toBe(labeled);
+    expect(toSmsPlainText(`- ${header}`)).toBe(`• ${labeled}`);
     expect(toSmsPlainText("[user](https://example.com)[Thu 2026-07-02] question")).toBe(
       "[assistant-authored transcript] user (https://example.com)[Thu 2026-07-02] question",
     );
@@ -170,14 +157,9 @@ describe("sendSmsMedia", () => {
       throw new Error("SMS credential owner unavailable");
     });
 
-    await expect(
-      prepareSmsMediaAttempt({
-        account: createAccount(1500),
-        text: "photo",
-        mediaUrl: "/tmp/photo.jpg",
-        mediaLocalRoots: ["/tmp"],
-      }),
-    ).rejects.toThrow("SMS credential owner unavailable");
+    await expect(prepareSmsMediaAttempt(mediaParams())).rejects.toThrow(
+      "SMS credential owner unavailable",
+    );
 
     expect(hostedMediaMocks.prepare).not.toHaveBeenCalled();
   });
@@ -189,15 +171,7 @@ describe("sendSmsMedia", () => {
     });
     hostedMediaMocks.prepare.mockRejectedValueOnce(rejection);
 
-    await expect(
-      sendSmsMedia({
-        account: createAccount(1500),
-        to: "+15551234567",
-        text: "photo",
-        mediaUrl: "/tmp/photo.jpg",
-        mediaLocalRoots: ["/tmp"],
-      }),
-    ).rejects.toBe(rejection);
+    await expect(sendSmsMedia(mediaParams())).rejects.toBe(rejection);
 
     expect(sendSmsViaTwilio).not.toHaveBeenCalled();
   });
@@ -223,29 +197,21 @@ describe("sendSmsMedia", () => {
       events.push("dispatch");
     });
 
-    let observed: unknown;
-    try {
-      await sendSmsMedia({
+    const observed: unknown = await sendSmsMedia(
+      mediaParams({
         account: createAccount(5),
-        to: "+15551234567",
         text: "alpha beta gamma",
-        mediaUrl: "/tmp/photo.jpg",
-        mediaLocalRoots: ["/tmp"],
         onPlatformSendDispatch,
         onDeliveryResult,
-      });
-    } catch (error) {
-      observed = error;
-    }
+      }),
+    ).catch((error: unknown) => error);
 
     expect(sendSmsViaTwilio).toHaveBeenCalledTimes(2);
     expect(sendSmsViaTwilio.mock.calls[0]?.[0]).toMatchObject({
       text: "alpha",
       mediaUrls: ["https://gateway.example.com/webhooks/sms/media/abc?token=token"],
     });
-    expect(sendSmsViaTwilio.mock.calls[1]?.[0]).toMatchObject({
-      text: " beta",
-    });
+    expect(sendSmsViaTwilio.mock.calls[1]?.[0]).toMatchObject({ text: " beta" });
     expect(sendSmsViaTwilio.mock.calls[1]?.[0]).not.toHaveProperty("mediaUrls");
     expect(isChannelPartialDeliveryError(observed)).toBe(true);
     if (!isChannelPartialDeliveryError(observed)) {
@@ -278,13 +244,7 @@ describe("sendSmsMedia", () => {
   });
 
   it("sends media-only MMS without a Body", async () => {
-    await sendSmsMedia({
-      account: createAccount(1500),
-      to: "+15551234567",
-      text: " ",
-      mediaUrl: "/tmp/photo.jpg",
-      mediaLocalRoots: ["/tmp"],
-    });
+    await sendSmsMedia(mediaParams({ text: " " }));
 
     expect(sendSmsViaTwilio).toHaveBeenCalledExactlyOnceWith({
       account: createAccount(1500),

@@ -1,4 +1,3 @@
-// Sms tests cover accounts plugin behavior.
 import { afterEach, describe, expect, it } from "vitest";
 import { inspectSmsAccount, listSmsAccountIds, resolveSmsAccount } from "./accounts.js";
 import { SmsChannelConfigSchema } from "./config-schema.js";
@@ -18,6 +17,10 @@ function parseSmsConfig(value: unknown): SmsChannelConfig {
     throw new Error(parsed.issues.map((issue) => issue.message).join("; "));
   }
   return parsed.data as SmsChannelConfig;
+}
+
+function config(sms: SmsChannelConfig) {
+  return { channels: { sms } };
 }
 
 const ENV_KEYS = [
@@ -42,16 +45,14 @@ afterEach(() => {
 describe("SMS account config", () => {
   it("reports an invalid public webhook URL without unconfiguring SMS credentials", () => {
     expect(
-      inspectSmsAccount({
-        channels: {
-          sms: {
-            accountSid: "AC123",
-            authToken: "secret",
-            fromNumber: "+15557654321",
-            publicWebhookUrl: "https://sms_gateway.example.com/webhooks/sms",
-          },
-        },
-      }),
+      inspectSmsAccount(
+        config({
+          accountSid: "AC123",
+          authToken: "secret",
+          fromNumber: "+15557654321",
+          publicWebhookUrl: "https://sms_gateway.example.com/webhooks/sms",
+        }),
+      ),
     ).toMatchObject({
       accountId: "default",
       name: "+15557654321",
@@ -68,25 +69,17 @@ describe("SMS account config", () => {
       provider: "default",
       id: "OPENCLAW_TEST_UNAVAILABLE_SMS_TOKEN",
     } as const;
-    const cfg = {
-      channels: {
-        sms: {
-          accountSid: "AC-parent",
-          authToken: unresolvedToken,
-          fromNumber: "+15550000000",
-          accounts: {
-            support: {
-              authToken: unresolvedToken,
-              messagingServiceSid: "MG-support",
-              fromNumber: "",
-            },
-            inherited: { enabled: false },
-            healthy: { authToken: "healthy-token", fromNumber: "+15551112222" },
-            missing: { authToken: "" },
-          },
-        },
+    const cfg = config({
+      accountSid: "AC-parent",
+      authToken: unresolvedToken,
+      fromNumber: "+15550000000",
+      accounts: {
+        support: { authToken: unresolvedToken, messagingServiceSid: "MG-support", fromNumber: "" },
+        inherited: { enabled: false },
+        healthy: { authToken: "healthy-token", fromNumber: "+15551112222" },
+        missing: { authToken: "" },
       },
-    };
+    });
 
     for (const accountId of ["default", "support", "inherited"]) {
       expect(() => resolveSmsAccount(cfg, accountId)).toThrow("unresolved SecretRef");
@@ -95,34 +88,20 @@ describe("SMS account config", () => {
       inspectSmsAccount(cfg, accountId),
     );
     expect(inspected).toMatchObject([
-      {
-        accountId: "default",
-        name: "+15550000000",
-        enabled: true,
-        configured: true,
-        tokenStatus: "configured_unavailable",
-      },
-      {
-        accountId: "support",
-        name: "MG-support",
-        enabled: true,
-        configured: true,
-        tokenStatus: "configured_unavailable",
-      },
-      {
-        accountId: "inherited",
-        enabled: false,
-        configured: true,
-        tokenStatus: "configured_unavailable",
-      },
-      {
-        accountId: "healthy",
-        name: "+15551112222",
-        enabled: true,
-        configured: true,
-        tokenStatus: "available",
-      },
-      { accountId: "missing", enabled: true, configured: false, tokenStatus: "missing" },
+      { accountId: "default", name: "+15550000000" },
+      { accountId: "support", name: "MG-support" },
+      { accountId: "inherited" },
+      { accountId: "healthy", name: "+15551112222" },
+      { accountId: "missing" },
+    ]);
+    expect(
+      inspected.map(({ enabled, configured, tokenStatus }) => [enabled, configured, tokenStatus]),
+    ).toEqual([
+      [true, true, "configured_unavailable"],
+      [true, true, "configured_unavailable"],
+      [false, true, "configured_unavailable"],
+      [true, true, "available"],
+      [true, false, "missing"],
     ]);
     for (const account of inspected) {
       expect(account).not.toHaveProperty("authToken");
@@ -131,21 +110,17 @@ describe("SMS account config", () => {
   });
 
   it("treats top-level enabled false as a channel kill switch", () => {
-    const cfg = {
-      channels: {
-        sms: {
-          enabled: false,
-          accounts: {
-            support: {
-              enabled: true,
-              accountSid: "AC-support",
-              authToken: "support-token",
-              fromNumber: "+15551112222",
-            },
-          },
+    const cfg = config({
+      enabled: false,
+      accounts: {
+        support: {
+          enabled: true,
+          accountSid: "AC-support",
+          authToken: "support-token",
+          fromNumber: "+15551112222",
         },
       },
-    };
+    });
 
     expect(resolveSmsAccount(cfg, "support")).toMatchObject({
       accountId: "support",
@@ -164,7 +139,7 @@ describe("SMS account config", () => {
     process.env.SMS_DANGEROUSLY_DISABLE_SIGNATURE_VALIDATION = "true";
     process.env.SMS_TEXT_CHUNK_LIMIT = "800";
 
-    const cfg = { channels: { sms: { accounts: { support: { enabled: true } } } } };
+    const cfg = config({ accounts: { support: { enabled: true } } });
 
     expect(listSmsAccountIds(cfg)).toEqual(["default", "support"]);
     expect(resolveSmsAccount(cfg)).toMatchObject({
@@ -209,8 +184,6 @@ describe("SMS account config", () => {
       allowFrom: [15551234567],
     });
 
-    expect(resolveSmsAccount({ channels: { sms: parsed } })).toMatchObject({
-      allowFrom: ["+15551234567"],
-    });
+    expect(resolveSmsAccount(config(parsed))).toMatchObject({ allowFrom: ["+15551234567"] });
   });
 });

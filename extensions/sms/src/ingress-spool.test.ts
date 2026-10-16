@@ -1,4 +1,3 @@
-// Sms tests cover durable Twilio webhook admission and replay.
 import { createHmac } from "node:crypto";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -25,6 +24,12 @@ const stateDirs: string[] = [];
 const disposers: Array<() => void | Promise<void>> = [];
 type SmsIngressDeliver = NonNullable<Parameters<typeof createSmsIngressSpool>[0]["deliver"]>;
 type SmsIngressSpool = ReturnType<typeof createSmsIngressSpool>;
+
+function adoptingDelivery() {
+  return vi.fn<SmsIngressDeliver>(async (_message, lifecycle) => {
+    await lifecycle.onAdopted();
+  });
+}
 
 async function createStateDir(): Promise<string> {
   const created = await mkdtemp(path.join(os.tmpdir(), "openclaw-sms-ingress-"));
@@ -284,9 +289,7 @@ describe("createSmsIngressSpool", () => {
       kind: "accepted",
     });
 
-    const deliver = vi.fn<SmsIngressDeliver>(async (_message, lifecycle) => {
-      await lifecycle.onAdopted();
-    });
+    const deliver = adoptingDelivery();
     const recovered = createTestSpool(stateDir, { deliver });
     await drainSpool(recovered);
 
@@ -318,9 +321,7 @@ describe("createSmsIngressSpool", () => {
 
   it.each(["SmsMessageSid"])("accepts the legacy %s event id alias", async (key) => {
     const stateDir = await createStateDir();
-    const deliver = vi.fn<SmsIngressDeliver>(async (_message, lifecycle) => {
-      await lifecycle.onAdopted();
-    });
+    const deliver = adoptingDelivery();
     const spool = createTestSpool(stateDir, { deliver });
     const rawForm = form("SM-alias");
     delete rawForm.MessageSid;
@@ -350,9 +351,7 @@ describe("createSmsIngressSpool", () => {
     await first.stop();
     now.mockRestore();
 
-    const deliver = vi.fn<SmsIngressDeliver>(async (_message, lifecycle) => {
-      await lifecycle.onAdopted();
-    });
+    const deliver = adoptingDelivery();
     const recovered = createTestSpool(stateDir, { deliver });
     await drainSpool(recovered);
 
@@ -361,9 +360,7 @@ describe("createSmsIngressSpool", () => {
 
   it("preserves the old handler-reload replay guard scenario with a tombstone", async () => {
     const stateDir = await createStateDir();
-    const firstDeliver = vi.fn<SmsIngressDeliver>(async (_message, lifecycle) => {
-      await lifecycle.onAdopted();
-    });
+    const firstDeliver = adoptingDelivery();
     const first = createTestSpool(stateDir, { deliver: firstDeliver });
     await first.enqueue(form("SM-handler-reload"));
     await drainSpool(first);
@@ -383,9 +380,7 @@ describe("createSmsIngressSpool", () => {
 
   it("preserves Messaging Service RCS identity", async () => {
     const stateDir = await createStateDir();
-    const deliver = vi.fn<SmsIngressDeliver>(async (_message, lifecycle) => {
-      await lifecycle.onAdopted();
-    });
+    const deliver = adoptingDelivery();
     const spool = createTestSpool(stateDir, {
       account: { ...account, fromNumber: "", messagingServiceSid: "MG123" },
       deliver,
@@ -450,10 +445,7 @@ describe("createSmsIngressSpool", () => {
   ])("dead-letters a permanent $name failure", async ({ ingressAccount, rawForm }) => {
     const stateDir = await createStateDir();
     const deliver = vi.fn<SmsIngressDeliver>(async () => undefined);
-    const spool = createTestSpool(stateDir, {
-      account: ingressAccount,
-      deliver,
-    });
+    const spool = createTestSpool(stateDir, { account: ingressAccount, deliver });
 
     await spool.enqueue(rawForm);
     await drainSpool(spool);
