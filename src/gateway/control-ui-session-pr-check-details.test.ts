@@ -123,20 +123,18 @@ function harness(host = "github.com") {
     }
     throw new Error("Unexpected route: " + url.href);
   };
+  const snapshot = { pullRequests: [{ ...chip, url: pullUrl }], rateLimited: false };
   const deps = {
     sessionScope: "ci-test-" + ++scope,
     assertCurrent: vi.fn(),
     fetchImpl: vi.fn(fetchResponse),
-    loadPullRequests: vi.fn(async () => ({
-      pullRequests: [{ ...chip, url: pullUrl }],
-      rateLimited: false,
-    })),
+    loadPullRequests: vi.fn(async () => snapshot),
   };
   return {
     api,
     host,
     state,
-    deps,
+    ...deps,
     fetchResponse,
     load: (params: Partial<typeof target> = {}, overrides: Partial<typeof deps> = {}) =>
       loadControlUiSessionPullRequestChecks({ ...target, ...params }, { ...deps, ...overrides }),
@@ -155,7 +153,7 @@ function holdJobs(readers = 1) {
   let waiting = 0;
   const gate = createDeferred<Response>();
   const started = createDeferred();
-  h.deps.fetchImpl.mockImplementation(async (input, init) => {
+  h.fetchImpl.mockImplementation(async (input, init) => {
     if (!requestUrl(input).includes("/jobs?")) {
       return h.fetchResponse(input, init);
     }
@@ -200,9 +198,9 @@ it.each(["github.com", "ghe.example.test"])(
     });
     expect(result.checks[0]?.steps?.map((row) => row.number)).toEqual([1, 2, 3]);
     expect(
-      h.deps.fetchImpl.mock.calls.filter(([input]) => requestUrl(input).includes("/jobs?")),
+      h.fetchImpl.mock.calls.filter(([input]) => requestUrl(input).includes("/jobs?")),
     ).toHaveLength(2);
-    expect(h.deps.fetchImpl.mock.calls).toHaveLength(6);
+    expect(h.fetchImpl.mock.calls).toHaveLength(6);
   },
 );
 
@@ -222,9 +220,9 @@ it("separates non-Actions checks and skips skipped-only Actions suites", async (
     [1, "actions", "skipped", undefined],
   ]);
   expect(result.checks[0]?.detailsUrl).toBe("https://ci.example.test/build/2");
-  expect(
-    h.deps.fetchImpl.mock.calls.some(([input]) => requestUrl(input).includes("/actions/")),
-  ).toBe(false);
+  expect(h.fetchImpl.mock.calls.some(([input]) => requestUrl(input).includes("/actions/"))).toBe(
+    false,
+  );
 });
 
 it("joins current checks and retains successful earlier-attempt jobs", async () => {
@@ -249,8 +247,7 @@ it("joins current checks and retains successful earlier-attempt jobs", async () 
   h.state.checks = [check(4, { name: "rerun", conclusion: "failure" })];
   h.state.jobs = [job(4, { conclusion: "failure" })];
   vi.advanceTimersByTime(30_001);
-  const rerun = await h.load();
-  expect(rerun.checks.map((row) => row.id)).toEqual([4]);
+  expect((await h.load()).checks.map((row) => row.id)).toEqual([4]);
 });
 
 it.each([
@@ -281,17 +278,17 @@ it("does not treat a failed later jobs page as a complete job inventory", async 
 it("coalesces reads and respects the retry window with stale data", async () => {
   const [a, b] = await Promise.all([h.load(), h.load()]);
   expect(a).toEqual(b);
-  expect(h.deps.fetchImpl).toHaveBeenCalledTimes(4);
+  expect(h.fetchImpl).toHaveBeenCalledTimes(4);
   a.checks.splice(0);
   expect((await h.load()).checks).toHaveLength(1);
   h.state.status = 429;
   vi.advanceTimersByTime(30_001);
   const stale = await h.load();
   expect(stale).toMatchObject({ status: "stale", rateLimited: true, retryAfterMs: 120_000 });
-  const calls = h.deps.fetchImpl.mock.calls.length;
+  const calls = h.fetchImpl.mock.calls.length;
   vi.advanceTimersByTime(90_000);
   expect((await h.load()).status).toBe("stale");
-  expect(h.deps.fetchImpl).toHaveBeenCalledTimes(calls);
+  expect(h.fetchImpl).toHaveBeenCalledTimes(calls);
 });
 
 it("does not reuse details across session generations or credential selections", async () => {
@@ -306,13 +303,13 @@ it("does not reuse details across session generations or credential selections",
 it("rejects unbound PRs and heads without fetching details", async () => {
   expect(await h.load({ number: 999 })).toMatchObject(unavailable);
   expect(await h.load({ headSha: "b".repeat(40) })).toMatchObject(unavailable);
-  expect(h.deps.fetchImpl).not.toHaveBeenCalled();
+  expect(h.fetchImpl).not.toHaveBeenCalled();
 });
 
 it("bounds distinct concurrent loads without extra GitHub requests", async () => {
   const jobs = holdJobs(4);
   const pending = Array.from({ length: 4 }, (_, i) =>
-    h.load({}, { sessionScope: h.deps.sessionScope + "-" + i }),
+    h.load({}, { sessionScope: h.sessionScope + "-" + i }),
   );
   await jobs.started;
   const busy = await h.load();
@@ -332,7 +329,7 @@ it("clears stale private details after access is revoked", async () => {
 });
 
 it("rejects repository redirects without credential dispatch", async () => {
-  h.deps.fetchImpl.mockResolvedValue(
+  h.fetchImpl.mockResolvedValue(
     new Response(null, {
       status: 301,
       headers: { location: "https://api.github.com/repos/other/repo/pulls/103469" },
@@ -342,7 +339,7 @@ it("rejects repository redirects without credential dispatch", async () => {
     ...unavailable,
     error: expect.stringContaining("repository changed"),
   });
-  expect(h.deps.fetchImpl).toHaveBeenCalledTimes(1);
+  expect(h.fetchImpl).toHaveBeenCalledTimes(1);
 });
 
 it.each([true, false])(
@@ -363,7 +360,7 @@ it.each([true, false])(
     );
     await jobs.started;
     active = remainingReader;
-    h.deps.assertCurrent.mockImplementation(() => {
+    h.assertCurrent.mockImplementation(() => {
       throw new Error("session generation changed");
     });
     jobs.release();
@@ -372,7 +369,7 @@ it.each([true, false])(
       expect((await second).status).toBe("ready");
     } else {
       await expect(second).rejects.toThrow("Second reader retired");
-      expect(h.deps.fetchImpl).toHaveBeenCalledTimes(4);
+      expect(h.fetchImpl).toHaveBeenCalledTimes(4);
     }
   },
 );

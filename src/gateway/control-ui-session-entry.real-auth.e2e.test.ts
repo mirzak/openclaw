@@ -1,7 +1,6 @@
 import { readFile } from "node:fs/promises";
-import { get, type IncomingHttpHeaders, type ServerResponse } from "node:http";
+import type { ServerResponse } from "node:http";
 import path from "node:path";
-import { gunzipSync } from "node:zlib";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   awaitGateBeforeSettlement,
@@ -64,48 +63,7 @@ const proxyHeaders = {
   "x-openclaw-scopes": "operator.read",
 };
 
-type HttpResult = { status: number; headers: IncomingHttpHeaders; body: string };
-
-function readHttp(
-  port: number,
-  route: string,
-  email?: string,
-  signal?: AbortSignal,
-  ingressHeaders: Record<string, string> = proxyHeaders,
-) {
-  return new Promise<HttpResult>((resolve, reject) => {
-    get(
-      {
-        hostname: "127.0.0.1",
-        port,
-        path: route,
-        signal,
-        agent: false,
-        headers: {
-          ...ingressHeaders,
-          "accept-encoding": "gzip",
-          ...(email ? { "x-forwarded-user": email } : {}),
-        },
-      },
-      (response) => {
-        const chunks: Buffer[] = [];
-        response.on("data", (chunk: Buffer) => chunks.push(chunk));
-        response.once("error", reject);
-        response.once("end", () => {
-          const bytes = Buffer.concat(chunks);
-          resolve({
-            status: response.statusCode ?? 0,
-            headers: response.headers,
-            body: (response.headers["content-encoding"] === "gzip"
-              ? gunzipSync(bytes)
-              : bytes
-            ).toString("utf8"),
-          });
-        });
-      },
-    ).once("error", reject);
-  });
-}
+type HttpResult = { status: number; headers: Record<string, string>; body: string };
 
 function expectNoApp(response: HttpResult, status: number) {
   expect(response.status).toBe(status);
@@ -149,12 +107,28 @@ describe("real HTTP authentication to canonical thread app delivery", () => {
   let index: string;
   let port: number;
   let auth: ResolvedGatewayAuth;
-  const request = (
+  const request = async (
     route: string,
     signal: AbortSignal,
     email?: string,
     headers: Record<string, string> = proxyHeaders,
-  ) => readHttp(port, route, email, signal, headers);
+  ): Promise<HttpResult> => {
+    const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+      signal,
+      redirect: "manual",
+      headers: {
+        ...headers,
+        "accept-encoding": "gzip",
+        connection: "close",
+        ...(email ? { "x-forwarded-user": email } : {}),
+      },
+    });
+    return {
+      status: response.status,
+      headers: Object.fromEntries(response.headers),
+      body: await response.text(),
+    };
+  };
 
   beforeAll(async () => {
     // qaRuntime snapshots omit assets; use the real build owner, not a fake shell.
@@ -271,7 +245,7 @@ describe("real HTTP authentication to canonical thread app delivery", () => {
   });
 
   for (const mode of ["token", "password"] as const) {
-    it(`reopens private ${mode} chat links through the real HTTP entry`, async ({ signal }) => {
+    it(`reopens private ${mode} links through real HTTP`, async ({ signal }) => {
       const previousAuth = auth;
       auth = {
         mode,
@@ -336,9 +310,7 @@ describe("real HTTP authentication to canonical thread app delivery", () => {
     expect(document.body).toContain("Session unavailable");
   });
 
-  it("ignores spoofed identity on anonymous canonical documents while protecting the handoff", async ({
-    signal,
-  }) => {
+  it("ignores spoofed document identity and protects handoff", async ({ signal }) => {
     for (const [route, status] of [
       [publicPath, 200],
       [privatePath, 404],
@@ -363,9 +335,7 @@ describe("real HTTP authentication to canonical thread app delivery", () => {
   });
 
   for (const change of ["membership", "role"] as const) {
-    it(`withholds all app bytes when ${change} changes after real document preparation`, async ({
-      signal,
-    }) => {
+    it(`withholds all app bytes after ${change} revocation`, async ({ signal }) => {
       await addSessionMember(privateScope, { identityId: memberId, addedBy: ownerId });
       const held = holdPreparedDocument();
       const pending = request(entry, signal, memberEmail);

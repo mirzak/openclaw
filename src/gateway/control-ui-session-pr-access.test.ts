@@ -108,6 +108,17 @@ async function sessionSource(key: string) {
   return readSource;
 }
 
+function closedPull(number?: number) {
+  return pullListItem({
+    ...(number === undefined
+      ? {}
+      : { number, html_url: `https://github.com/synthetic/publication/pull/${number}` }),
+    state: "closed",
+    head: {},
+    base: { ref: "main", repo: { name: "publication", owner: { login: "synthetic" } } },
+  });
+}
+
 async function withDefaultLoader(provider: typeof fetch, run: (f: Fixture) => Promise<void>) {
   try {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
@@ -210,15 +221,13 @@ it.each(["incarnation", "namespace", "repository"] as const)(
       "operator.admin",
       async (f) => {
         const key = "agent:main:dashboard:incognito-pr-retirement";
-        const repository = await getSessionRepositoryWorkspaceStore().create({
-          agentId: "main",
-          sessionKey: key,
-          url: "https://github.com/synthetic/private",
-          branch: "private-change",
-          assertCurrent: () => {},
-        });
+        const repository = await f.seedRepository(
+          key,
+          "private",
+          { incognito: true },
+          "private-change",
+        );
         const entry = { incognito: true as const, repositoryWorkspaceId: repository.workspaceId };
-        await f.seed(key, f.profile.id, entry);
         const entered = createDeferredCore();
         const release = createDeferredCore();
         const exposed = vi.fn();
@@ -279,20 +288,11 @@ it.each(["private local", "private repository", "archived", "scoped global"] as 
             ? "agent:main:global"
             : sessionKey;
         if (privateRow) {
-          const workspace =
-            kind === "private repository"
-              ? await getSessionRepositoryWorkspaceStore().create({
-                  agentId: "main",
-                  sessionKey: key,
-                  url: "https://github.com/synthetic/private",
-                  branch: "private-change",
-                  assertCurrent: () => {},
-                })
-              : undefined;
-          await f.seed(key, f.profile.id, {
-            incognito: true,
-            ...(workspace ? { repositoryWorkspaceId: workspace.workspaceId } : {}),
-          });
+          if (kind === "private repository") {
+            await f.seedRepository(key, "private", { incognito: true }, "private-change");
+          } else {
+            await f.seed(key, f.profile.id, { incognito: true });
+          }
         } else if (kind === "scoped global") {
           await f.seed("global");
           await f.seed(key, f.profile.id, { sessionId: "separate-literal-global-row" });
@@ -715,15 +715,13 @@ it.each(["local", "repository"] as const)(
           await f.subscriptions.pollNow();
         }
         const queries = statements.queries.map((sql) => sql.toLowerCase());
-        expect({
-          sessionReads: queries.filter((sql) => sql.includes("session_nodes")).length,
-          profileReads: queries.filter((sql) => sql.includes("user_profiles")).length,
-          repositoryReads: queries.filter((sql) => sql.includes("session_repository_workspaces"))
-            .length,
-          freshnessReads: queries.filter(
-            (sql) => sql.includes("pragma") || sql.includes("cache_generation"),
-          ).length,
-        }).toEqual({ sessionReads: 0, profileReads: 0, repositoryReads: 0, freshnessReads: 0 });
+        expect(
+          queries.filter((sql) =>
+            /session_nodes|user_profiles|session_repository_workspaces|pragma|cache_generation/.test(
+              sql,
+            ),
+          ),
+        ).toEqual([]);
         expect(f.load).toHaveBeenCalledTimes(3);
         expect(frames(f.socket)).toEqual([expectedFrame(sessionKey)]);
       } finally {
@@ -749,13 +747,7 @@ it("keeps warm default-loader SQL constant as readers join without a native row 
   const provider = vi.fn<typeof fetch>(async (input) => {
     const url = new URL(requestUrl(input));
     if (url.pathname.endsWith("/pulls")) {
-      return githubJson([
-        pullListItem({
-          state: "closed",
-          head: {},
-          base: { ref: "main", repo: { name: "publication", owner: { login: "synthetic" } } },
-        }),
-      ]);
+      return githubJson([closedPull()]);
     }
     throw new Error(`Unexpected warm PR request: ${url.pathname}`);
   });
@@ -787,7 +779,6 @@ it("keeps warm default-loader SQL constant as readers join without a native row 
       await f.subscribe([sessionKey], f.addReader(`default-reader-${index}`).client);
     }
     const twentyReaders = await measure();
-    console.info("PR_DEFAULT_LOADER_SQL", JSON.stringify({ oneReader, twentyReaders }));
     expect(twentyReaders).toEqual(oneReader);
     expect(oneReader.transactions).toBe(0);
     expect(frames(f.socket)).toHaveLength(1);
@@ -805,15 +796,7 @@ it("drops cached subscription hydration after physical database replacement", as
     }
     return rateLimited
       ? githubJson({ message: "Rate limited" }, 429)
-      : githubJson([
-          pullListItem({
-            number: 300,
-            html_url: "https://github.com/synthetic/publication/pull/300",
-            state: "closed",
-            head: {},
-            base: { ref: "main", repo: { name: "publication", owner: { login: "synthetic" } } },
-          }),
-        ]);
+      : githubJson([closedPull(300)]);
   });
   await withDefaultLoader(provider, async (f) => {
     await f.seedRepository();

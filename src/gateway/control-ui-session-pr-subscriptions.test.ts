@@ -6,14 +6,14 @@ import {
   createGatewaySchedulerClock,
   createTestGatewayScheduler,
 } from "../test-utils/gateway-scheduler-clock.js";
-import type { ControlUiSessionPullRequests } from "./control-ui-contract.js";
+import type { ControlUiSessionPullRequests as Snapshot } from "./control-ui-contract.js";
 import { parseControlUiSessionPullRequestsSubscribeParams as parse } from "./control-ui-session-pr-subscriptions.js";
 import { createTestControlUiSessionPrSubscriptions } from "./control-ui-session-pr-subscriptions.test-support.js";
-import type { ControlUiSessionPullRequestsParams } from "./control-ui-session-prs.js";
+import type { ControlUiSessionPullRequestsParams as LoadParams } from "./control-ui-session-prs.js";
 
 const CHANGED_EVENT = "controlUi.sessionPullRequests.changed";
 
-const READY: ControlUiSessionPullRequests = { pullRequests: [], rateLimited: false };
+const READY: Snapshot = { pullRequests: [], rateLimited: false };
 
 let running: ReturnType<typeof createTestControlUiSessionPrSubscriptions> | undefined;
 let broadcastToConnIds: ReturnType<typeof vi.fn>;
@@ -68,6 +68,15 @@ function loadArgs(sessionKey: string, refresh?: true) {
   ] as const;
 }
 
+function expectSessions(
+  load: { mock: { calls: readonly (readonly unknown[])[] } },
+  keys: string[],
+) {
+  expect(load.mock.calls.map(([params]) => params)).toEqual(
+    keys.map((sessionKey) => ({ sessionKey, agentId: "main" })),
+  );
+}
+
 describe("control UI session PR subscriptions", () => {
   it.each([
     { cleanup: "stop", failing: true },
@@ -111,8 +120,7 @@ describe("control UI session PR subscriptions", () => {
         } else {
           await active.replace("first", []);
         }
-        expect(retired.aborted).toBe(true);
-        expect(getEventListeners(retired, "abort")).toHaveLength(0);
+        expect([retired.aborted, getEventListeners(retired, "abort").length]).toEqual([true, 0]);
         if (cleanup !== "stop") {
           operations.push(active.replace("second", ["shared"]));
         }
@@ -153,9 +161,7 @@ describe("control UI session PR subscriptions", () => {
 
   it("polls the watched union once per wake, including after sleep", async () => {
     const clock = createGatewaySchedulerClock();
-    const load = vi.fn<
-      (params: ControlUiSessionPullRequestsParams) => Promise<ControlUiSessionPullRequests>
-    >(async () => READY);
+    const load = vi.fn<(params: LoadParams) => Promise<Snapshot>>(async () => READY);
     const active = start({ load, scheduler: createTestGatewayScheduler(clock.clock) });
 
     await active.replace("conn-a", ["shared", "only-a"]);
@@ -201,7 +207,7 @@ describe("control UI session PR subscriptions", () => {
     const releases: Array<() => void> = [];
     const load = vi.fn(
       async () =>
-        await new Promise<ControlUiSessionPullRequests>((resolve) => {
+        await new Promise<Snapshot>((resolve) => {
           releases.push(() => resolve(READY));
         }),
     );
@@ -209,13 +215,11 @@ describe("control UI session PR subscriptions", () => {
     const sessionKeys = Array.from({ length: 6 }, (_value, index) => `session-${index}`);
 
     const finishLimitedLoads = async (operation: Promise<unknown>, total = 6) => {
-      await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(4));
-      for (const release of releases.splice(0)) {
-        release();
-      }
-      await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(total));
-      for (const release of releases.splice(0)) {
-        release();
+      for (const count of [4, total]) {
+        await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(count));
+        for (const release of releases.splice(0)) {
+          release();
+        }
       }
       await operation;
     };
@@ -235,8 +239,8 @@ describe("control UI session PR subscriptions", () => {
 
   it("discards an orphaned load before hydrating a new watcher", async () => {
     vi.useFakeTimers();
-    const retired = createDeferred<ControlUiSessionPullRequests>();
-    const fresh = createDeferred<ControlUiSessionPullRequests>();
+    const retired = createDeferred<Snapshot>();
+    const fresh = createDeferred<Snapshot>();
     const load = vi
       .fn()
       .mockImplementationOnce(() => retired.promise)
@@ -251,10 +255,7 @@ describe("control UI session PR subscriptions", () => {
     await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(2));
 
     expect(broadcastToConnIds).not.toHaveBeenCalled();
-    expect(load.mock.calls.map(([params]) => params)).toEqual([
-      { sessionKey: "session", agentId: "main" },
-      { sessionKey: "session", agentId: "main" },
-    ]);
+    expectSessions(load, ["session", "session"]);
     fresh.resolve(READY);
     await Promise.all([initial, forced, current]);
 
@@ -348,9 +349,9 @@ describe("control UI session PR subscriptions", () => {
       const loadStarted = createDeferred();
       const clock = createGatewaySchedulerClock();
       const replacementEntered = createDeferred();
-      const heldSnapshot = createDeferred<ControlUiSessionPullRequests>();
+      const heldSnapshot = createDeferred<Snapshot>();
       let blockLoads = phase === "initial hydration";
-      const load = vi.fn(async ({ sessionKey }: ControlUiSessionPullRequestsParams) => {
+      const load = vi.fn(async ({ sessionKey }: LoadParams) => {
         if (sessionKey === "barrier") {
           replacementEntered.resolve();
           return READY;
@@ -395,20 +396,12 @@ describe("control UI session PR subscriptions", () => {
         heldSnapshot.resolve(READY);
         await Promise.all(operations);
 
-        expect({
+        expect([
           completedBeforeRelease,
           stopCompletions,
-          loads: load.mock.calls.map(([params]) => params),
-          broadcasts: broadcastToConnIds.mock.calls.length,
-        }).toEqual({
-          completedBeforeRelease: 0,
-          stopCompletions: 2,
-          loads: [
-            { sessionKey: "session", agentId: "main" },
-            { sessionKey: "barrier", agentId: "main" },
-          ],
-          broadcasts: 0,
-        });
+          broadcastToConnIds.mock.calls.length,
+        ]).toEqual([0, 2, 0]);
+        expectSessions(load, ["session", "barrier"]);
       } finally {
         heldSnapshot.resolve(READY);
         await Promise.allSettled(operations);
@@ -421,7 +414,7 @@ describe("control UI session PR subscriptions", () => {
     "keeps a pending result current through a %s membership change",
     async (kind) => {
       vi.useFakeTimers();
-      const pending = createDeferred<ControlUiSessionPullRequests>();
+      const pending = createDeferred<Snapshot>();
       const load = vi
         .fn()
         .mockResolvedValueOnce(READY)
@@ -467,8 +460,7 @@ describe("control UI session PR subscriptions", () => {
 
   it("does not publish a superseded replace-set after its load completes", async () => {
     vi.useFakeTimers();
-    const { promise: first, resolve: resolveFirst } =
-      createDeferred<ControlUiSessionPullRequests>();
+    const { promise: first, resolve: resolveFirst } = createDeferred<Snapshot>();
     const load = vi.fn(async ({ sessionKey }: { sessionKey: string }) =>
       sessionKey === "old" ? await first : READY,
     );
@@ -487,20 +479,14 @@ describe("control UI session PR subscriptions", () => {
 
   it("delivers a shared cached key after its earlier hydration was superseded", async () => {
     vi.useFakeTimers();
-    const { promise: blocked, resolve: resolveBlocked } =
-      createDeferred<ControlUiSessionPullRequests>();
+    const { promise: blocked, resolve: resolveBlocked } = createDeferred<Snapshot>();
     const load = vi.fn(async ({ sessionKey }: { sessionKey: string }) =>
       sessionKey.startsWith("blocked") ? await blocked : READY,
     );
     const active = start({ load });
 
-    const oldReplace = active.replace("conn-a", [
-      "blocked-1",
-      "blocked-2",
-      "blocked-3",
-      "blocked-4",
-      "shared",
-    ]);
+    const blockedKeys = Array.from({ length: 4 }, (_, index) => `blocked-${index + 1}`);
+    const oldReplace = active.replace("conn-a", [...blockedKeys, "shared"]);
     await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(4));
     const replacement = active.replace("conn-a", ["blocked-1"]);
     resolveBlocked(READY);

@@ -183,15 +183,20 @@ export async function createFixture(
         };
       }
     },
-    async seedRepository(key = sessionKey, repo = "publication") {
+    async seedRepository(
+      key = sessionKey,
+      repo = "publication",
+      patch: Partial<SessionEntry> = {},
+      repoBranch = "guest-change",
+    ) {
       const repository = await getSessionRepositoryWorkspaceStore().create({
         agentId: "main",
         sessionKey: key,
         url: `https://github.com/synthetic/${repo}`,
-        branch: "guest-change",
+        branch: repoBranch,
         assertCurrent: () => {},
       });
-      await seed(key, profile.id, { repositoryWorkspaceId: repository.workspaceId });
+      await seed(key, profile.id, { ...patch, repositoryWorkspaceId: repository.workspaceId });
       return repository;
     },
     async subscribe(keys = [sessionKey], client = reader.client) {

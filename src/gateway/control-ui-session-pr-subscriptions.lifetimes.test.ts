@@ -115,8 +115,10 @@ describe("recipient publication lifetimes", () => {
     broadcastToConnIds.mockClear();
   }
 
-  function expectPublications(...connections: string[]) {
-    expect(broadcastToConnIds.mock.calls).toEqual(connections.map((id) => publication(id)));
+  function expectPublications(connections: string[], key = "shared", rateLimited = true) {
+    expect(broadcastToConnIds.mock.calls).toEqual(
+      connections.map((id) => publication(id, key, rateLimited)),
+    );
   }
 
   it.each(["selection", "grant"] as const)(
@@ -165,13 +167,13 @@ describe("recipient publication lifetimes", () => {
       held.release();
       await poll;
       if (boundary === "selection") {
-        expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(...publication("first"));
+        expectPublications(["first"]);
         await active.pollNow();
-        expectPublications("first", "recipient");
+        expectPublications(["first", "recipient"]);
         await active.pollNow();
         expect(broadcastToConnIds).toHaveBeenCalledTimes(2);
       } else {
-        expectPublications("first", "last");
+        expectPublications(["first", "last"]);
         broadcastToConnIds.mockClear();
         await active.pollNow();
         expect(broadcastToConnIds).not.toHaveBeenCalled();
@@ -209,7 +211,7 @@ describe("recipient publication lifetimes", () => {
     expect(broadcastToConnIds).toHaveBeenCalledTimes(2);
     forced.release();
     await Promise.all([poll, refresh]);
-    expectPublications("first", "recipient", "first");
+    expectPublications(["first", "recipient", "first"]);
   });
 
   it("acknowledges a refresh admitted after that viewer received the in-flight result", async () => {
@@ -242,7 +244,7 @@ describe("recipient publication lifetimes", () => {
     held.release();
     await Promise.all(operations);
     expect(load).toHaveBeenCalledTimes(1);
-    expectPublications("first", "recipient", "first");
+    expectPublications(["first", "recipient", "first"]);
   });
 
   it("keeps a pending replacement when its last old watch loses visibility", async () => {
@@ -275,9 +277,7 @@ describe("recipient publication lifetimes", () => {
     await retired.promise;
     held.release();
     await Promise.all([replacement, poll]);
-    expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(
-      ...publication("same", "new", false),
-    );
+    expectPublications(["same"], "new", false);
   });
 
   it("does not let a superseded preparation overwrite a current refresh request", async () => {
@@ -318,9 +318,7 @@ describe("recipient publication lifetimes", () => {
     await blocked.entered;
     loading.release();
     await current;
-    expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(
-      ...publication("same", "shared", false),
-    );
+    expectPublications(["same"], "shared", false);
     blocked.release();
     await old;
     expect(load).toHaveBeenCalledTimes(1);
@@ -346,9 +344,7 @@ describe("recipient publication lifetimes", () => {
     held.release();
     await retired;
     expect(load).toHaveBeenCalledTimes(1);
-    expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(
-      ...publication("reused", "current", false),
-    );
+    expectPublications(["reused"], "current", false);
   });
 
   it.each(["grant", "all"] as const)(
@@ -363,9 +359,7 @@ describe("recipient publication lifetimes", () => {
           const grant = connId === "survivor" ? access.survivor : access.departing;
           const preparedTarget = {
             ...target,
-            assertCurrent: () => {
-              grant.signal.throwIfAborted();
-            },
+            assertCurrent: () => grant.signal.throwIfAborted(),
           };
           return async () => (grant.signal.aborted ? undefined : preparedTarget);
         },
@@ -394,7 +388,7 @@ describe("recipient publication lifetimes", () => {
       if (retirement === "all") {
         expect(broadcastToConnIds).not.toHaveBeenCalled();
       } else {
-        expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(...publication("survivor"));
+        expectPublications(["survivor"]);
       }
     },
   );
@@ -440,7 +434,7 @@ describe("recipient publication lifetimes", () => {
     joining.release();
     await Promise.all(operations);
 
-    expectPublications("first", "joining");
+    expectPublications(["first", "joining"]);
   });
 
   it.each(["pending", "prepared"] as const)(
@@ -483,7 +477,7 @@ describe("recipient publication lifetimes", () => {
       }
       await poll;
 
-      expect(broadcastToConnIds).toHaveBeenCalledExactlyOnceWith(...publication("first"));
+      expectPublications(["first"]);
       active.unsubscribe("first");
       expect(cacheSignal?.aborted).toBe(true);
     },
