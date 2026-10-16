@@ -30,10 +30,6 @@ const THIRD_VALID_MESSAGE_ID = "msg_01arz3ndektsv4rrffq69g5fax";
 
 vi.mock("./outbound.js", () => ({ sendClickClackText: sendClickClackTextMock }));
 
-function createRuntime(): PluginRuntime {
-  return createInboundRuntime(true);
-}
-
 function createAgentAccount(
   overrides: Partial<ResolvedClickClackAccount> = {},
 ): ResolvedClickClackAccount {
@@ -60,7 +56,7 @@ function createAgentAccount(
 describe("handleClickClackInbound", () => {
   let runtime: PluginRuntime;
   beforeEach(() => {
-    runtime = createRuntime();
+    runtime = createInboundRuntime(true);
     setClickClackRuntime(runtime);
     sendClickClackTextMock.mockReset();
   });
@@ -226,8 +222,10 @@ describe("handleClickClackInbound", () => {
 
     const dispatchTurn = vi.mocked(runtime.channel.inbound.dispatch);
     expect(dispatchTurn).toHaveBeenCalledTimes(1);
-    expect(dispatchTurn.mock.calls[0]?.[0].ctxPayload.ChatType).toBe("direct");
-    expect(dispatchTurn.mock.calls[0]?.[0].ctxPayload.CommandAuthorized).toBe(true);
+    expect(dispatchTurn.mock.calls[0]?.[0].ctxPayload).toMatchObject({
+      ChatType: "direct",
+      CommandAuthorized: true,
+    });
   });
 
   it("preserves session policy when an account overrides the routed agent", async () => {
@@ -517,72 +515,40 @@ describe("ClickClack direct-model response prefix", () => {
     sendClickClackTextMock.mockClear();
   });
 
-  it("renders root, account, and templated prefixes on model replies", async () => {
-    const cases = [
-      {
-        label: "root",
-        cfg: { channels: { clickclack: { responsePrefix: "[bot]" } } },
-        expected: "[bot] service bot online",
-      },
-      {
-        label: "account",
-        cfg: {
-          channels: {
-            clickclack: {
-              responsePrefix: "[root]",
-              accounts: { "model-loop-account": { responsePrefix: "[svc]" } },
-            },
+  it.each([
+    ["root", "[bot]", undefined, undefined, "[bot] service bot online"],
+    ["account", "[root]", "[svc]", undefined, "[svc] service bot online"],
+    ["templated", "[{model}]", undefined, undefined, "[gpt-5.6-luna] service bot online"],
+    ["empty account override", "[root]", "", undefined, "service bot online"],
+    ["identity", "auto", undefined, "Service Bot", "[Service Bot] service bot online"],
+  ] as const)(
+    "renders the %s prefix on model replies",
+    async (_label, responsePrefix, accountPrefix, identity, expected) => {
+      const cfg: CoreConfig = {
+        channels: {
+          clickclack: {
+            responsePrefix,
+            ...(accountPrefix !== undefined
+              ? { accounts: { "model-loop-account": { responsePrefix: accountPrefix } } }
+              : {}),
           },
         },
-        expected: "[svc] service bot online",
-      },
-      {
-        label: "templated",
-        cfg: { channels: { clickclack: { responsePrefix: "[{model}]" } } },
-        expected: "[gpt-5.6-luna] service bot online",
-      },
-      {
-        label: "empty account override",
-        cfg: {
-          channels: {
-            clickclack: {
-              responsePrefix: "[root]",
-              accounts: { "model-loop-account": { responsePrefix: "" } },
-            },
-          },
-        },
-        expected: "service bot online",
-      },
-      {
-        label: "identity",
-        cfg: {
-          agents: { entries: { "service-bot": { identity: { name: "Service Bot" } } } },
-          channels: { clickclack: { responsePrefix: "auto" } },
-        },
-        expected: "[Service Bot] service bot online",
-      },
-    ];
-
-    for (const testCase of cases) {
-      sendClickClackTextMock.mockClear();
+        ...(identity
+          ? { agents: { entries: { "service-bot": { identity: { name: identity } } } } }
+          : {}),
+      };
       const runtime = createModelRuntime();
       const account = createModelAccount();
-      publishAccountConfig(runtime, account, testCase.cfg);
+      publishAccountConfig(runtime, account, cfg);
       setClickClackRuntime(runtime);
-      await handleClickClackInbound({
-        account,
-        config: testCase.cfg,
-        message: createModelMessage(),
-      });
+      await handleClickClackInbound({ account, config: cfg, message: createModelMessage() });
 
       expect(runtime.channel.inbound.dispatch).not.toHaveBeenCalled();
       expect(runtime.agent.runEmbeddedAgent).not.toHaveBeenCalled();
       expect(vi.mocked(runtime.llm.complete).mock.calls[0]?.[0]).not.toHaveProperty("maxTokens");
-      expect(sendClickClackTextMock.mock.calls[0]?.[0]?.text, testCase.label).toBe(
-        testCase.expected,
-      );
-    }
-  });
+      expect(sendClickClackTextMock.mock.calls[0]?.[0]?.text).toBe(expected);
+    },
+  );
 
   it("does not add a second prefix when the completion already opens with one", async () => {
     sendClickClackTextMock.mockClear();

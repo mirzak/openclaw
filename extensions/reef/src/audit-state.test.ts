@@ -119,7 +119,6 @@ describe("Reef SQLite audit state", () => {
   });
 
   it("refuses an invalid event group without publishing a partial chain", async () => {
-    const key = new Uint8Array(32).fill(1);
     const audit = openReefAuditStore(createRuntime(stateDir), key, 2);
     const initial = await audit.appendEvent("before", {}, 9);
     const state = getReefAuditOperationState(audit)!;
@@ -305,8 +304,6 @@ describe("Reef SQLite audit state", () => {
   });
 
   it("observes foreign appends on a new read of the retained suffix", async () => {
-    const runtime = createRuntime(stateDir);
-    const key = new Uint8Array(32).fill(1);
     const current = openReefAuditStore(runtime, key, 1);
     const reader = openReefAuditStore(runtime, key, 1);
     await current.appendEvent("old", {}, 10);

@@ -1,29 +1,34 @@
-// Clickclack tests cover accounts plugin behavior.
 import fs from "node:fs";
 import path from "node:path";
 import { withTempDir } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { listClickClackAccountIds, resolveClickClackAccount } from "./accounts.js";
-import type { ClickClackAccountConfig, CoreConfig } from "./types.js";
+import type { ClickClackAccountConfig, CoreConfig, ResolvedClickClackAccount } from "./types.js";
 
+const ACCOUNT_BASE = { baseUrl: "https://app.clickclack.chat", workspace: "wsp_1" };
 function accountConfig(
   settings: ClickClackAccountConfig & { accounts?: Record<string, ClickClackAccountConfig> },
 ): CoreConfig {
-  return {
-    channels: {
-      clickclack: {
-        baseUrl: "https://app.clickclack.chat",
-        workspace: "wsp_1",
-        ...settings,
-      },
-    },
-  };
+  return { channels: { clickclack: { ...ACCOUNT_BASE, ...settings } } };
+}
+
+function expectUnavailable(
+  account: ResolvedClickClackAccount,
+  configPath: string,
+  reason: string,
+  hiddenPath: string,
+) {
+  expect(account).toMatchObject({
+    token: "",
+    tokenSource: "tokenFile",
+    tokenStatus: "configured_unavailable",
+    credentialDiagnostics: [{ code: "CREDENTIAL_FILE_UNAVAILABLE", path: configPath, reason }],
+  });
+  expect(JSON.stringify(account.credentialDiagnostics)).not.toContain(hiddenPath);
 }
 
 describe("ClickClack account resolution", () => {
-  afterEach(() => {
-    vi.unstubAllEnvs();
-  });
+  afterEach(() => vi.unstubAllEnvs());
 
   it("merges partial named-account group overrides with the root group policy", () => {
     const cfg = accountConfig({
@@ -35,15 +40,7 @@ describe("ClickClack account resolution", () => {
           mentionPatterns: ["@root-bot"],
         },
       },
-      accounts: {
-        work: {
-          groups: {
-            chn_1: {
-              requireMention: false,
-            },
-          },
-        },
-      },
+      accounts: { work: { groups: { chn_1: { requireMention: false } } } },
     });
 
     const account = resolveClickClackAccount({ cfg, accountId: "work" });
@@ -105,16 +102,8 @@ describe("ClickClack account resolution", () => {
         ["work", missingAccountFile, "channels.clickclack.accounts.work.tokenFile"],
       ] as const) {
         const account = resolveClickClackAccount({ cfg, accountId, env });
-        expect(account).toMatchObject({
-          configured: true,
-          token: "",
-          tokenSource: "tokenFile",
-          tokenStatus: "configured_unavailable",
-          credentialDiagnostics: [
-            { code: "CREDENTIAL_FILE_UNAVAILABLE", path: configPath, reason: "not-found" },
-          ],
-        });
-        expect(JSON.stringify(account.credentialDiagnostics)).not.toContain(filePath);
+        expect(account.configured).toBe(true);
+        expectUnavailable(account, configPath, "not-found", filePath);
       }
     });
   });
@@ -139,51 +128,35 @@ describe("ClickClack account resolution", () => {
           cfg: accountConfig({ token: "lower-priority-token", tokenFile: selectedFile }),
         });
 
-        expect(account).toMatchObject({
-          token: "",
-          tokenSource: "tokenFile",
-          tokenStatus: "configured_unavailable",
-          credentialDiagnostics: [
-            { code: "CREDENTIAL_FILE_UNAVAILABLE", path: "channels.clickclack.tokenFile", reason },
-          ],
-        });
-        expect(JSON.stringify(account.credentialDiagnostics)).not.toContain(selectedFile);
+        expectUnavailable(account, "channels.clickclack.tokenFile", reason, selectedFile);
       }
     });
   });
 
   it("resolves model-mode bot account policy", () => {
-    const cfg = accountConfig({
-      enabled: true,
-      accounts: {
-        peter: {
-          token: "token-oversized",
-          agentId: "peter-bot",
-          replyMode: "model",
-          model: "openai/gpt-5.4-mini",
-          toolsAllow: ["web_search"],
-        },
-      },
-    });
+    const policy = {
+      token: "token-oversized",
+      agentId: "peter-bot",
+      replyMode: "model",
+      model: "openai/gpt-5.4-mini",
+      toolsAllow: ["web_search"],
+    } satisfies ClickClackAccountConfig;
+    const cfg = accountConfig({ enabled: true, accounts: { peter: policy } });
 
     expect(resolveClickClackAccount({ cfg, accountId: "peter" })).toEqual({
+      ...policy,
       allowBots: false,
       allowFrom: ["*"],
       accountId: "peter",
-      agentId: "peter-bot",
       apiEndpoint: "https://app.clickclack.chat",
       baseUrl: "https://app.clickclack.chat",
       botLoopProtection: undefined,
       config: {
-        agentId: "peter-bot",
+        ...policy,
         allowFrom: ["*"],
         baseUrl: "https://app.clickclack.chat",
         enabled: true,
-        model: "openai/gpt-5.4-mini",
-        replyMode: "model",
-        token: "token-oversized",
         tokenFile: undefined,
-        toolsAllow: ["web_search"],
         workspace: "wsp_1",
       },
       configured: true,
@@ -195,17 +168,13 @@ describe("ClickClack account resolution", () => {
       discussions: { enabled: false, workspace: "wsp_1", section: "Sessions" },
       groups: {},
       mentionPatterns: [],
-      model: "openai/gpt-5.4-mini",
       name: undefined,
       nativeProgress: false,
       reconnectMs: 1_500,
-      replyMode: "model",
       requireMention: false,
       systemPrompt: undefined,
-      token: "token-oversized",
       tokenSource: "config",
       tokenStatus: "available",
-      toolsAllow: ["web_search"],
       workspace: "wsp_1",
     });
   });
