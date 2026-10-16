@@ -147,6 +147,14 @@ async function withVerifiedIdentity(
   });
 }
 
+function role(
+  scopes: OperatorScope[],
+  others: "none" | "view" | "write" = "view",
+  agents: "*" | string[] = "*",
+) {
+  return { sessions: { others }, agents, scopes };
+}
+
 const GITHUB_RATE_LIMITED_ERROR = {
   code: "UNAVAILABLE",
   message: expect.stringContaining("GitHub is rate limiting profile verification"),
@@ -228,7 +236,7 @@ describe("gateway identity scope grants", () => {
             agents: "*",
             scopes: ["operator.read"],
           },
-          staff: { sessions: { others: "write" }, agents: "*", scopes: ["operator.admin"] },
+          staff: role(["operator.admin"], "write"),
         },
       },
     });
@@ -352,22 +360,10 @@ describe("gateway identity scope grants", () => {
       roles: {
         default: "guest",
         definitions: {
-          guest: {
-            sessions: { others: "view" },
-            agents: "*",
-            scopes: ["operator.read", "operator.write"],
-          },
-          "admin-only": {
-            sessions: { others: "write" },
-            agents: "*",
-            scopes: ["operator.admin"],
-          },
-          "read-only": {
-            sessions: { others: "view" },
-            agents: "*",
-            scopes: ["operator.read"],
-          },
-          denied: { sessions: { others: "none" }, agents: [], scopes: [] },
+          guest: role(["operator.read", "operator.write"]),
+          "admin-only": role(["operator.admin"], "write"),
+          "read-only": role(["operator.read"]),
+          denied: role([], "none", []),
         },
       },
     });
@@ -533,11 +529,7 @@ describe("gateway identity scope grants", () => {
         roles: {
           default: "guest",
           definitions: {
-            guest: {
-              sessions: { others: "none" },
-              agents: [],
-              scopes: ["operator.read"],
-            },
+            guest: role(["operator.read"], "none", []),
           },
         },
       },
@@ -805,12 +797,8 @@ describe("gateway identity scope grants", () => {
         roles: {
           default: "guest",
           definitions: {
-            guest: { sessions: { others: "none" }, agents: [], scopes: ["operator.read"] },
-            staff: {
-              sessions: { others: "write" },
-              agents: "*",
-              scopes: ["operator.read", "operator.write"],
-            },
+            guest: role(["operator.read"], "none", []),
+            staff: role(["operator.read", "operator.write"], "write"),
           },
         },
       },
