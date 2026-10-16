@@ -8,24 +8,37 @@ import { createCorrectionFixture } from "./pr-correction-preparation.test-suppor
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const describePosix = process.platform === "win32" ? describe.skip : describe;
 
-function fixture(approved = false) {
+function fixture(phase: "incoming" | "corrected" | "reviewed" | "approved" = "incoming") {
   const f = createCorrectionFixture(tempDirs.make("openclaw-pr-correction-"));
-  if (approved) {
+  if (phase !== "incoming") {
     expect(f.run("prepare_init 42 '' correction").status).toBe(0);
     f.commitFix();
+  }
+  if (phase === "reviewed" || phase === "approved") {
     expect(f.run("prepare_correction_review_init 42").status).toBe(0);
+  }
+  if (phase === "approved") {
     f.approve();
   }
-  return f;
+  const local = (name: string) => join(f.root, ".local", name);
+  return {
+    ...f,
+    read: (name: string) => readFileSync(local(name), "utf8"),
+    write: (name: string, value: string | Buffer) => writeFileSync(local(name), value),
+    has: (name: string) => existsSync(local(name)),
+    gates: (head: string) =>
+      writeFileSync(
+        local("gates.env"),
+        `PR_NUMBER=42\nGATES_MODE=full\nLAST_VERIFIED_HEAD_SHA=${head}\nFULL_GATES_HEAD_SHA=${head}\n`,
+      ),
+  };
 }
 
 describePosix("native correction preparation", () => {
   it.each(["OPENCLAW_PR_GIT", "GIT_EXEC"])(
     "uses configured Git for correction review initialization and validation via %s",
     (selector) => {
-      const f = fixture();
-      expect(f.run("prepare_init 42 '' correction").status).toBe(0);
-      f.commitFix();
+      const f = fixture("corrected");
       const resolved = spawnSync("bash", ["-c", "command -v git"], { encoding: "utf8" });
       expect(resolved.status, resolved.stderr).toBe(0);
       const bin = join(f.root, ".local", "git-bin");
@@ -62,7 +75,7 @@ describePosix("native correction preparation", () => {
     const f = fixture();
     f.review.recommendation = "READY FOR /prepare-pr";
     f.review.findings = [];
-    writeFileSync(join(f.root, ".local/review.json"), JSON.stringify(f.review));
+    f.write("review.json", JSON.stringify(f.review));
     const result = f.run(
       [
         'pr_observe() { echo "unexpected replacement observation" >&2; return 99; }',
@@ -72,28 +85,26 @@ describePosix("native correction preparation", () => {
       ].join("\n"),
     );
     expect(result.status, result.stdout + result.stderr).toBe(0);
-    expect(readFileSync(join(f.root, ".local/prep-context.env"), "utf8")).toContain(
-      "PREP_REVIEW_MODE=ready",
-    );
-    expect(existsSync(join(f.root, ".local/gates-reached"))).toBe(true);
-    expect(existsSync(join(f.root, ".local/push-reached"))).toBe(true);
+    expect(f.read("prep-context.env")).toContain("PREP_REVIEW_MODE=ready");
+    expect(f.has("gates-reached")).toBe(true);
+    expect(f.has("push-reached")).toBe(true);
     expect(f.git("rev-parse", "HEAD")).toBe(f.incoming);
     expect(f.run("require_prepared_review 42").status).toBe(0);
   });
 
   it("preserves default NEEDS WORK refusal and explicitly admits only correction preparation", () => {
     const f = fixture();
-    const original = readFileSync(join(f.root, ".local/review.json"), "utf8");
+    const original = f.read("review.json");
     const denied = f.run("prepare_init 42");
     expect(denied.status).toBe(1);
     expect(denied.stdout).toContain("requires a validated READY");
-    expect(existsSync(join(f.root, ".local/side-effects"))).toBe(false);
+    expect(f.has("side-effects")).toBe(false);
     const admitted = f.run("prepare_init 42 '' correction");
     expect(admitted.status, admitted.stderr).toBe(0);
     expect(f.git("rev-parse", "HEAD")).toBe(f.incoming);
-    expect(readFileSync(join(f.root, ".local/review.json"), "utf8")).toBe(original);
+    expect(f.read("review.json")).toBe(original);
     expect(f.run("require_prepared_review 42").status).toBe(1);
-    expect(existsSync(join(f.root, ".local/gates.env"))).toBe(false);
+    expect(f.has("gates.env")).toBe(false);
   });
 
   it.each(["NEEDS DISCUSSION", "NOT USEFUL (CLOSE)"])(
@@ -101,18 +112,15 @@ describePosix("native correction preparation", () => {
     (recommendation) => {
       const f = fixture();
       f.review.recommendation = recommendation;
-      writeFileSync(join(f.root, ".local/review.json"), JSON.stringify(f.review));
+      f.write("review.json", JSON.stringify(f.review));
       const result = f.run("prepare_init 42 '' correction");
       expect(result.status).toBe(1);
-      expect(existsSync(join(f.root, ".local/side-effects"))).toBe(false);
+      expect(f.has("side-effects")).toBe(false);
     },
   );
 
   it("requires complete exact-candidate review, then rejects subsequent source drift", () => {
-    const f = fixture();
-    expect(f.run("prepare_init 42 '' correction").status).toBe(0);
-    f.commitFix();
-    expect(f.run("prepare_correction_review_init 42").status).toBe(0);
+    const f = fixture("reviewed");
     expect(f.run("require_prepared_review 42").status).toBe(1);
     f.approve();
     const accepted = f.run("require_prepared_review 42");
@@ -124,10 +132,8 @@ describePosix("native correction preparation", () => {
   it.each(["gates", "push", "sync"])(
     "refuses %s before its execution/publication owner without candidate approval",
     (operation) => {
-      const f = fixture();
-      expect(f.run("prepare_init 42 '' correction").status).toBe(0);
-      f.commitFix();
-      writeFileSync(join(f.root, ".local/gates.env"), "GATES_MODE=full\n");
+      const f = fixture("corrected");
+      f.write("gates.env", "GATES_MODE=full\n");
       const result = f.run(
         [
           'source "$script_parent_dir/pr-lib/gates.sh"',
@@ -144,14 +150,12 @@ describePosix("native correction preparation", () => {
       );
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("correction-review.json");
-      expect(existsSync(join(f.root, ".local/execution-reached"))).toBe(false);
+      expect(f.has("execution-reached")).toBe(false);
     },
   );
 
   it("rejects candidate review when the corrected history drops the incoming commit", () => {
-    const f = fixture();
-    expect(f.run("prepare_init 42 '' correction").status).toBe(0);
-    f.commitFix();
+    const f = fixture("corrected");
     f.git("checkout", "--orphan", "replacement");
     f.git("add", ".");
     f.git("commit", "-qm", "rewritten source");
@@ -162,9 +166,9 @@ describePosix("native correction preparation", () => {
   it.each(["incoming review", "finding resolution", "foreign candidate", "lost correction mode"])(
     "refuses changed %s",
     (kind) => {
-      const f = fixture(true);
+      const f = fixture("approved");
       if (kind === "incoming review") {
-        writeFileSync(join(f.root, ".local/review.json"), `${JSON.stringify(f.review)}\n\n`);
+        f.write("review.json", `${JSON.stringify(f.review)}\n\n`);
       } else if (kind === "lost correction mode") {
         const path = join(f.root, ".local/prep-context.env");
         writeFileSync(
@@ -191,7 +195,7 @@ describePosix("native correction preparation", () => {
   it.each([false, true])(
     "binds recovered approval to incoming review bytes, changed=%s",
     (changed) => {
-      const f = fixture(true);
+      const f = fixture("approved");
       const candidate = f.git("rev-parse", "HEAD");
       const names = ["correction-review.json", "correction-incoming-review.json"];
       const retained = names.map((name) => ({
@@ -205,7 +209,7 @@ describePosix("native correction preparation", () => {
           throw new Error("Missing incoming fixture finding");
         }
         finding.fix = "A different obligation with the same I1 identifier";
-        writeFileSync(join(f.root, ".local/review.json"), JSON.stringify(f.review));
+        f.write("review.json", JSON.stringify(f.review));
       }
       expect(f.run("prepare_init 42 '' correction").status).toBe(0);
       f.git("reset", "--hard", candidate);
@@ -219,7 +223,7 @@ describePosix("native correction preparation", () => {
   );
 
   it.each(["push", "sync"])("requires exact gates before correction %s", (operation) => {
-    const f = fixture(true);
+    const f = fixture("approved");
     const qualified = f.git("rev-parse", "HEAD");
     const publish = () =>
       f.run(
@@ -229,27 +233,21 @@ describePosix("native correction preparation", () => {
         ].join("\n"),
       );
     expect(publish().status).toBe(1);
-    expect(existsSync(join(f.root, ".local/execution-reached"))).toBe(false);
-    writeFileSync(
-      join(f.root, ".local/gates.env"),
-      `PR_NUMBER=42\nGATES_MODE=full\nLAST_VERIFIED_HEAD_SHA=${qualified}\nFULL_GATES_HEAD_SHA=${qualified}\n`,
-    );
+    expect(f.has("execution-reached")).toBe(false);
+    f.gates(qualified);
     f.git("commit", "-q", "--allow-empty", "-m", "new candidate same tree");
     expect(f.run("prepare_correction_review_init 42").status).toBe(0);
     f.approve();
     expect(publish().status).toBe(1);
-    expect(existsSync(join(f.root, ".local/execution-reached"))).toBe(false);
+    expect(f.has("execution-reached")).toBe(false);
     const current = f.git("rev-parse", "HEAD");
-    writeFileSync(
-      join(f.root, ".local/gates.env"),
-      `PR_NUMBER=42\nGATES_MODE=full\nLAST_VERIFIED_HEAD_SHA=${current}\nFULL_GATES_HEAD_SHA=${current}\n`,
-    );
+    f.gates(current);
     expect(publish().status).toBe(73);
-    expect(existsSync(join(f.root, ".local/execution-reached"))).toBe(true);
+    expect(f.has("execution-reached")).toBe(true);
   });
 
   it("qualifies the reviewed correction for deferred GitHub gates without success stamps", () => {
-    const f = fixture(true);
+    const f = fixture("approved");
     const result = f.run(
       [
         "resolve_pr_gates_remote_mode() { echo github; }",
@@ -261,12 +259,12 @@ describePosix("native correction preparation", () => {
       ].join("\n"),
     );
     expect(result.status, result.stdout + result.stderr).toBe(73);
-    const gates = readFileSync(join(f.root, ".local/gates.env"), "utf8");
+    const gates = f.read("gates.env");
     expect(gates).toContain("GATES_MODE=github_pending");
     expect(gates).not.toContain("GATES_PASSED_AT");
     expect(gates).not.toContain("LAST_VERIFIED_HEAD_SHA");
     expect(gates).toContain(`HOSTED_GATES_TARGET_HEAD_SHA=${f.git("rev-parse", "HEAD")}`);
-    expect(existsSync(join(f.root, ".local/execution-reached"))).toBe(true);
+    expect(f.has("execution-reached")).toBe(true);
     expect(f.run("push_prep_head_to_pr_branch() { return 73; }; prepare_sync_head 42").status).toBe(
       73,
     );
@@ -275,11 +273,11 @@ describePosix("native correction preparation", () => {
   it.each(["completed", "pending", "revoked", "fork", "stale-review", "foreign-gate"])(
     "preserves correction authority when a partial publication has %s gates",
     (state) => {
-      const f = fixture(true);
+      const f = fixture("approved");
       const local = f.git("rev-parse", "HEAD");
       const hosted = f.git("commit-tree", `${local}^{tree}`, "-p", f.incoming, "-m", "hosted");
-      writeFileSync(
-        join(f.root, ".local/prepare-push-result.env"),
+      f.write(
+        "prepare-push-result.env",
         `PUSH_PREP_HEAD_SHA=${hosted}\nPUSH_LOCAL_PREP_HEAD_SHA=${local}\nPUSHED_FROM_SHA=${f.incoming}\nPUSH_REPLACED_HOSTED_ANCESTRY=false\nPR_HEAD_SHA_AFTER_PUSH=${hosted}\n`,
       );
       const pending = ["pending", "revoked", "fork"].includes(state);
@@ -289,8 +287,8 @@ describePosix("native correction preparation", () => {
           : pending
             ? local
             : hosted;
-      writeFileSync(
-        join(f.root, ".local/gates.env"),
+      f.write(
+        "gates.env",
         `PR_NUMBER=42\nGATES_MODE=${pending ? "remote_crabbox_aws_pending" : "full"}\nLAST_VERIFIED_HEAD_SHA=${qualified}\nFULL_GATES_HEAD_SHA=${qualified}\nREMOTE_GATES_PROVIDER=aws\n`,
       );
       if (state === "stale-review") {
@@ -319,7 +317,7 @@ describePosix("native correction preparation", () => {
       );
       const allowed = state === "completed" || state === "pending";
       expect(result.status, result.stdout + result.stderr).toBe(allowed ? 0 : 1);
-      expect(existsSync(join(f.root, ".local/prep.env"))).toBe(false);
+      expect(f.has("prep.env")).toBe(false);
     },
   );
 
@@ -331,7 +329,7 @@ describePosix("native correction preparation", () => {
   ])(
     "checks native pending-route eligibility before correction publication, fork=$fork, authorization=$authorization",
     ({ fork, authorization }) => {
-      const f = fixture(true);
+      const f = fixture("approved");
       const target = JSON.stringify({
         state: "OPEN",
         isCrossRepository: fork,
@@ -361,12 +359,12 @@ describePosix("native correction preparation", () => {
       );
       const allowed = !fork && authorization === "granted";
       expect(result.status, result.stdout + result.stderr).toBe(allowed ? 73 : 1);
-      expect(existsSync(join(f.root, ".local/execution-reached"))).toBe(allowed);
-      const checks = readFileSync(join(f.root, ".local/admin-checks"), "utf8").trim().split("\n");
+      expect(f.has("execution-reached")).toBe(allowed);
+      const checks = f.read("admin-checks").trim().split("\n");
       expect(checks).toContain("qualification");
       if (authorization === "denied") {
         expect(checks).not.toContain("publication");
-        expect(existsSync(join(f.root, ".local/gates.env"))).toBe(false);
+        expect(f.has("gates.env")).toBe(false);
       } else {
         expect(checks).toContain("publication");
       }
@@ -376,9 +374,7 @@ describePosix("native correction preparation", () => {
   );
 
   it("includes runtime fixup paths in candidate review even when incoming scope is docs", () => {
-    const f = fixture();
-    expect(f.run("prepare_init 42 '' correction").status).toBe(0);
-    f.commitFix();
+    const f = fixture("corrected");
     mkdirSync(join(f.root, "src"));
     writeFileSync(join(f.root, "src/fix.ts"), "export const fixed = true;\n");
     f.git("add", "src/fix.ts");
@@ -402,12 +398,9 @@ describePosix("native correction preparation", () => {
   ])(
     "revalidates JSON authority immediately before %s publication after %s change",
     (route, change) => {
-      const f = fixture(true);
+      const f = fixture("approved");
       const head = f.git("rev-parse", "HEAD");
-      writeFileSync(
-        join(f.root, ".local/gates.env"),
-        `PR_NUMBER=42\nGATES_MODE=full\nLAST_VERIFIED_HEAD_SHA=${head}\nFULL_GATES_HEAD_SHA=${head}\n`,
-      );
+      f.gates(head);
       const mutation =
         change === "JSON"
           ? "printf '\\n' >> .local/correction-review.json"
@@ -434,7 +427,7 @@ describePosix("native correction preparation", () => {
       );
       const changedAuthority = change === "JSON" || change === "publication receipt";
       expect(result.status, result.stdout + result.stderr).toBe(changedAuthority ? 1 : 0);
-      expect(existsSync(join(f.root, ".local/publication"))).toBe(!changedAuthority);
+      expect(f.has("publication")).toBe(!changedAuthority);
       if (changedAuthority) {
         expect(result.stderr).toContain("Correction review authority changed");
       }
@@ -442,8 +435,8 @@ describePosix("native correction preparation", () => {
   );
 
   it("retains prior candidate reviews when initializing another review", () => {
-    const f = fixture(true);
-    const original = readFileSync(join(f.root, ".local/correction-review.json"), "utf8");
+    const f = fixture("approved");
+    const original = f.read("correction-review.json");
     expect(f.run("prepare_correction_review_init 42").status).toBe(0);
     const retained = readdirSync(join(f.root, ".local")).find((name) =>
       name.startsWith("correction-review-retained."),
@@ -461,15 +454,12 @@ describePosix("native correction preparation", () => {
   it.each(["review", "publication lease", "replacement flag"])(
     "refuses a resumed no-op when %s changes during hosted acquisition",
     (change) => {
-      const f = fixture(true);
+      const f = fixture("approved");
       const local = f.git("rev-parse", "HEAD");
       const hosted = f.git("commit-tree", `${local}^{tree}`, "-p", f.incoming, "-m", "hosted");
       const receipt = `PUSH_PREP_HEAD_SHA=${hosted}\nPUSH_LOCAL_PREP_HEAD_SHA=${local}\nPUSHED_FROM_SHA=${f.incoming}\nPUSH_REPLACED_HOSTED_ANCESTRY=false\nPR_HEAD_SHA_AFTER_PUSH=${hosted}\n`;
-      writeFileSync(join(f.root, ".local/prepare-push-result.env"), receipt);
-      writeFileSync(
-        join(f.root, ".local/gates.env"),
-        `PR_NUMBER=42\nGATES_MODE=full\nLAST_VERIFIED_HEAD_SHA=${hosted}\nFULL_GATES_HEAD_SHA=${hosted}\n`,
-      );
+      f.write("prepare-push-result.env", receipt);
+      f.gates(hosted);
       const changedReceipt =
         change === "publication lease"
           ? receipt.replace(`PUSHED_FROM_SHA=${f.incoming}`, `PUSHED_FROM_SHA=${hosted}`)
@@ -497,8 +487,8 @@ describePosix("native correction preparation", () => {
       );
       expect(result.status, result.stdout + result.stderr).toBe(1);
       expect(result.stderr).toContain("Correction review authority changed");
-      expect(existsSync(join(f.root, ".local/completed"))).toBe(false);
-      expect(readFileSync(join(f.root, ".local/prepare-push-result.env"), "utf8")).toBe(
+      expect(f.has("completed")).toBe(false);
+      expect(f.read("prepare-push-result.env")).toBe(
         change === "review" ? receipt : changedReceipt,
       );
     },

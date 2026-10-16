@@ -234,6 +234,18 @@ function servicePrincipal(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function timingLine() {
+  return `${JSON.stringify({
+    exitCode: 0,
+    label: `openclaw-pr-gate:130481:${baseSha}:${headSha}`,
+    leaseId,
+    leaseStopped: true,
+    provider: "aws",
+    runId,
+    runStatus: "succeeded",
+  })}\n`;
+}
+
 function verifyProof(
   overrides: {
     events?: ReturnType<typeof brokerEvents>;
@@ -327,15 +339,7 @@ function crabboxRunner() {
       return {
         exitCode: 0,
         stdout: "",
-        stderr: `${JSON.stringify({
-          exitCode: 0,
-          label: `openclaw-pr-gate:130481:${baseSha}:${headSha}`,
-          leaseId,
-          leaseStopped: true,
-          provider: "aws",
-          runId,
-          runStatus: "succeeded",
-        })}\n`,
+        stderr: timingLine(),
       };
     },
   );
@@ -378,14 +382,7 @@ describe("Crabbox gate request and broker proof", () => {
   });
 
   it("caps retained output while preserving the final timing line", () => {
-    const timing = `${JSON.stringify({
-      exitCode: 0,
-      leaseId,
-      leaseStopped: true,
-      provider: "aws",
-      runId,
-      runStatus: "succeeded",
-    })}\n`;
+    const timing = timingLine();
     const oversized = Buffer.from("x".repeat(256 * 1024));
     const retained = appendCrabboxOutputTail(
       appendCrabboxOutputTail(Buffer.alloc(0), oversized),

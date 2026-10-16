@@ -38,9 +38,18 @@ function createTrackedFixture(files: Record<string, string>) {
 function planFixture(cwd: string, paths: string[]) {
   return createCrabboxGatePlan({
     baseSha,
+    headSha,
     cwd,
     changedPaths: paths.map((changedPath) => ({ path: changedPath, status: "M" })),
+  });
+}
+
+function mergePlan() {
+  return createCrabboxGatePlan({
+    baseSha,
     headSha,
+    changedPaths: [{ path: "scripts/pr", status: "M" }],
+    resolvePathPlan: () => ({ mode: "targets", targets: ["test/scripts/pr-merge.test.ts"] }),
   });
 }
 
@@ -301,15 +310,7 @@ describe("Crabbox PR-derived gate plan", () => {
   });
 
   it("binds immutable proof into the command and publisher workflow into the summary", () => {
-    const plan = createCrabboxGatePlan({
-      baseSha,
-      changedPaths: [{ path: "scripts/pr", status: "M" }],
-      headSha,
-      resolvePathPlan: () => ({
-        mode: "targets",
-        targets: ["test/scripts/pr-merge.test.ts"],
-      }),
-    });
+    const plan = mergePlan();
     const digest = crabboxGatePlanDigest(plan);
     const command = buildCrabboxGateCommand(plan, bootstrapSha256);
     expect(command).toContain(`OPENCLAW_CRABBOX_GATE_BASE=${baseSha}`);
@@ -318,7 +319,7 @@ describe("Crabbox PR-derived gate plan", () => {
     expect(command).toContain(`OPENCLAW_CRABBOX_GATE_PLAN_SHA256=${digest}`);
     expect(command).toContain("test/scripts/pr-merge.test.ts");
 
-    const summary = formatCrabboxGateCheckSummary({
+    const proof = {
       baseSha,
       headSha,
       leaseId: "cbx_def456",
@@ -326,30 +327,14 @@ describe("Crabbox PR-derived gate plan", () => {
       runId: "run_abc123",
       targetCount: 1,
       workflowSha,
-    });
-    expect(parseCrabboxGateCheckSummary(summary)).toEqual({
-      baseSha,
-      headSha,
-      leaseId: "cbx_def456",
-      planDigest: digest,
-      runId: "run_abc123",
-      targetCount: 1,
-      workflowSha,
-    });
+    };
+    expect(parseCrabboxGateCheckSummary(formatCrabboxGateCheckSummary(proof))).toEqual(proof);
   });
 
   it.skipIf(process.platform === "win32").each([undefined, "3"])(
     "preserves native worker sizing (%s) and forwards compact reporting for every target",
     (workers) => {
-      const plan = createCrabboxGatePlan({
-        baseSha,
-        changedPaths: [{ path: "scripts/pr", status: "M" }],
-        headSha,
-        resolvePathPlan: () => ({
-          mode: "targets",
-          targets: ["test/scripts/pr-merge.test.ts"],
-        }),
-      });
+      const plan = mergePlan();
       const command = buildCrabboxGateCommand(plan, bootstrapSha256);
       const output = execFileSync(
         "/bin/bash",

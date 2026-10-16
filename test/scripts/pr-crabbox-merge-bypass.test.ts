@@ -33,16 +33,20 @@ type WorkflowStep = {
   status: string;
 };
 
+function forwardComparison(sha: string, ahead_by = 4) {
+  return {
+    ahead_by,
+    base_commit: { sha },
+    behind_by: 0,
+    merge_base_commit: { sha },
+    status: "ahead",
+  };
+}
+
 function input(testedBaseSha = baseSha) {
   return {
     actor: { login: "maintainer" },
-    baseComparison: {
-      ahead_by: 4,
-      base_commit: { sha: testedBaseSha },
-      behind_by: 0,
-      merge_base_commit: { sha: testedBaseSha },
-      status: "ahead",
-    },
+    baseComparison: forwardComparison(testedBaseSha),
     finalMainComparison: undefined,
     mainAdvanceComparison: undefined,
     pullMainComparison: undefined,
@@ -108,13 +112,7 @@ function input(testedBaseSha = baseSha) {
       user: { login: "maintainer" },
     },
     finalMainRef: { object: { sha: mainSha }, ref: "refs/heads/main" },
-    mainComparison: {
-      ahead_by: 3,
-      base_commit: { sha: workflowSha },
-      behind_by: 0,
-      merge_base_commit: { sha: workflowSha },
-      status: "ahead",
-    },
+    mainComparison: forwardComparison(workflowSha, 3),
     mainRef: { object: { sha: mainSha }, ref: "refs/heads/main" },
     pullRequest: {
       base: { ref: "main", repo: { full_name: "openclaw/openclaw" }, sha: mainSha },
@@ -382,23 +380,15 @@ function runProtectedShell(
     ...input(strictDrift ? mainSha : baseSha),
     currentMainSha: mainSha,
     materializedAdvance: requalification !== "materialization",
-    advancedBaseComparison: {
-      ahead_by: 5,
-      base_commit: { sha: baseSha },
-      behind_by: 0,
-      merge_base_commit: { sha: baseSha },
-      status: "ahead",
-    },
+    advancedBaseComparison: forwardComparison(baseSha, 5),
     mainAdvanceComparison: {
-      ahead_by: 1,
-      base_commit: { sha: mainSha },
+      ...forwardComparison(mainSha, 1),
       behind_by: nonForwardMain ? 1 : 0,
       merge_base_commit: { sha: nonForwardMain ? baseSha : mainSha },
       status: nonForwardMain ? "diverged" : "ahead",
     },
     finalMainComparison: {
-      ahead_by: 4,
-      base_commit: { sha: workflowSha },
+      ...forwardComparison(workflowSha),
       behind_by: nonAncestralPublisher ? 1 : 0,
       merge_base_commit: { sha: nonAncestralPublisher ? baseSha : workflowSha },
       status: nonAncestralPublisher ? "diverged" : "ahead",

@@ -69,7 +69,13 @@ function fixture(transport: "auto" | "graphql" = "graphql") {
     join(f.local, "gates.env"),
     `PR_NUMBER=4242\nGATES_MODE=remote_crabbox_aws_pending\nLAST_VERIFIED_HEAD_SHA=${f.candidate}\nREMOTE_GATES_PROVIDER=aws\n`,
   );
-  return f;
+  return {
+    ...f,
+    read: (name: string) => readFileSync(join(f.local, name), "utf8"),
+    write: (name: string, value: string | Buffer) => writeFileSync(join(f.local, name), value),
+    has: (name: string) => existsSync(join(f.local, name)),
+    hosted: () => f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic"),
+  };
 }
 
 function runCorrection(
@@ -111,11 +117,9 @@ function runCorrection(
 }
 
 function expectIncomplete(f: ReturnType<typeof fixture>) {
-  expect(existsSync(join(f.local, "prep.env"))).toBe(false);
-  expect(readFileSync(join(f.local, "gates.env"), "utf8")).toContain(
-    "GATES_MODE=remote_crabbox_aws_pending\n",
-  );
-  expect(readFileSync(join(f.local, "prep.md"), "utf8")).not.toContain("Gates passed");
+  expect(f.has("prep.env")).toBe(false);
+  expect(f.read("gates.env")).toContain("GATES_MODE=remote_crabbox_aws_pending\n");
+  expect(f.read("prep.md")).not.toContain("Gates passed");
 }
 
 describePosix("correction publication authority handoff", () => {
@@ -135,28 +139,20 @@ describePosix("correction publication authority handoff", () => {
     "completes the first %s publication through protected-gate finalization",
     (transport) => {
       const f = fixture(transport);
-      const before = readFileSync(join(f.local, "review.json"), "utf8");
+      const before = f.read("review.json");
       const result = runCorrection(f);
       expect(result.status, result.stdout + result.stderr).toBe(0);
-      const hosted = f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic");
+      const hosted = f.hosted();
       expect(hosted === f.candidate).toBe(transport === "auto");
       expect(f.git("rev-parse", `${hosted}^{tree}`)).toBe(f.git("rev-parse", "HEAD^{tree}"));
-      expect(readFileSync(join(f.local, "events"), "utf8")).toBe(
-        `${transport === "auto" ? "push" : "graphql"}\nproof\n`,
-      );
-      expect(readFileSync(join(f.local, "prepare-push-result.env"), "utf8")).toContain(
-        `PUSHED_FROM_SHA=${f.source}\n`,
-      );
-      expect(readFileSync(join(f.local, "prep.env"), "utf8")).toContain(
-        `PREP_HEAD_SHA=${hosted}\n`,
-      );
-      expect(readFileSync(join(f.local, "prep.env"), "utf8")).toContain(
-        `LOCAL_PREP_HEAD_SHA=${f.candidate}\n`,
-      );
-      expect(readFileSync(join(f.local, "gates.env"), "utf8")).toContain(
+      expect(f.read("events")).toBe(`${transport === "auto" ? "push" : "graphql"}\nproof\n`);
+      expect(f.read("prepare-push-result.env")).toContain(`PUSHED_FROM_SHA=${f.source}\n`);
+      expect(f.read("prep.env")).toContain(`PREP_HEAD_SHA=${hosted}\n`);
+      expect(f.read("prep.env")).toContain(`LOCAL_PREP_HEAD_SHA=${f.candidate}\n`);
+      expect(f.read("gates.env")).toContain(
         `GATES_MODE=remote_crabbox_aws\nHOSTED_GATES_TARGET_HEAD_SHA=''\nLAST_VERIFIED_HEAD_SHA=${hosted}\nFULL_GATES_HEAD_SHA=${hosted}\n`,
       );
-      expect(readFileSync(join(f.local, "review.json"), "utf8")).toBe(before);
+      expect(f.read("review.json")).toBe(before);
     },
   );
 
@@ -168,28 +164,24 @@ describePosix("correction publication authority handoff", () => {
     "publishes and resumes a reviewed %s correction through %s with pending GitHub gates",
     (transport, command) => {
       const f = fixture(transport);
-      const incomingReview = readFileSync(join(f.local, "review.json"), "utf8");
-      writeFileSync(
-        join(f.local, "gates.env"),
+      const incomingReview = f.read("review.json");
+      f.write(
+        "gates.env",
         `PR_NUMBER=4242\nGATES_MODE=github_pending\nHOSTED_GATES_TARGET_HEAD_SHA=${f.candidate}\n`,
       );
       const published = runCorrection(f, { command: `${command} 4242` });
       expect(published.status, published.stdout + published.stderr).toBe(0);
-      const hosted = f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic");
-      const gates = readFileSync(join(f.local, "gates.env"), "utf8");
+      const hosted = f.hosted();
+      const gates = f.read("gates.env");
       expect(gates).toContain(`HOSTED_GATES_TARGET_HEAD_SHA=${hosted}\n`);
       expect(gates).not.toMatch(/GATES_PASSED_AT|LAST_VERIFIED_HEAD_SHA|FULL_GATES_HEAD_SHA/);
-      expect(readFileSync(join(f.local, "prep.env"), "utf8")).toContain(
-        `LOCAL_PREP_HEAD_SHA=${f.candidate}\n`,
-      );
-      expect(readFileSync(join(f.local, "prep.md"), "utf8")).not.toContain("Gates passed");
+      expect(f.read("prep.env")).toContain(`LOCAL_PREP_HEAD_SHA=${f.candidate}\n`);
+      expect(f.read("prep.md")).not.toContain("Gates passed");
       const resumed = runCorrection(f);
       expect(resumed.status, resumed.stdout + resumed.stderr).toBe(0);
-      expect(readFileSync(join(f.local, "gates.env"), "utf8")).toBe(gates);
-      expect(readFileSync(join(f.local, "events"), "utf8")).toBe(
-        `${transport === "auto" ? "push" : "graphql"}\n`,
-      );
-      expect(readFileSync(join(f.local, "review.json"), "utf8")).toBe(incomingReview);
+      expect(f.read("gates.env")).toBe(gates);
+      expect(f.read("events")).toBe(`${transport === "auto" ? "push" : "graphql"}\n`);
+      expect(f.read("review.json")).toBe(incomingReview);
     },
   );
 
@@ -197,8 +189,8 @@ describePosix("correction publication authority handoff", () => {
     "refuses pending correction publication with %s binding",
     (fault) => {
       const f = fixture();
-      writeFileSync(
-        join(f.local, "gates.env"),
+      f.write(
+        "gates.env",
         `PR_NUMBER=${fault === "foreign-pr" ? 42 : 4242}\nGATES_MODE=github_pending\nHOSTED_GATES_TARGET_HEAD_SHA=${fault === "missing" ? "" : fault === "stale" ? f.source : f.candidate}\n`,
       );
       if (fault === "changed-review") {
@@ -209,9 +201,9 @@ describePosix("correction publication authority handoff", () => {
       }
       const result = runCorrection(f);
       expect(result.status, result.stdout + result.stderr).not.toBe(0);
-      expect(readFileSync(join(f.local, "events"), "utf8")).toBe("");
-      expect(f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic")).toBe(f.source);
-      expect(existsSync(join(f.local, "prep.env"))).toBe(false);
+      expect(f.read("events")).toBe("");
+      expect(f.hosted()).toBe(f.source);
+      expect(f.has("prep.env")).toBe(false);
     },
   );
 
@@ -231,9 +223,9 @@ describePosix("correction publication authority handoff", () => {
         ],
       });
       expect(result.status, result.stdout + result.stderr).not.toBe(0);
-      expect(readFileSync(join(f.local, "events"), "utf8")).toBe("");
-      expect(f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic")).toBe(f.source);
-      expect(existsSync(join(f.local, "prepare-push-result.env"))).toBe(false);
+      expect(f.read("events")).toBe("");
+      expect(f.hosted()).toBe(f.source);
+      expect(f.has("prepare-push-result.env")).toBe(false);
     },
   );
 
@@ -275,24 +267,22 @@ describePosix("correction publication authority handoff", () => {
     review.issueValidation.status = "valid";
     review.correction.resolvedFindings[0].resolution = "Reviewed the full refreshed product delta.";
     writeFileSync(reviewPath, JSON.stringify(review));
-    writeFileSync(join(f.local, "gates.env"), oldGates);
+    f.write("gates.env", oldGates);
     const stale = runCorrection(f);
     expect(stale.status).not.toBe(0);
-    expect(f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic")).toBe(f.source);
-    expect(readFileSync(join(f.local, "events"), "utf8")).not.toContain("push");
-    writeFileSync(
-      join(f.local, "gates.env"),
+    expect(f.hosted()).toBe(f.source);
+    expect(f.read("events")).not.toContain("push");
+    f.write(
+      "gates.env",
       `PR_NUMBER=4242\nGATES_MODE=full\nLAST_VERIFIED_HEAD_SHA=${head}\nFULL_GATES_HEAD_SHA=${head}\n`,
     );
     const published = runCorrection(f);
     expect(published.status, published.stdout + published.stderr).toBe(0);
-    expect(f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic")).toBe(head);
+    expect(f.hosted()).toBe(head);
     expect(f.git("show", "-s", "--format=%P", head)).toBe(`${f.candidate} ${baseline}`);
     f.git("verify-commit", head);
-    expect(readFileSync(join(f.local, "events"), "utf8")).toBe("push\n");
-    expect(readFileSync(join(f.local, "prepare-push-result.env"), "utf8")).toContain(
-      `PUSH_LOCAL_PREP_HEAD_SHA=${head}\n`,
-    );
+    expect(f.read("events")).toBe("push\n");
+    expect(f.read("prepare-push-result.env")).toContain(`PUSH_LOCAL_PREP_HEAD_SHA=${head}\n`);
   });
 
   it.each(["review", "other receipt", "selected receipt", "removed receipt"])(
@@ -300,8 +290,8 @@ describePosix("correction publication authority handoff", () => {
     (changed) => {
       const f = fixture();
       if (changed === "removed receipt") {
-        writeFileSync(
-          join(f.local, "prepare-sync-result.env"),
+        f.write(
+          "prepare-sync-result.env",
           `PUSH_PREP_HEAD_SHA=${f.source}\nPUSH_LOCAL_PREP_HEAD_SHA=${f.source}\nPUSHED_FROM_SHA=${f.source}\nPUSH_REPLACED_HOSTED_ANCESTRY=false\nPR_HEAD_SHA_AFTER_PUSH=${f.source}\n`,
         );
       }
@@ -323,25 +313,23 @@ describePosix("correction publication authority handoff", () => {
       });
       expect(result.status, result.stdout + result.stderr).not.toBe(0);
       expect(result.stderr).toContain("Correction review authority changed");
-      expect(readFileSync(join(f.local, "events"), "utf8")).toBe("graphql\nproof\n");
+      expect(f.read("events")).toBe("graphql\nproof\n");
       expectIncomplete(f);
     },
   );
 
   it("admits the named sync receipt with completed correction gates", () => {
     const f = fixture();
-    writeFileSync(
-      join(f.local, "gates.env"),
+    f.write(
+      "gates.env",
       `PR_NUMBER=4242\nGATES_MODE=full\nLAST_VERIFIED_HEAD_SHA=${f.candidate}\nFULL_GATES_HEAD_SHA=${f.candidate}\n`,
     );
     const result = runCorrection(f, { command: "prepare_sync_head 4242" });
     expect(result.status, result.stdout + result.stderr).toBe(0);
-    const hosted = f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic");
-    expect(readFileSync(join(f.local, "prepare-sync-result.env"), "utf8")).toContain(
-      `PUSH_PREP_HEAD_SHA=${hosted}\n`,
-    );
-    expect(readFileSync(join(f.local, "prep.env"), "utf8")).toContain(`PREP_HEAD_SHA=${hosted}\n`);
-    expect(readFileSync(join(f.local, "events"), "utf8")).toBe("graphql\n");
+    const hosted = f.hosted();
+    expect(f.read("prepare-sync-result.env")).toContain(`PUSH_PREP_HEAD_SHA=${hosted}\n`);
+    expect(f.read("prep.env")).toContain(`PREP_HEAD_SHA=${hosted}\n`);
+    expect(f.read("events")).toBe("graphql\n");
   });
 
   it.each(["writer failure", "replaced result"])(
@@ -368,7 +356,7 @@ describePosix("correction publication authority handoff", () => {
       expect(result.stderr).toContain(
         fault === "writer failure" ? "Is a directory" : "Correction review authority changed",
       );
-      expect(readFileSync(join(f.local, "events"), "utf8")).toBe("graphql\n");
+      expect(f.read("events")).toBe("graphql\n");
       expectIncomplete(f);
     },
   );
@@ -377,7 +365,7 @@ describePosix("correction publication authority handoff", () => {
     const f = fixture();
     const published = runCorrection(f);
     expect(published.status, published.stdout + published.stderr).toBe(0);
-    const hosted = f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic");
+    const hosted = f.hosted();
     const resultPath = join(f.local, "prepare-push-result.env");
     const receipt = readFileSync(resultPath, "utf8");
     const result = runCorrection(f, {
@@ -395,7 +383,7 @@ describePosix("correction publication authority handoff", () => {
     });
     expect(result.status, result.stdout + result.stderr).toBe(0);
     expect(readFileSync(resultPath, "utf8")).toBe(receipt);
-    expect(readFileSync(join(f.local, "events"), "utf8")).toBe("graphql\nproof\n");
+    expect(f.read("events")).toBe("graphql\nproof\n");
   });
 
   it("does not admit an unnamed result path or pending sync publication", () => {
@@ -411,8 +399,8 @@ describePosix("correction publication authority handoff", () => {
     expect(unnamed.stderr).toContain("named preparation receipt");
     const sync = runCorrection(f, { command: "prepare_sync_head 4242" });
     expect(sync.status, sync.stdout + sync.stderr).toBe(1);
-    expect(readFileSync(join(f.local, "events"), "utf8")).toBe("");
-    expect(f.git("--git-dir", f.remote, "rev-parse", "refs/heads/topic")).toBe(f.source);
+    expect(f.read("events")).toBe("");
+    expect(f.hosted()).toBe(f.source);
     expectIncomplete(f);
   });
 });
