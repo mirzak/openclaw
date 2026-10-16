@@ -34,19 +34,17 @@ const metadataDiagnostic = "elevation runtime build metadata does not match app:
 const armv7Path = `${runtimeRoot}/lib/object-resource are: arm64 x86_64\nNon-fat file: injected is architecture: arm64`;
 const signatureDiagnostic = "must be signed for every architecture";
 const archCommand = (arch: string) => `codesign -dv --verbose=4 --arch ${arch}`;
-type Artifact = Awaited<ReturnType<typeof artifactFixture>>;
+type Artifact = Awaited<ReturnType<typeof artifactFixture>> & {
+  tool: (command: string, args: string[]) => Promise<string>;
+  fat: (slices: Buffer[], fat64?: boolean) => Promise<Buffer>;
+  code: () => Promise<void>;
+};
 
 type Contents =
   | keyof Artifact["binaries"]
   | ((h: Artifact, mac: MacScriptFixture) => Buffer | Promise<Buffer>)
   | null;
-type Mutation = readonly [
-  name: string,
-  path: string,
-  contents: Contents,
-  diagnostic: string | RegExp,
-  mode?: number,
-];
+type Mutation = readonly [string, string, Contents, string | RegExp, number?];
 const nonUniversal = "elevation Mach-O is not universal:";
 const missingSlices = "could not inspect elevation code slices:";
 const foreignNative = "elevation runtime contains non-Mach-O native code:";
@@ -58,8 +56,7 @@ const slice =
   (arch: "arm64" | "x86_64"): Contents =>
   (h, mac) =>
     singleSliceMacFat64(h.home, arch, mac);
-const fatLibrary: Contents = (h, mac) =>
-  macFatContainerFixture(h.home, [h.binaries.armLibrary, h.binaries.intelLibrary], true, mac);
+const fatLibrary: Contents = (h) => h.fat([h.binaries.armLibrary, h.binaries.intelLibrary], true);
 const armv7: Contents = async (h, mac) => {
   const bytes = Buffer.from(await macObjectFixture(h.home, "arm64", mac));
   bytes.writeUInt32LE(12, 4); // Synthetic ARMv7 resource; never executed.
@@ -68,7 +65,21 @@ const armv7: Contents = async (h, mac) => {
 };
 
 function withArtifact(mac: MacScriptFixture, body: (artifact: Artifact) => Promise<void>) {
-  return mac.lifetime.run(async () => body(await artifactFixture(mac)));
+  return mac.lifetime.run(async () => {
+    const h = await artifactFixture(mac);
+    await body({
+      ...h,
+      tool: (command, args) => runMacFixtureTool(command, args, h.home, mac),
+      fat: (slices, fat64 = false) => macFatContainerFixture(h.home, slices, fat64, mac),
+      code: async () => {
+        const result = await h.verifyCode();
+        expect(result, result.stderr).toMatchObject({
+          status: 0,
+          stdout: "Elevation code verified\n",
+        });
+      },
+    });
+  });
 }
 
 async function verify(
@@ -314,16 +325,6 @@ describe.skipIf(process.platform !== "darwin")(
         }),
     );
 
-    it.concurrent.for(["generic-native-arm64", "missing-native-format-x86_64"])(
-      "rejects %s signatures despite successful app policy verification",
-      async (fault, { mac }) =>
-        withArtifact(mac, async (h) => {
-          const result = await verify(h, nativeFormat, fault);
-          expect(result.stderr).toContain(addon);
-          expect(readFileSync(h.calls, "utf8")).toContain("spctl --assess --type execute");
-        }),
-    );
-
     it.concurrent.for(
       (["archive", "object"] as const).flatMap((resource) =>
         [false, true].flatMap((fat64) =>
@@ -335,13 +336,11 @@ describe.skipIf(process.platform !== "darwin")(
       async ({ resource, fat64, archiveFirst }, { mac }) =>
         withArtifact(mac, async (h) => {
           const [armResource, intelResource] = await resources(h, mac, resource);
-          const mixed = await macFatContainerFixture(
-            h.home,
+          const mixed = await h.fat(
             archiveFirst
               ? [h.binaries.armLibrary, intelResource]
               : [armResource, h.binaries.intelLibrary],
             fat64,
-            mac,
           );
           await write(h.at(runtimeAddon), withMachResourceKind(mixed, resource));
           await verify(
@@ -371,10 +370,7 @@ describe.skipIf(process.platform !== "darwin")(
       async ({ resource, format }, { mac }) =>
         withArtifact(mac, async (h) => {
           const [arm, intel] = await resources(h, mac, resource);
-          const bytes =
-            format !== "thin"
-              ? await macFatContainerFixture(h.home, [arm, intel], format === "fat64", mac)
-              : arm;
+          const bytes = format !== "thin" ? await h.fat([arm, intel], format === "fat64") : arm;
           await write(h.at(runtimeBun), withMachResourceKind(bytes, resource), 0o755);
           const result = await h.verify(`${resource}-bun`);
           expect(result.status, result.stderr).toBe(1);
@@ -402,12 +398,7 @@ describe.skipIf(process.platform !== "darwin")(
           const universal =
             format === "thin"
               ? undefined
-              : await macFatContainerFixture(
-                  h.home,
-                  [objects.arm64, objects.x86_64],
-                  format === "fat64",
-                  mac,
-                );
+              : await h.fat([objects.arm64, objects.x86_64], format === "fat64");
           const preserved = [];
           for (const arch of ["arm64", "x86_64"] as const) {
             for (const mode of [0o644, 0o755]) {
@@ -418,8 +409,7 @@ describe.skipIf(process.platform !== "darwin")(
             }
           }
           await verify(h);
-          const inspected = await h.verifyCode();
-          expect(inspected.status, inspected.stderr).toBe(0);
+          await h.code();
           expectPreserved(preserved);
           const calls = readFileSync(h.calls, "utf8");
           expect(calls).toContain("codesign --verify --deep --strict --all-architectures");
@@ -449,9 +439,7 @@ describe.skipIf(process.platform !== "darwin")(
           ].join("");
           const target = h.at(`${runtimeRoot}/lib/opaque [*].resource`);
           await write(target, `!<thin>\n${kind === "empty" ? "" : header}`);
-          expect(await runMacFixtureTool("/usr/bin/file", ["-b", target], h.home, mac)).toContain(
-            "thin archive with",
-          );
+          expect(await h.tool("/usr/bin/file", ["-b", target])).toContain("thin archive with");
           await verify(h, "elevation runtime contains unsupported thin archive:");
         }),
     );
@@ -460,15 +448,16 @@ describe.skipIf(process.platform !== "darwin")(
       withArtifact(mac, async (h) => {
         await write(path.join(h.home, "ordinary.txt"), "ordinary resource\n");
         const tar = path.join(h.home, "ordinary.tar");
-        await runMacFixtureTool(
-          "/usr/bin/tar",
-          ["--format", "ustar", "-cf", tar, "-C", h.home, "ordinary.txt"],
+        await h.tool("/usr/bin/tar", [
+          "--format",
+          "ustar",
+          "-cf",
+          tar,
+          "-C",
           h.home,
-          mac,
-        );
-        expect(await runMacFixtureTool("/usr/bin/file", ["-b", tar], h.home, mac)).toBe(
-          "POSIX tar archive",
-        );
+          "ordinary.txt",
+        ]);
+        expect(await h.tool("/usr/bin/file", ["-b", tar])).toBe("POSIX tar archive");
         const targets = [sharedLibrary, runtimeBun, runtimeAddon];
         for (const relative of targets) {
           await write(
@@ -481,12 +470,7 @@ describe.skipIf(process.platform !== "darwin")(
         for (const mode of [0o644, 0o700, 0o750]) {
           await write(h.at(`Contents/Frameworks/thin-${mode}.dylib`), h.binaries.armLibrary, mode);
         }
-        const archive64 = await macFatContainerFixture(
-          h.home,
-          [h.binaries.armArchive, h.binaries.intelArchive],
-          true,
-          mac,
-        );
+        const archive64 = await h.fat([h.binaries.armArchive, h.binaries.intelArchive], true);
         await write(h.at(`${runtimeRoot}/ordinary.resource`), readFileSync(tar));
         await write(h.at(`${runtimeRoot}/lib/universal.a`), h.binaries.universalArchive);
         await write(h.at(`${runtimeRoot}/lib/archive64 [*]`), archive64);
@@ -512,9 +496,7 @@ describe.skipIf(process.platform !== "darwin")(
         );
         await verify(h);
         // verifyCode receives this tree; verify above inspects a separate ZIP extraction.
-        const code = await h.verifyCode();
-        expect(code.status, code.stderr).toBe(0);
-        expect(code.stdout).toBe("Elevation code verified\n");
+        await h.code();
         expectPreserved(preserved);
       }));
 
@@ -550,12 +532,11 @@ describe.skipIf(process.platform !== "darwin")(
         expect(nonNative.status, nonNative.stderr).toBe(1);
         expect(nonNative.stderr).toContain("elevation runtime binary must be Mach-O:");
         await write(bun, h.binaries.universal, 0o755);
-        await runMacFixtureTool(
-          "/usr/bin/plutil",
-          ["-remove", "OpenClawRuntimeBuildID", h.at("Contents/Info.plist")],
-          h.home,
-          mac,
-        );
+        await h.tool("/usr/bin/plutil", [
+          "-remove",
+          "OpenClawRuntimeBuildID",
+          h.at("Contents/Info.plist"),
+        ]);
         const missingIdentity = await h.verify("plist-error-stdout");
         expect(missingIdentity.status, missingIdentity.stderr).toBe(1);
         expect(missingIdentity.stderr).toContain("elevation app is missing runtime build identity");
@@ -610,46 +591,37 @@ describe.skipIf(process.platform !== "darwin")(
       }),
     );
 
-    it.concurrent.for([
-      ["team-arm64", 1, signatureDiagnostic, archCommand("arm64")],
-      ["team-x86_64", 1, signatureDiagnostic, archCommand("x86_64")],
-      ["authority-arm64", 1, signatureDiagnostic, archCommand("arm64")],
-      ["authority-x86_64", 1, signatureDiagnostic, archCommand("x86_64")],
+    const faultCases: Array<[string, string, number?, string?, string?]> = [
+      ["generic-native-arm64", nativeFormat, 1, "spctl --assess --type execute", addon],
+      ["missing-native-format-x86_64", nativeFormat, 1, "spctl --assess --type execute", addon],
+      ["team-arm64", signatureDiagnostic, 1, archCommand("arm64")],
+      ["team-x86_64", signatureDiagnostic, 1, archCommand("x86_64")],
+      ["authority-arm64", signatureDiagnostic, 1, archCommand("arm64")],
+      ["authority-x86_64", signatureDiagnostic, 1, archCommand("x86_64")],
       [
         "signature",
-        1,
         signatureDiagnostic,
+        1,
         "codesign --verify --deep --strict --all-architectures",
       ],
       [
         "notarized",
-        23,
         "mock rejection: notarized",
+        23,
         "codesign --verify --strict --test-requirement==notarized",
       ],
-      ["stapler", 23, "mock rejection: stapler", "xcrun stapler validate"],
-      ["spctl", 23, "mock rejection: spctl", "spctl --assess --type execute"],
-      ["apple-events", 1, "Apple Events entitlement remains on elevation code:", `/${addon}`],
-      ["bundle-events", 1, "Apple Events entitlement remains on elevation bundle:", "/fixture.xpc"],
+      ["stapler", "mock rejection: stapler", 23, "xcrun stapler validate"],
+      ["spctl", "mock rejection: spctl", 23, "spctl --assess --type execute"],
+      ["apple-events", "Apple Events entitlement remains on elevation code:", 1, `/${addon}`],
+      ["bundle-events", "Apple Events entitlement remains on elevation bundle:", 1, "/fixture.xpc"],
       [
         "mlx",
-        1,
         "MLX helper must be signed without app entitlements:",
+        1,
         "/Contents/MacOS/openclaw-mlx-tts",
       ],
-      ["cdhash-arm64", 1, "artifact receipt arm64 CDHash mismatch", archCommand("arm64")],
-      ["cdhash-x86_64", 1, "artifact receipt x86_64 CDHash mismatch", archCommand("x86_64")],
-    ] as const)(
-      "preserves the %s policy gate with observable mocks",
-      async ([fault, code, diagnostic, command], { mac }) =>
-        withArtifact(mac, async (h) => {
-          await mkdir(h.at(`${runtimeRoot}/fixture.xpc`));
-          await verify(h, diagnostic, fault, code);
-          expect(readFileSync(h.calls, "utf8")).toContain(command);
-        }),
-    );
-
-    it.concurrent.for([
+      ["cdhash-arm64", "artifact receipt arm64 CDHash mismatch", 1, archCommand("arm64")],
+      ["cdhash-x86_64", "artifact receipt x86_64 CDHash mismatch", 1, archCommand("x86_64")],
       ["find-code", "could not scan elevation code"],
       ["find-links", "cyclic or unreadable elevation runtime tree"],
       ["file", "could not inspect elevation code:"],
@@ -663,10 +635,22 @@ describe.skipIf(process.platform !== "darwin")(
       ["file-partial-error", "could not inspect elevation code:"],
       ["file-changed-type", "elevation code changed type during classification:"],
       ["lipo", "could not inspect elevation code slices:"],
-    ])("fails closed when %s cannot scan the artifact", async ([fault, diagnostic], { mac }) =>
-      withArtifact(mac, async (h) => {
-        await verify(h, diagnostic, fault);
-      }),
+    ];
+    it.concurrent.for(faultCases)(
+      "rejects %s verification faults",
+      async ([fault, diagnostic, code = 1, command, detail], { mac }) =>
+        withArtifact(mac, async (h) => {
+          if (command && !detail) {
+            await mkdir(h.at(`${runtimeRoot}/fixture.xpc`));
+          }
+          const result = await verify(h, diagnostic, fault, code);
+          if (command) {
+            expect(readFileSync(h.calls, "utf8")).toContain(command);
+          }
+          if (detail) {
+            expect(result.stderr).toContain(detail);
+          }
+        }),
     );
 
     it.concurrent.for(["file", "symlink"])(
