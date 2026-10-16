@@ -3,7 +3,7 @@ import { copyFileSync, renameSync } from "node:fs";
 import { DatabaseSync, StatementSync } from "node:sqlite";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { withinTest } from "../../test/helpers/promise.js";
+import { awaitGateBeforeSettlement, withinTest } from "../../test/helpers/promise.js";
 import { observeSqliteReadSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { deleteSessionEntryLifecycle } from "../config/sessions.js";
 import type { SessionEntry } from "../config/sessions/types.js";
@@ -58,30 +58,24 @@ async function withFixture(
   isolated = false,
   initialSessionPatch: Partial<SessionEntry> = {},
 ) {
+  let fixture: Awaited<ReturnType<typeof createFixture>> | undefined;
+  const runFixture = async () => {
+    fixture = await createFixture(scope, false, initialSessionPatch);
+    try {
+      await run(fixture);
+    } finally {
+      await fixture.close();
+    }
+  };
   if (isolated) {
-    return withOpenClawTestState({ scenario: "minimal" }, async () => {
-      const fixture = await createFixture(scope, false, initialSessionPatch);
-      try {
-        await run(fixture);
-      } finally {
-        await fixture.close();
-      }
-    });
+    return withOpenClawTestState({ scenario: "minimal" }, runFixture);
   }
-  // Only the physical stores survive; every case owns its reader, projection and session rows.
+  // Only physical stores survive; cases own their reader, projection and session rows.
   sharedState ??= await createOpenClawTestState({ scenario: "minimal" });
   sharedState.applyEnv();
   const work = new AsyncWorkScope();
-  let fixture: Awaited<ReturnType<typeof createFixture>> | undefined;
   try {
-    await work.track(async () => {
-      fixture = await createFixture(scope, false, initialSessionPatch);
-      try {
-        await run(fixture);
-      } finally {
-        await fixture.close();
-      }
-    });
+    await work.track(runFixture);
   } finally {
     try {
       await work.drain();
@@ -196,12 +190,11 @@ describe("registered session PR subscriptions", () => {
           });
           const loading = f.subscriptions.replace(f.client.connId!, [key]);
           try {
-            await Promise.race([
+            await awaitGateBeforeSettlement(
               entered.promise,
-              loading.then(() => {
-                throw new Error("Private PR read was not admitted");
-              }),
-            ]);
+              loading,
+              "Private PR read was not admitted",
+            );
             if (change === "repository") {
               await getSessionRepositoryWorkspaceStore().delete({
                 workspaceId: repository.workspaceId,
@@ -330,12 +323,11 @@ describe("registered session PR subscriptions", () => {
         sessionChanges.emit({ all: true, scope: "stores" });
         const polling = f.subscriptions.pollNow();
         try {
-          await Promise.race([
+          await awaitGateBeforeSettlement(
             entered.promise,
-            polling.then(() => {
-              throw new Error("PR polling finished before its pending topology was prepared");
-            }),
-          ]);
+            polling,
+            "PR polling finished before its pending topology was prepared",
+          );
           expect(f.load).not.toHaveBeenCalled();
           expect(frames(f.socket)).toEqual([]);
           if (authority === "revoked") {
@@ -638,12 +630,11 @@ describe("registered session PR check details", () => {
           respond,
         });
         try {
-          await Promise.race([
+          await awaitGateBeforeSettlement(
             entered.promise,
-            request.then(() => {
-              throw new Error("The registered check-details loader was not entered");
-            }),
-          ]);
+            request,
+            "The registered check-details loader was not entered",
+          );
           if (mutation === "store closure") {
             const source = (await loadGatewaySessionEntryReadOnlyAsync(key, { agentId: "main" }))
               .readSource;
@@ -693,19 +684,7 @@ it.each(["local", "repository"] as const)(
   async (source) => {
     await withFixture("operator.read", async (f) => {
       const repositories = getSessionRepositoryWorkspaceStore();
-      const repository =
-        source === "repository"
-          ? await repositories.create({
-              agentId: "main",
-              sessionKey,
-              url: "https://github.com/synthetic/publication",
-              branch: "guest-change",
-              assertCurrent: () => {},
-            })
-          : undefined;
-      if (repository) {
-        await f.seed(sessionKey, f.profile.id, { repositoryWorkspaceId: repository.workspaceId });
-      }
+      const repository = source === "repository" ? await f.seedRepository() : undefined;
       await f.subscribe();
       const statements = observeSqliteReadSql(StatementSync.prototype);
       try {
@@ -755,9 +734,7 @@ it("keeps warm default-loader SQL constant as readers join without a native row 
     vi.stubEnv("GH_TOKEN", "");
     vi.stubEnv("GITHUB_TOKEN", "");
     const provider = vi.fn<typeof fetch>(async (input) => {
-      const url = new URL(
-        typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
-      );
+      const url = new URL(requestUrl(input));
       if (url.pathname.endsWith("/pulls")) {
         return githubJson([
           pullListItem({
@@ -772,14 +749,7 @@ it("keeps warm default-loader SQL constant as readers join without a native row 
     vi.stubGlobal("fetch", provider);
     const f = await createFixture("operator.read", true);
     try {
-      const repository = await getSessionRepositoryWorkspaceStore().create({
-        agentId: "main",
-        sessionKey,
-        url: "https://github.com/synthetic/publication",
-        branch: "guest-change",
-        assertCurrent: () => {},
-      });
-      await f.seed(sessionKey, f.profile.id, { repositoryWorkspaceId: repository.workspaceId });
+      await f.seedRepository();
       await f.subscribe();
       await f.subscriptions.pollNow();
       const measure = async () => {
@@ -846,14 +816,7 @@ it("drops cached subscription hydration after physical database replacement", as
       vi.stubGlobal("fetch", provider);
       const f = await createFixture("operator.read", true);
       try {
-        const repository = await getSessionRepositoryWorkspaceStore().create({
-          agentId: "main",
-          sessionKey,
-          url: "https://github.com/synthetic/publication",
-          branch: "guest-change",
-          assertCurrent: () => {},
-        });
-        await f.seed(sessionKey, f.profile.id, { repositoryWorkspaceId: repository.workspaceId });
+        await f.seedRepository();
         await f.subscribe();
         await f.subscriptions.pollNow();
         expect(frames(f.socket)).toMatchObject([
@@ -913,9 +876,7 @@ it.each(["concurrency limit", "earlier refresh", "refresh timer", "publication"]
         vi.stubGlobal(
           "fetch",
           vi.fn<typeof fetch>(async (input) => {
-            const url = new URL(
-              typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
-            );
+            const url = new URL(requestUrl(input));
             if (url.pathname.endsWith("/pulls")) {
               lookedUp.push(url.pathname);
               if (lookedUp.length === activeLoads) {
@@ -933,14 +894,7 @@ it.each(["concurrency limit", "earlier refresh", "refresh timer", "publication"]
           for (let index = 0; index < (waitingOn === "concurrency limit" ? 5 : 1); index++) {
             const key = `agent:main:queued-pr-${index}`;
             keys.push(key);
-            const repository = await getSessionRepositoryWorkspaceStore().create({
-              agentId: "main",
-              sessionKey: key,
-              url: `https://github.com/synthetic/queued-${index}`,
-              branch: "guest-change",
-              assertCurrent: () => {},
-            });
-            await f.seed(key, f.profile.id, { repositoryWorkspaceId: repository.workspaceId });
+            await f.seedRepository(key, `queued-${index}`);
           }
           if (waitingOn === "refresh timer") {
             await f.subscriptions.replace(f.client.connId!, keys, new Set(keys));

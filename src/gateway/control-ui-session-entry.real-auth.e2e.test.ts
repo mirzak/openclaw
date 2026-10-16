@@ -13,6 +13,7 @@ import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
 import { replaceTranscriptEvents } from "../config/sessions/session-accessor.sqlite-transcript-write.test-support.js";
 import { addSessionMember, removeSessionMember } from "../config/sessions/session-sharing-store.js";
+import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   CONTROL_UI_ASSETS_BUILD_TIMEOUT_MS,
@@ -53,6 +54,7 @@ const publicScope = {
   sessionKey: "agent:main:dashboard:87654321-aaaa-4000-8000-000000000002",
   sessionId: "public-http-instance",
 };
+const entry = buildControlUiSessionEntryUrl(privatePath, basePath);
 const memberEmail = "http-handoff-member@example.test";
 const deniedEmail = "http-handoff-denied@example.test";
 const ownerEmail = "http-handoff-owner@example.test";
@@ -110,10 +112,9 @@ function readHttp(
 }
 
 function expectNoApp(response: HttpResult) {
-  expect(response.body).not.toContain("<openclaw-app");
-  expect(response.body).not.toContain('type="module"');
-  expect(response.body).not.toContain(privateTitle);
-  expect(response.body).not.toContain(privateMessage);
+  for (const text of ["<openclaw-app", 'type="module"', privateTitle, privateMessage]) {
+    expect(response.body).not.toContain(text);
+  }
 }
 
 function holdPreparedDocument() {
@@ -123,8 +124,7 @@ function holdPreparedDocument() {
   const spy = vi
     .spyOn(documentTransport, "sendControlUiHtmlBody")
     .mockImplementationOnce(async (req, res, body, isCurrent) => {
-      // Real file-worker read and index/path/CSP preparation have finished.
-      // The production encoder and final live-authority check still own delivery.
+      // Delay only transport; the production encoder still owns the final authority check.
       entered.resolve({ body, res, current: isCurrent?.() === true });
       await resume.promise;
       await send(req, res, body, isCurrent);
@@ -145,6 +145,12 @@ describe("real HTTP authentication to canonical thread app delivery", () => {
   let index: string;
   let port: number;
   let auth: ResolvedGatewayAuth;
+  const request = (
+    route: string,
+    signal: AbortSignal,
+    email?: string,
+    headers: Record<string, string> = proxyHeaders,
+  ) => readHttp(port, route, email, signal, headers);
 
   beforeAll(async () => {
     // qaRuntime snapshots omit UI assets. The existing owner builds the real bundle
@@ -170,7 +176,6 @@ describe("real HTTP authentication to canonical thread app delivery", () => {
   }, CONTROL_UI_ASSETS_BUILD_TIMEOUT_MS);
 
   beforeAll(async () => {
-    // The build owner above validates all startup assets, not just an HTML sentinel.
     const root = path.resolve("dist/control-ui");
     index = await readFile(path.join(root, "index.html"), "utf8");
     expect(index).toContain("<openclaw-app");
@@ -210,37 +215,34 @@ describe("real HTTP authentication to canonical thread app delivery", () => {
     await setCanonicalUserProfileRole(deniedId, "denied", {
       onCommitted: invalidateOperatorRolePolicy,
     });
-    await upsertSessionEntryCore(privateScope, {
-      sessionId: "private-http-instance",
-      updatedAt: 1,
-      displayName: privateTitle,
-      visibility: "read-only",
-      createdActor: { type: "human", source: "profile", id: ownerId },
-    });
-    await replaceTranscriptEvents(privateScope, [
-      { type: "session", version: 3, id: "private-http-instance" },
-      {
-        type: "message",
-        id: "private-message",
-        message: { role: "user", content: privateMessage },
-      },
-    ]);
+    const seedThread = async (
+      scope: typeof privateScope,
+      displayName: string,
+      content: string,
+      updatedAt: number,
+      patch: Partial<SessionEntry>,
+    ) => {
+      await upsertSessionEntryCore(scope, {
+        sessionId: scope.sessionId,
+        updatedAt,
+        displayName,
+        createdActor: { type: "human", source: "profile", id: ownerId },
+        ...patch,
+      });
+      await replaceTranscriptEvents(scope, [
+        { type: "session", version: 3, id: scope.sessionId },
+        {
+          type: "message",
+          id: updatedAt === 1 ? "private-message" : "public-message",
+          message: { role: "user", content },
+        },
+      ]);
+    };
+    await seedThread(privateScope, privateTitle, privateMessage, 1, { visibility: "read-only" });
     await addSessionMember(privateScope, { identityId: memberId, addedBy: ownerId });
-    await upsertSessionEntryCore(publicScope, {
-      sessionId: "public-http-instance",
-      updatedAt: 2,
-      displayName: "Public HTTP handoff conversation",
-      createdActor: { type: "human", source: "profile", id: ownerId },
-      publicShare: { id: "a".repeat(48), sessionId: "public-http-instance", createdAt: 1 },
+    await seedThread(publicScope, "Public HTTP handoff conversation", publishedMessage, 2, {
+      publicShare: { id: "a".repeat(48), sessionId: publicScope.sessionId, createdAt: 1 },
     });
-    await replaceTranscriptEvents(publicScope, [
-      { type: "session", version: 3, id: "public-http-instance" },
-      {
-        type: "message",
-        id: "public-message",
-        message: { role: "user", content: publishedMessage },
-      },
-    ]);
     projection = await createSessionRowProjection({ cfg, getConfig: () => cfg, modelCatalog: [] });
     await projection.ensureMaterialized();
     // Reuse the suite context fixture only for unrelated scheduler/WS services.
@@ -297,26 +299,23 @@ describe("real HTTP authentication to canonical thread app delivery", () => {
         allowTailscale: false,
       };
       try {
-        const entry = buildControlUiSessionEntryUrl(privatePath, basePath);
         for (const headers of [{ host: "localhost" }, proxyHeaders]) {
-          const response = await readHttp(port, privatePath, undefined, signal, headers);
+          const response = await request(privatePath, signal, undefined, headers);
           expect(response.status).toBe(404);
           expectNoApp(response);
           expect(response.body).toContain('data-gateway-path="/control"');
-          expect(
-            (await readHttp(port, entry + "&probe=1", undefined, signal, headers)).status,
-          ).toBe(401);
-          const app = await readHttp(port, entry, undefined, signal, headers);
+          expect((await request(entry + "&probe=1", signal, undefined, headers)).status).toBe(401);
+          const app = await request(entry, signal, undefined, headers);
           expect(app.status).toBe(200);
           expect(app.body).toContain("<openclaw-app");
         }
-        const nonSecure = await readHttp(port, privatePath, undefined, signal, {
+        const nonSecure = await request(privatePath, signal, undefined, {
           host: "gateway.lan",
         });
         expect(nonSecure.status).toBe(200);
         expect(nonSecure.body).toContain("<openclaw-app");
         expect(nonSecure.body).not.toContain(privateMessage);
-        const published = await readHttp(port, publicPath, undefined, signal);
+        const published = await request(publicPath, signal, undefined);
         expect(published.status).toBe(200);
         expect(published.body).toContain(publishedMessage);
         expectNoApp(published);
@@ -329,10 +328,9 @@ describe("real HTTP authentication to canonical thread app delivery", () => {
   it("delivers the real app for both the owner and an allowed authenticated reader", async ({
     signal,
   }) => {
-    const entry = buildControlUiSessionEntryUrl(privatePath, basePath);
     for (const email of [ownerEmail, memberEmail]) {
-      expect((await readHttp(port, entry + "&probe=1", email, signal)).status, email).toBe(204);
-      const response = await readHttp(port, entry, email, signal);
+      expect((await request(entry + "&probe=1", signal, email)).status, email).toBe(204);
+      const response = await request(entry, signal, email);
       expect(response.status, email).toBe(200);
       expect(response.body).toContain("<openclaw-app");
       expect(response.body).toContain('type="module"');
@@ -356,12 +354,11 @@ describe("real HTTP authentication to canonical thread app delivery", () => {
   it("keeps a genuinely authenticated but denied profile on the unavailable reader", async ({
     signal,
   }) => {
-    const entry = buildControlUiSessionEntryUrl(privatePath, basePath);
     // 403 (not 401) proves identity admission succeeded before session access was denied.
-    const probe = await readHttp(port, entry + "&probe=1", deniedEmail, signal);
+    const probe = await request(entry + "&probe=1", signal, deniedEmail);
     expect(probe.status).toBe(403);
     expectNoApp(probe);
-    const document = await readHttp(port, entry, deniedEmail, signal);
+    const document = await request(entry, signal, deniedEmail);
     expect(document.status).toBe(403);
     expect(document.headers.location).toBeUndefined();
     expectNoApp(document);
@@ -371,25 +368,25 @@ describe("real HTTP authentication to canonical thread app delivery", () => {
   it("ignores spoofed identity on anonymous canonical documents while protecting the handoff", async ({
     signal,
   }) => {
-    const anonymous = await readHttp(port, publicPath, undefined, signal);
-    const spoofed = await readHttp(port, publicPath, ownerEmail, signal);
+    const anonymous = await request(publicPath, signal, undefined);
+    const spoofed = await request(publicPath, signal, ownerEmail);
     expect(anonymous.status).toBe(200);
     expect(anonymous.body).toContain(publishedMessage);
     expect(spoofed.status).toBe(200);
     expect(spoofed.body).toBe(anonymous.body);
     expectNoApp(spoofed);
-    const privateAnonymous = await readHttp(port, privatePath, undefined, signal);
-    const privateSpoofed = await readHttp(port, privatePath, ownerEmail, signal);
+    const privateAnonymous = await request(privatePath, signal, undefined);
+    const privateSpoofed = await request(privatePath, signal, ownerEmail);
     expect(privateAnonymous.status).toBe(404);
     expect(privateSpoofed.status).toBe(404);
     expect(privateSpoofed.body).toBe(privateAnonymous.body);
     expectNoApp(privateSpoofed);
     for (const route of [
-      buildControlUiSessionEntryUrl(privatePath, basePath),
-      buildControlUiSessionEntryUrl(privatePath, basePath) + "&probe=1",
+      entry,
+      entry + "&probe=1",
       basePath + "/__openclaw__/assistant-media?source=missing.png",
     ]) {
-      const protectedResponse = await readHttp(port, route, undefined, signal);
+      const protectedResponse = await request(route, signal, undefined);
       expect(protectedResponse.status).toBe(401);
       expectNoApp(protectedResponse);
     }
@@ -401,8 +398,7 @@ describe("real HTTP authentication to canonical thread app delivery", () => {
     }) => {
       await addSessionMember(privateScope, { identityId: memberId, addedBy: ownerId });
       const held = holdPreparedDocument();
-      const entry = buildControlUiSessionEntryUrl(privatePath, basePath);
-      const pending = readHttp(port, entry, memberEmail, signal);
+      const pending = request(entry, signal, memberEmail);
       try {
         const prepared = await withinTest(
           awaitGateBeforeSettlement(

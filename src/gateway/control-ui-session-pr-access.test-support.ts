@@ -8,6 +8,7 @@ import {
 } from "../config/sessions/session-accessor.js";
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { getSessionRepositoryWorkspaceStore } from "../state/session-repository-workspaces.js";
 import { linkEmail, setUserProfileRole } from "../state/user-profile-writes.worker.js";
 import { ensureProfileForEmail } from "../state/user-profiles.js";
 import {
@@ -173,20 +174,9 @@ export async function createFixture(
     context,
     async changeReader(change: (typeof readerChanges)[number], key = sessionKey) {
       if (change === "role") {
-        const roles = cfg.gateway!.roles!;
-        setRuntimeConfigSnapshot({
-          ...cfg,
-          gateway: {
-            ...cfg.gateway,
-            roles: {
-              ...roles,
-              definitions: {
-                ...roles.definitions,
-                reader: { ...roles.definitions.reader!, scopes: [] },
-              },
-            },
-          },
-        });
+        const revoked = structuredClone(cfg);
+        revoked.gateway!.roles!.definitions!.reader!.scopes = [];
+        setRuntimeConfigSnapshot(revoked);
       } else if (change === "connection") {
         reader.client.invalidated = true;
       } else if (change === "profile") {
@@ -205,6 +195,17 @@ export async function createFixture(
           },
         };
       }
+    },
+    async seedRepository(key = sessionKey, repo = "publication") {
+      const repository = await getSessionRepositoryWorkspaceStore().create({
+        agentId: "main",
+        sessionKey: key,
+        url: `https://github.com/synthetic/${repo}`,
+        branch: "guest-change",
+        assertCurrent: () => {},
+      });
+      await seed(key, profile.id, { repositoryWorkspaceId: repository.workspaceId });
+      return repository;
     },
     async subscribe(keys = [sessionKey], client = reader.client) {
       const respond = vi.fn();

@@ -29,18 +29,22 @@ const chip: ControlUiSessionPullRequest = {
 };
 let scope = 0;
 
+const completed = {
+  status: "completed",
+  conclusion: "success",
+  started_at: "2026-09-14T03:00:00Z",
+  completed_at: "2026-09-14T03:00:10Z",
+};
+
 function check(id: number, overrides: Record<string, unknown> = {}) {
   return {
     id,
     name: "check-" + id,
-    status: "completed",
-    conclusion: "success",
+    ...completed,
     head_sha: headSha,
     app: { slug: "github-actions" },
     check_suite: { id: 17 },
     details_url: "https://github.com/openclaw/openclaw/actions/runs/23/job/" + (id + 1000),
-    started_at: "2026-09-14T03:00:00Z",
-    completed_at: "2026-09-14T03:00:10Z",
     ...overrides,
   };
 }
@@ -51,10 +55,7 @@ function job(checkId: number, overrides: Record<string, unknown> = {}) {
     run_attempt: 2,
     head_sha: headSha,
     check_run_url: base + "/check-runs/" + checkId,
-    status: "completed",
-    conclusion: "success",
-    started_at: "2026-09-14T03:00:00Z",
-    completed_at: "2026-09-14T03:00:10Z",
+    ...completed,
     steps: [
       { number: 3, name: "Complete job", status: "completed", conclusion: "success" },
       { number: 1, name: "Set up", status: "completed", conclusion: "success" },
@@ -123,11 +124,14 @@ function harness() {
   };
 }
 
+let h: ReturnType<typeof harness>;
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-09-14T04:00:00Z"));
   vi.stubEnv("GH_TOKEN", "");
   vi.stubEnv("GITHUB_TOKEN", "");
+  h = harness();
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -140,7 +144,6 @@ describe("session PR CI details", () => {
   it.each(["github.com", "ghe.example.test"])(
     "paginates and joins checks on the session host %s",
     async (host) => {
-      const h = harness();
       const enterpriseBase = "https://ghe.example.test/api/v3/repos/openclaw/openclaw";
       if (host !== "github.com") {
         setRuntimeConfigSnapshot({
@@ -200,7 +203,6 @@ describe("session PR CI details", () => {
   );
 
   it("keeps non-Actions checks distinct and skips Actions calls for skipped-only suites", async () => {
-    const h = harness();
     h.state.checks = [
       check(1, { conclusion: "skipped" }),
       check(2, {
@@ -222,7 +224,6 @@ describe("session PR CI details", () => {
   });
 
   it("uses only current check identities while retaining successful earlier-attempt jobs", async () => {
-    const h = harness();
     h.state.checks = [
       check(2, { name: "rerun", status: "in_progress", conclusion: null }),
       check(3, { name: "retained" }),
@@ -248,40 +249,35 @@ describe("session PR CI details", () => {
     expect(rerun.checks.map((row) => row.id)).toEqual([4]);
   });
 
-  it.each(["foreign repository", "missing join", "wrong head", "duplicate steps"])(
-    "does not attach steps for %s",
-    async (failure) => {
-      const h = harness();
-      if (failure === "foreign repository") {
-        h.state.jobs = [
-          job(1, { check_run_url: "https://api.github.com/repos/other/repo/check-runs/1" }),
-        ];
-      }
-      if (failure === "missing join") {
-        h.state.jobs = [job(2, { id: 1 })];
-      }
-      if (failure === "wrong head") {
-        h.state.runHead = "b".repeat(40);
-      }
-      if (failure === "duplicate steps") {
-        h.state.jobs = [
+  it.each([
+    [
+      "foreign repository",
+      { jobs: [job(1, { check_run_url: "https://api.github.com/repos/other/repo/check-runs/1" })] },
+    ],
+    ["missing join", { jobs: [job(2, { id: 1 })] }],
+    ["wrong head", { runHead: "b".repeat(40) }],
+    [
+      "duplicate steps",
+      {
+        jobs: [
           job(1, {
             steps: [
               { number: 1, name: "a", status: "completed" },
               { number: 1, name: "b", status: "completed" },
             ],
           }),
-        ];
-      }
-      const result = await h.load();
-      expect(result.status).toBe("stale");
-      expect(result.checks[0]?.steps).toBeUndefined();
-      expect(result.error).toBeTruthy();
-    },
-  );
+        ],
+      },
+    ],
+  ] as const)("does not attach steps for %s", async (_failure, patch) => {
+    Object.assign(h.state, patch);
+    const result = await h.load();
+    expect(result.status).toBe("stale");
+    expect(result.checks[0]?.steps).toBeUndefined();
+    expect(result.error).toBeTruthy();
+  });
 
   it("does not treat a failed later jobs page as a complete job inventory", async () => {
-    const h = harness();
     h.state.checks = Array.from({ length: 101 }, (_, i) => check(i + 1));
     h.state.jobs = Array.from({ length: 101 }, (_, i) => job(i + 1));
     h.state.secondJobPageStatus = 403;
@@ -293,7 +289,6 @@ describe("session PR CI details", () => {
   });
 
   it("coalesces repeated requests and respects the upstream retry window with stale data", async () => {
-    const h = harness();
     const [a, b] = await Promise.all([h.load(), h.load()]);
     expect(a).toEqual(b);
     expect(h.deps.fetchImpl).toHaveBeenCalledTimes(4);
@@ -310,7 +305,6 @@ describe("session PR CI details", () => {
   });
 
   it("does not reuse details across session generations or credential selections", async () => {
-    const h = harness();
     await h.load();
     h.state.status = 404;
     const nextSession = await loadControlUiSessionPullRequestChecks(target, {
@@ -323,7 +317,6 @@ describe("session PR CI details", () => {
   });
 
   it("rejects a client-selected PR/head absent from the session without fetching details", async () => {
-    const h = harness();
     expect(
       await loadControlUiSessionPullRequestChecks({ ...target, number: 999 }, h.deps),
     ).toMatchObject({ status: "unavailable", checks: [] });
@@ -334,7 +327,6 @@ describe("session PR CI details", () => {
   });
 
   it("bounds distinct concurrent detail loads without multiplying GitHub requests", async () => {
-    const h = harness();
     const gate = createDeferred<Response>();
     const started = createDeferred();
     let waiting = 0;
@@ -361,7 +353,6 @@ describe("session PR CI details", () => {
   });
 
   it("clears stale private details after access is revoked", async () => {
-    const h = harness();
     await h.load();
     h.state.status = 403;
     vi.advanceTimersByTime(30_001);
@@ -372,7 +363,6 @@ describe("session PR CI details", () => {
   });
 
   it("rejects repository redirects without dispatching credentials to a new target", async () => {
-    const h = harness();
     h.deps.fetchImpl.mockResolvedValue(
       new Response(null, {
         status: 301,
@@ -390,7 +380,6 @@ describe("session PR CI details", () => {
   it.each([true, false])(
     "rechecks live readers of coalesced details (remaining reader=%s)",
     async (remainingReader) => {
-      const h = harness();
       const gate = createDeferred<Response>();
       const started = createDeferred();
       h.deps.fetchImpl.mockImplementation(async (input, init) => {

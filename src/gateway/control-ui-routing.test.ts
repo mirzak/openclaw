@@ -1,8 +1,9 @@
-/**
- * Control UI gateway routing tests.
- */
 import { describe, expect, it } from "vitest";
 import { classifyControlUiRequest, isControlUiApprovalDocumentPath } from "./control-ui-routing.js";
+
+const serve = { kind: "serve", spaFallback: true } as const;
+const outside = { kind: "not-control-ui" } as const;
+const notFound = { kind: "not-found" } as const;
 
 describe("isControlUiApprovalDocumentPath", () => {
   it.each([
@@ -95,199 +96,44 @@ describe("Control UI SPA fallback Accept routing", () => {
 describe("classifyControlUiRequest", () => {
   describe("root-mounted control ui", () => {
     it.each([
-      ["serves the root entrypoint", "/", "GET", { kind: "serve" as const, spaFallback: true }],
+      ["serves the root entrypoint", "/", "GET", serve],
+      ["serves other read-only SPA routes", "/chat", "HEAD", serve],
+      ["plugin manager", "/settings/plugins", "GET", serve],
+      ["health probes", "/healthz", "GET", outside],
+      ["readiness probes", "/ready", "HEAD", outside],
+      ["plugin routes", "/plugins/webhook", "GET", outside],
+      ["marketplace root", "/plugins", "GET", serve],
+      ["marketplace root slash", "/plugins/", "GET", serve],
+      ["API routes", "/api/sessions", "GET", outside],
+      ["the device join root", "/j", "GET", outside],
+      ["device join codes", `/j/${"a".repeat(22)}`, "GET", outside],
+      ["the OpenAI-compatible API root", "/v1", "GET", outside],
+      ["the OpenAI-compatible API root slash", "/v1/", "HEAD", outside],
+      ["model discovery", "/v1/models", "GET", outside],
+      ["model details", "/v1/models/openclaw", "GET", outside],
+      ["responses", "/v1/responses", "HEAD", outside],
+      ["the standalone MCP App shell", "/__openclaw__/mcp-app", "GET", outside],
+      ["the standalone MCP App view", "/__openclaw__/mcp-app/view", "HEAD", outside],
+      ["MCP App lookalike", "/__openclaw__/mcp-apps", "GET", serve],
+      ["MCP App descendants", "/__openclaw__/mcp-app/other", "GET", outside],
+      ["worker admission", "/__openclaw__/worker", "GET", outside],
+      ["worker admission descendants", "/__openclaw__/worker/other", "GET", outside],
+      ["worker lookalike", "/__openclaw__/workers", "GET", serve],
       [
-        "serves other read-only SPA routes",
-        "/chat",
-        "HEAD",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "serves the plugin manager without claiming plugin HTTP routes",
-        "/settings/plugins",
-        "GET",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "keeps health probes outside the SPA catch-all",
-        "/healthz",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps readiness probes outside the SPA catch-all",
-        "/ready",
-        "HEAD",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps plugin routes outside the SPA catch-all",
-        "/plugins/webhook",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "serves the marketplace document at the plugin root",
-        "/plugins",
-        "GET",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "serves the marketplace document at the plugin root slash",
-        "/plugins/",
-        "GET",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "keeps API routes outside the SPA catch-all",
-        "/api/sessions",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps the device join root outside the SPA catch-all",
-        "/j",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps device join codes outside the SPA catch-all",
-        `/j/${"a".repeat(22)}`,
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps the OpenAI-compatible API root outside the SPA catch-all",
-        "/v1",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps the OpenAI-compatible API root slash outside the SPA catch-all",
-        "/v1/",
-        "HEAD",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps OpenAI-compatible model discovery outside the SPA catch-all",
-        "/v1/models",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps OpenAI-compatible model details outside the SPA catch-all",
-        "/v1/models/openclaw",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps OpenAI-compatible responses outside the SPA catch-all",
-        "/v1/responses",
-        "HEAD",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps the standalone MCP App shell outside the SPA catch-all",
-        "/__openclaw__/mcp-app",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps the standalone MCP App view outside the SPA catch-all",
-        "/__openclaw__/mcp-app/view",
-        "HEAD",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "preserves SPA routes that only resemble the standalone MCP App namespace",
-        "/__openclaw__/mcp-apps",
-        "GET",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "keeps MCP App descendants outside the SPA catch-all",
-        "/__openclaw__/mcp-app/other",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps worker admission outside the SPA catch-all",
-        "/__openclaw__/worker",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps worker admission descendants outside the SPA catch-all",
-        "/__openclaw__/worker/other",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "preserves SPA routes that only resemble worker admission",
-        "/__openclaw__/workers",
-        "GET",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "keeps node workspace transfers outside the SPA catch-all",
+        "workspace transfers",
         "/__openclaw__/worker-transfer/v1/environments/worker%3A1/blobs/abc",
         "GET",
-        { kind: "not-control-ui" as const },
+        outside,
       ],
-      [
-        "keeps malformed node workspace transfer descendants outside the SPA catch-all",
-        "/__openclaw__/worker-transfer/other",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "preserves SPA routes that only resemble node workspace transfers",
-        "/__openclaw__/worker-transfers",
-        "GET",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "keeps health probe descendants outside the SPA catch-all",
-        "/healthz/details",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "keeps readiness probe trailing slashes outside the SPA catch-all",
-        "/readyz/",
-        "HEAD",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "preserves SPA routes that only resemble probe paths",
-        "/healthcheck",
-        "GET",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "preserves the SPA root that only resembles the OpenAI-compatible API",
-        "/v12",
-        "GET",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "preserves SPA routes that only resemble the OpenAI-compatible API",
-        "/v12/models",
-        "GET",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "returns not-found for legacy ui routes",
-        "/ui/settings",
-        "GET",
-        { kind: "not-found" as const },
-      ],
-      [
-        "falls through non-read requests",
-        "/imessage-webhook",
-        "POST",
-        { kind: "not-control-ui" as const },
-      ],
+      ["malformed workspace transfer", "/__openclaw__/worker-transfer/other", "GET", outside],
+      ["transfer lookalike", "/__openclaw__/worker-transfers", "GET", serve],
+      ["health probe descendants", "/healthz/details", "GET", outside],
+      ["readiness probe trailing slashes", "/readyz/", "HEAD", outside],
+      ["SPA lookalike: probe paths", "/healthcheck", "GET", serve],
+      ["API root lookalike", "/v12", "GET", serve],
+      ["API lookalike", "/v12/models", "GET", serve],
+      ["returns not-found for legacy ui routes", "/ui/settings", "GET", notFound],
+      ["falls through non-read requests", "/imessage-webhook", "POST", outside],
     ])("%s", (_name, pathname, method, expected) => {
       expect(
         classifyControlUiRequest({
@@ -307,21 +153,21 @@ describe("classifyControlUiRequest", () => {
         pathname: "/plugins/",
         method: "GET",
         accept: "text/html",
-        expected: { kind: "serve" as const, spaFallback: true },
+        expected: serve,
       },
       {
-        name: "keeps JSON catalogue reads outside the SPA",
+        name: "JSON catalogue reads outside the SPA",
         pathname: "/plugins",
         method: "GET",
         accept: "application/json",
-        expected: { kind: "not-control-ui" as const },
+        expected: outside,
       },
       {
-        name: "keeps JSON catalogue slash reads outside the SPA",
+        name: "JSON catalogue slash reads outside the SPA",
         pathname: "/plugins/",
         method: "GET",
         accept: "application/json",
-        expected: { kind: "not-control-ui" as const },
+        expected: outside,
       },
     ])("$name", ({ pathname, method, accept, expected }) => {
       expect(
@@ -345,55 +191,13 @@ describe("classifyControlUiRequest", () => {
         "GET",
         { kind: "redirect" as const, location: "/openclaw/?foo=1" },
       ],
-      [
-        "serves nested read-only routes",
-        "/openclaw/chat",
-        "",
-        "HEAD",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "serves the plugin catalogue under a configured basePath",
-        "/openclaw/plugins",
-        "",
-        "GET",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "serves the plugin catalogue slash under a configured basePath",
-        "/openclaw/plugins/",
-        "",
-        "GET",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "serves the plugin manager under a configured basePath",
-        "/openclaw/settings/plugins",
-        "",
-        "GET",
-        { kind: "serve" as const, spaFallback: true },
-      ],
-      [
-        "falls through unmatched paths",
-        "/elsewhere/chat",
-        "",
-        "GET",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "falls through write requests to the basePath entrypoint",
-        "/openclaw",
-        "",
-        "POST",
-        { kind: "not-control-ui" as const },
-      ],
-      [
-        "falls through write requests to a subroute",
-        "/openclaw/webhook",
-        "",
-        "PATCH",
-        { kind: "not-control-ui" },
-      ],
+      ["serves nested read-only routes", "/openclaw/chat", "", "HEAD", serve],
+      ["catalogue", "/openclaw/plugins", "", "GET", serve],
+      ["catalogue slash", "/openclaw/plugins/", "", "GET", serve],
+      ["plugin manager", "/openclaw/settings/plugins", "", "GET", serve],
+      ["falls through unmatched paths", "/elsewhere/chat", "", "GET", outside],
+      ["write entrypoint", "/openclaw", "", "POST", outside],
+      ["write subroute", "/openclaw/webhook", "", "PATCH", outside],
     ])("%s", (_name, pathname, search, method, expected) => {
       expect(
         classifyControlUiRequest({

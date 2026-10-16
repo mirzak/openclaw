@@ -16,21 +16,34 @@ const CHANGED_EVENT = "controlUi.sessionPullRequests.changed";
 const READY: ControlUiSessionPullRequests = { pullRequests: [], rateLimited: false };
 
 describe("recipient publication lifetimes", () => {
-  let active: ReturnType<typeof createTestControlUiSessionPrSubscriptions> | undefined;
+  let running: ReturnType<typeof createTestControlUiSessionPrSubscriptions> | undefined;
+  let broadcastToConnIds: ReturnType<typeof vi.fn>;
   let clock: ReturnType<typeof createGatewaySchedulerClock>;
   let scheduler: ReturnType<typeof createTestGatewayScheduler>;
 
   beforeEach(() => {
+    broadcastToConnIds = vi.fn();
     clock = createGatewaySchedulerClock(Date.now());
     scheduler = createTestGatewayScheduler(clock.clock);
+    vi.useFakeTimers();
   });
 
   afterEach(async () => {
-    await active?.stop();
+    await running?.stop();
     await scheduler.stop();
-    active = undefined;
+    running = undefined;
     vi.useRealTimers();
   });
+
+  type Options = Parameters<typeof createTestControlUiSessionPrSubscriptions>[0];
+  function start(options: Omit<Options, "scheduler" | "broadcastToConnIds">) {
+    running = createTestControlUiSessionPrSubscriptions({
+      scheduler,
+      broadcastToConnIds,
+      ...options,
+    });
+    return running;
+  }
 
   const target: ControlUiSessionPrTarget = {
     params: { sessionKey: "shared", agentId: "main" },
@@ -55,17 +68,13 @@ describe("recipient publication lifetimes", () => {
   it.each(["selection", "grant"] as const)(
     "continues delivery when a recipient's prepared %s changes",
     async (boundary) => {
-      vi.useFakeTimers();
       const entered = createDeferred();
       const release = createDeferred();
       const access = new AbortController();
       let generation = 0;
       let holdRecipient = false;
       let snapshot = READY;
-      const broadcastToConnIds = vi.fn();
-      active = createTestControlUiSessionPrSubscriptions({
-        scheduler,
-        broadcastToConnIds,
+      const active = start({
         load: async () => snapshot,
         prepareRead: async (connId) => async () => {
           if (boundary === "grant" && connId === "recipient" && access.signal.aborted) {
@@ -132,17 +141,13 @@ describe("recipient publication lifetimes", () => {
   );
 
   it("acknowledges a forced result equal to the normal poll queued before it", async () => {
-    vi.useFakeTimers();
     const normalEntered = createDeferred();
     const normalRelease = createDeferred();
     const forcedEntered = createDeferred();
     const forcedRelease = createDeferred();
     const admitted = createDeferred();
     let holdNormal = false;
-    const broadcastToConnIds = vi.fn();
-    active = createTestControlUiSessionPrSubscriptions({
-      scheduler,
-      broadcastToConnIds,
+    const active = start({
       load: async ({ refresh }) => {
         if (refresh) {
           forcedEntered.resolve();
@@ -182,16 +187,12 @@ describe("recipient publication lifetimes", () => {
   });
 
   it("acknowledges a refresh admitted after that viewer received the in-flight result", async () => {
-    vi.useFakeTimers();
     const entered = createDeferred();
     const release = createDeferred();
     const admitted = createDeferred();
     let holdRecipient = false;
     const load = vi.fn(async ({ refresh }: { refresh?: boolean }) => (refresh ? changed : READY));
-    const broadcastToConnIds = vi.fn();
-    active = createTestControlUiSessionPrSubscriptions({
-      scheduler,
-      broadcastToConnIds,
+    const active = start({
       load,
       prepareRead: async (connId) => async () => {
         if (connId === "recipient" && holdRecipient) {
@@ -229,7 +230,6 @@ describe("recipient publication lifetimes", () => {
   });
 
   it("keeps a pending replacement when its last old watch loses visibility", async () => {
-    vi.useFakeTimers();
     const entered = createDeferred();
     const release = createDeferred();
     const retired = createDeferred();
@@ -240,10 +240,7 @@ describe("recipient publication lifetimes", () => {
       }
       return READY;
     });
-    const broadcastToConnIds = vi.fn();
-    active = createTestControlUiSessionPrSubscriptions({
-      scheduler,
-      broadcastToConnIds,
+    const active = start({
       load,
       prepareRead: async (_connId, session) => {
         if (session.sessionKey === "new") {
@@ -280,7 +277,6 @@ describe("recipient publication lifetimes", () => {
   });
 
   it("does not let a superseded preparation overwrite a current refresh request", async () => {
-    vi.useFakeTimers();
     const oldEntered = createDeferred();
     const oldRelease = createDeferred();
     const blockedEntered = createDeferred();
@@ -295,10 +291,7 @@ describe("recipient publication lifetimes", () => {
       }
       return READY;
     });
-    const broadcastToConnIds = vi.fn();
-    active = createTestControlUiSessionPrSubscriptions({
-      scheduler,
-      broadcastToConnIds,
+    const active = start({
       load,
       prepareRead: async (_connId, session) => {
         if (session.sessionKey === "blocked") {
@@ -344,14 +337,10 @@ describe("recipient publication lifetimes", () => {
   });
 
   it("does not revive a retired admission after its connection ID is reused", async () => {
-    vi.useFakeTimers();
     const entered = createDeferred();
     const held = createDeferred();
     const load = vi.fn(async () => READY);
-    const broadcastToConnIds = vi.fn();
-    active = createTestControlUiSessionPrSubscriptions({
-      scheduler,
-      broadcastToConnIds,
+    const active = start({
       load,
       prepareRead: async (_connId, session) => {
         if (session.sessionKey === "retired") {
@@ -385,16 +374,12 @@ describe("recipient publication lifetimes", () => {
   it.each(["grant", "all"] as const)(
     "keeps pending shared reads authorized by surviving viewers after %s retirement",
     async (retirement) => {
-      vi.useFakeTimers();
       const entered = createDeferred();
       const held = createDeferred();
       const access = { survivor: new AbortController(), departing: new AbortController() };
-      const broadcastToConnIds = vi.fn();
       let holdLoad = false;
       let authorized = false;
-      active = createTestControlUiSessionPrSubscriptions({
-        scheduler,
-        broadcastToConnIds,
+      const active = start({
         prepareRead: async (connId) => {
           const grant = connId === "survivor" ? access.survivor : access.departing;
           const preparedTarget = {
@@ -443,7 +428,6 @@ describe("recipient publication lifetimes", () => {
   );
 
   it("checks the recipient's prepared authority when another watcher joins before send", async () => {
-    vi.useFakeTimers();
     const recipientEntered = createDeferred();
     const recipientRead = createDeferred<ControlUiSessionPrTarget>();
     const joiningEntered = createDeferred();
@@ -452,10 +436,7 @@ describe("recipient publication lifetimes", () => {
     const recipientTarget = { ...target, assertCurrent: () => access.signal.throwIfAborted() };
     let holdRecipient = false;
     let snapshot = READY;
-    const broadcastToConnIds = vi.fn();
-    active = createTestControlUiSessionPrSubscriptions({
-      scheduler,
-      broadcastToConnIds,
+    const active = start({
       load: async () => snapshot,
       prepareRead: async (connId) => () => {
         if (connId === "joining") {
@@ -506,16 +487,12 @@ describe("recipient publication lifetimes", () => {
   it.each(["pending", "prepared"] as const)(
     "does not revive a removed watcher whose delivery read is %s",
     async (boundary) => {
-      vi.useFakeTimers();
       const entered = createDeferred();
       const held = createDeferred<ControlUiSessionPrTarget>();
       let holdRecipient = false;
       let snapshot = READY;
       let cacheSignal: AbortSignal | undefined;
-      const broadcastToConnIds = vi.fn();
-      active = createTestControlUiSessionPrSubscriptions({
-        scheduler,
-        broadcastToConnIds,
+      const active = start({
         load: async (_params, signal) => {
           cacheSignal = signal;
           return snapshot;
