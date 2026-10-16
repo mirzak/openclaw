@@ -248,44 +248,35 @@ describe("node worker output framing", () => {
     },
   );
 
-  it("delivers an earlier frame before rejecting a later oversized frame in the same chunk", async () => {
+  it.each<[boolean, number]>([
+    [true, 1],
+    [false, 0],
+    [false, 1],
+  ])("bounds stdout (journal ready: %s, bytes over cap: %s)", async (journaled, delta) => {
     const harness = observationHarness();
-    await harness.send(
-      Buffer.concat([encodeResult("first"), Buffer.alloc(NODE_WORKER_STDOUT_MAX_BYTES + 1, 120)]),
+    if (journaled) {
+      await harness.send();
+    }
+    harness.stdout.write(
+      Buffer.concat([
+        journaled ? encodeResult("first") : sizedResult("first", NODE_WORKER_STDOUT_MAX_BYTES / 2),
+        journaled
+          ? Buffer.alloc(NODE_WORKER_STDOUT_MAX_BYTES + 1, 120)
+          : sizedResult("second", NODE_WORKER_STDOUT_MAX_BYTES / 2 + delta),
+      ]),
     );
     await harness.firstChunkConsumed;
-
-    expect(harness.frames).toEqual([resultFrame("first")]);
-    expect(await harness.close()).toMatchObject(overflow);
-    expect(harness.kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+    expect(harness.frames).toEqual(journaled ? [resultFrame("first")] : []);
+    expect(harness.kill).toHaveBeenCalledTimes(delta);
+    const outcome = await harness.close();
+    expect(outcome).toMatchObject(delta > 0 ? overflow : { state: "completed" });
+    if (delta) {
+      expect(harness.kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
+    }
+    expect(harness.frames.map((frame) => ("turnId" in frame ? frame.turnId : undefined))).toEqual(
+      journaled ? ["first"] : delta > 0 ? [] : ["first", "second"],
+    );
   });
-
-  it.each([0, 1])(
-    "bounds aggregate output including delimiters at cap + %i before journal readiness",
-    async (delta) => {
-      const harness = observationHarness();
-      harness.stdout.write(
-        Buffer.concat([
-          sizedResult("first", NODE_WORKER_STDOUT_MAX_BYTES / 2),
-          sizedResult("second", NODE_WORKER_STDOUT_MAX_BYTES / 2 + delta),
-        ]),
-      );
-      await harness.firstChunkConsumed;
-
-      expect(harness.frames).toEqual([]);
-      expect(harness.kill).toHaveBeenCalledTimes(delta > 0 ? 1 : 0);
-      const outcome = await harness.close();
-      if (delta > 0) {
-        expect(outcome).toMatchObject(overflow);
-        expect(harness.frames).toEqual([]);
-      } else {
-        expect(outcome).toMatchObject({ state: "completed" });
-        expect(
-          harness.frames.map((frame) => ("turnId" in frame ? frame.turnId : undefined)),
-        ).toEqual(["first", "second"]);
-      }
-    },
-  );
 
   it.each<[string, Buffer, number]>([
     ["empty output", Buffer.alloc(0), 0],
@@ -322,16 +313,10 @@ describe("node worker cleanup observation", () => {
     await harness.send(encodeResult("first"));
     const outcome = await harness.close();
 
-    if (uncertain) {
-      expect(outcome).toMatchObject({
-        state: "failed",
-        errorText: expect.stringContaining("cleanup"),
-      });
-      expect(outcome.errorText).not.toContain("framing-fixture-token");
-      expect(outcome.resultJson).toBeUndefined();
-    } else {
-      expect(outcome).toEqual(completed());
-    }
+    expect(outcome).toEqual(
+      uncertain ? { state: "failed", errorText: expect.stringContaining("cleanup") } : completed(),
+    );
+    expect(outcome.errorText ?? "").not.toContain("framing-fixture-token");
     expect(harness.frames).toEqual([resultFrame("first")]);
   });
 

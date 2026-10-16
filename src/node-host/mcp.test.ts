@@ -1,14 +1,14 @@
-/** Tests node-host MCP startup, descriptors, calls, and failure isolation. */
-
 import { ErrorCode, type CallToolResult, type Tool } from "@modelcontextprotocol/sdk/types.js";
 import { expectDefined } from "@openclaw/normalization-core";
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { OpenClawSchema } from "../config/zod-schema.js";
 import { GatewayClient } from "../gateway/client.js";
 import { useFrozenTime, useRealTime } from "../test-utils/frozen-time.js";
 import { handleInvoke } from "./invoke.js";
 import { callTool, createClient, okResult, startManager, transport } from "./mcp.test-support.js";
+
+afterEach(useRealTime);
 
 function tool(name: string, description?: string): Tool {
   return {
@@ -29,11 +29,7 @@ function itWithFrozenClock(name: string, run: () => Promise<void>): void {
   it(name, async () => {
     // Non-timeout catalog proofs must not spend the separately tested catalog deadline.
     useFrozenTime(1_000);
-    try {
-      await run();
-    } finally {
-      useRealTime();
-    }
+    await run();
   });
 }
 
@@ -305,47 +301,43 @@ describe("node host MCP manager", () => {
   it("isolates slow unique-cursor pagination at one catalog deadline", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);
-    try {
-      let page = 0;
-      const slow = createClient({
-        list: async () => {
-          await new Promise<void>((resolve) => {
-            setTimeout(resolve, 30);
-          });
-          page += 1;
-          return { tools: [tool(`tool-${page}`)], nextCursor: `cursor-${page}` };
-        },
-      });
-      const healthy = createClient({ tools: [tool("search")] });
-      const warn = vi.fn();
-      const starting = startManager(
-        {
-          createClient: (serverName) => (serverName === "slow" ? slow : healthy),
-          resolveTransport: () => ({ ...transport, requestTimeoutMs: 50 }),
-          warn,
-        },
-        { slow: { command: "slow" }, healthy: { command: "healthy" } },
-      );
+    let page = 0;
+    const slow = createClient({
+      list: async () => {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 30);
+        });
+        page += 1;
+        return { tools: [tool(`tool-${page}`)], nextCursor: `cursor-${page}` };
+      },
+    });
+    const healthy = createClient({ tools: [tool("search")] });
+    const warn = vi.fn();
+    const starting = startManager(
+      {
+        createClient: (serverName) => (serverName === "slow" ? slow : healthy),
+        resolveTransport: () => ({ ...transport, requestTimeoutMs: 50 }),
+        warn,
+      },
+      { slow: { command: "slow" }, healthy: { command: "healthy" } },
+    );
 
-      await vi.advanceTimersByTimeAsync(50);
-      const manager = await starting;
+    await vi.advanceTimersByTimeAsync(50);
+    const manager = await starting;
 
-      expect(slow.request).toHaveBeenCalledTimes(2);
-      expect(slow.request.mock.calls.map((call) => call[2]?.timeout)).toEqual([50, 50]);
-      expect(slow.close).toHaveBeenCalledOnce();
-      expect(warn).toHaveBeenCalledOnce();
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining("timed out after 50ms"));
-      expect(manager.descriptors.map((descriptor) => descriptor.name)).toEqual(["healthy_search"]);
-      await expect(manager.callMcpTool({ server: "healthy", tool: "search" })).resolves.toEqual(
-        okResult,
-      );
+    expect(slow.request).toHaveBeenCalledTimes(2);
+    expect(slow.request.mock.calls.map((call) => call[2]?.timeout)).toEqual([50, 50]);
+    expect(slow.close).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("timed out after 50ms"));
+    expect(manager.descriptors.map((descriptor) => descriptor.name)).toEqual(["healthy_search"]);
+    await expect(manager.callMcpTool({ server: "healthy", tool: "search" })).resolves.toEqual(
+      okResult,
+    );
 
-      await vi.advanceTimersByTimeAsync(10);
-      await manager.close();
-      expect(healthy.close).toHaveBeenCalledOnce();
-    } finally {
-      vi.useRealTimers();
-    }
+    await vi.advanceTimersByTimeAsync(10);
+    await manager.close();
+    expect(healthy.close).toHaveBeenCalledOnce();
   });
 
   itWithFrozenClock(
@@ -400,36 +392,32 @@ describe("node host MCP manager", () => {
 
   it("closes a server when startup is aborted during paginated listing", async () => {
     vi.useFakeTimers();
-    try {
-      const controller = new AbortController();
-      const client = createClient({
-        list: async () =>
-          await new Promise<{ tools: Tool[] }>(() => {
-            // The startup abort owns closing the client behind this pending SDK request.
-          }),
-      });
-      const createClientMock = vi.fn(() => client);
-      const warn = vi.fn();
-      const starting = startManager({
-        createClient: createClientMock,
-        signal: controller.signal,
-        warn,
-      });
-      await vi.waitFor(() => expect(client.request).toHaveBeenCalledOnce());
+    const controller = new AbortController();
+    const client = createClient({
+      list: async () =>
+        await new Promise<{ tools: Tool[] }>(() => {
+          // The startup abort owns closing the client behind this pending SDK request.
+        }),
+    });
+    const createClientMock = vi.fn(() => client);
+    const warn = vi.fn();
+    const starting = startManager({
+      createClient: createClientMock,
+      signal: controller.signal,
+      warn,
+    });
+    await vi.waitFor(() => expect(client.request).toHaveBeenCalledOnce());
 
-      controller.abort();
-      const manager = await starting;
+    controller.abort();
+    const manager = await starting;
 
-      expect(client.close).toHaveBeenCalledOnce();
-      expect(manager.descriptors).toEqual([]);
-      expect(warn).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(5 * 60_000);
-      expect(createClientMock).toHaveBeenCalledOnce();
-      await manager.close();
-      expect(client.close).toHaveBeenCalledOnce();
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(client.close).toHaveBeenCalledOnce();
+    expect(manager.descriptors).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(createClientMock).toHaveBeenCalledOnce();
+    await manager.close();
+    expect(client.close).toHaveBeenCalledOnce();
   });
 
   it("cancels an in-flight MCP tool when its node invocation is aborted", async () => {

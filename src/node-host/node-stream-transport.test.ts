@@ -11,7 +11,6 @@ import { WebSocketServer } from "ws";
 import { WebSocket } from "../../packages/gateway-client/src/websocket.js";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { TEST_TLS_CERT_PEM, TEST_TLS_KEY_PEM } from "../../test/helpers/tls-fixture.js";
-import { onInternalDiagnosticEvent } from "../infra/diagnostic-events.js";
 import { createSuiteLogPathTracker } from "../logging/log-test-helpers.js";
 import { flushLogger, resetLogger, setLoggerOverride } from "../logging/logger.js";
 import { createDiagnosticLogRecordCapture } from "../logging/test-helpers/diagnostic-log-capture.js";
@@ -30,9 +29,7 @@ function runStream(
   });
 }
 async function listenServer(server: net.Server) {
-  await new Promise<void>((resolve) => {
-    server.listen(0, "127.0.0.1", resolve);
-  });
+  await once(server.listen(0, "127.0.0.1"), "listening");
   return (server.address() as AddressInfo).port;
 }
 async function close(server: net.Server | WebSocketServer) {
@@ -52,12 +49,14 @@ function scheduleTimer(callback: () => void, delayMs: number) {
 function targetStream() {
   return new Duplex({
     read() {},
-    write(_chunk, _encoding, callback) {
-      callback();
-    },
+    write: (_chunk, _encoding, callback) => callback(),
   });
 }
-async function streamHarness(server: net.Server, target = targetStream()) {
+async function streamHarness(
+  server: net.Server,
+  target = targetStream(),
+  closePeers?: () => void | Promise<void>,
+) {
   const gatewayUrl = `ws://127.0.0.1:${await listenServer(server)}`;
   const controller = new AbortController();
   return {
@@ -68,6 +67,7 @@ async function streamHarness(server: net.Server, target = targetStream()) {
     async cleanup() {
       controller.abort();
       target.destroy();
+      await closePeers?.();
       await close(server);
     },
   };
@@ -78,20 +78,13 @@ async function websocketHarness(onConnection?: (ws: WebSocket) => void, target?:
   if (onConnection) {
     wss.on("connection", onConnection);
   }
-  const harness = await streamHarness(server, target);
-  return {
-    ...harness,
-    wss,
-    async cleanup() {
-      harness.controller.abort();
-      harness.target.destroy();
-      for (const client of wss.clients) {
-        client.terminate();
-      }
-      await close(wss);
-      await harness.cleanup();
-    },
-  };
+  const harness = await streamHarness(server, target, async () => {
+    for (const client of wss.clients) {
+      client.terminate();
+    }
+    await close(wss);
+  });
+  return { ...harness, wss };
 }
 // Raw peers deliberately leave the websocket/TCP close handshake incomplete.
 function rawGateway(onFrame: (socket: net.Socket) => void, onPeer?: (socket: net.Socket) => void) {
@@ -133,36 +126,29 @@ function rawGateway(onFrame: (socket: net.Socket) => void, onPeer?: (socket: net
 async function rawFrameHarness(frame: number[], onPeer?: (socket: net.Socket) => void) {
   let peer: net.Socket | undefined;
   let sent = false;
-  const harness = await streamHarness(
-    rawGateway(
-      (socket) => {
-        if (!sent) {
-          sent = true;
-          socket.write(Buffer.from(frame));
-        }
-      },
-      (socket) => {
-        peer = socket;
-        onPeer?.(socket);
-      },
-    ),
-  );
-  return {
-    ...harness,
-    destroyPeer: () => peer?.destroy(),
-    async cleanup() {
-      harness.controller.abort();
-      harness.target.destroy();
-      peer?.destroy();
-      await harness.cleanup();
+  const server = rawGateway(
+    (socket) => {
+      if (!sent) {
+        sent = true;
+        socket.write(Buffer.from(frame));
+      }
     },
+    (socket) => {
+      peer = socket;
+      onPeer?.(socket);
+    },
+  );
+  const destroyPeer = () => {
+    peer?.destroy();
   };
+  return { ...(await streamHarness(server, undefined, destroyPeer)), destroyPeer };
 }
 
 const fingerprint = new X509Certificate(TEST_TLS_CERT_PEM).fingerprint256;
 const ticket = "1".repeat(48);
 const logPaths = createSuiteLogPathTracker("node-stream-diagnostics-");
 const logCaptures: ReturnType<typeof createDiagnosticLogRecordCapture>[] = [];
+const STREAM_CLOSED = "node stream closed";
 
 beforeAll(async () => logPaths.setup());
 beforeEach(() =>
@@ -185,7 +171,6 @@ afterAll(async () => logPaths.cleanup());
 
 describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) => {
   it.each([
-    // Teardown shares one splice; vary close modes once and retain both target/TLS routes.
     ...["desktop", "portal"].flatMap((streamName) =>
       (["target-eof", "gateway-close", "gateway-terminate", "owner-abort"] as const)
         .filter((closeMode) => closeMode === "target-eof" || (!managed && streamName === "desktop"))
@@ -307,7 +292,7 @@ describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) =>
           await expect
             .poll(async () => {
               await logCapture.flush();
-              return logCapture.records.filter((record) => record.message === "node stream closed");
+              return logCapture.records.filter((record) => record.message === STREAM_CLOSED);
             })
             .toHaveLength(1);
           const trigger =
@@ -319,7 +304,7 @@ describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) =>
           const closeCode =
             closeMode === "gateway-close" ? 1012 : closeMode === "target-eof" ? 1005 : 1006;
           const terminalRecord = logCapture.records.find(
-            (record) => record.message === "node stream closed",
+            (record) => record.message === STREAM_CLOSED,
           );
           expect(terminalRecord?.attributes).toMatchObject({
             streamKind: streamName,
@@ -341,11 +326,7 @@ describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) =>
         await running;
         await expect.poll(() => sockets.size).toBe(0);
         if (!correctPin) {
-          expect({ bytes, frames, accessHeaders }).toEqual({
-            bytes: 0,
-            frames: [],
-            accessHeaders: [],
-          });
+          expect([bytes, frames, accessHeaders]).toEqual([0, [], []]);
         }
         expect(tunnels).toBe(managed ? 1 : 0);
       } finally {
@@ -449,119 +430,105 @@ describe("node stream close acknowledgement", () => {
       targetPeer = peer;
     });
     const targetPort = await listenServer(targetServer);
-    const closedLog = createDeferred();
-    const stopClosedLog = onInternalDiagnosticEvent((event) => {
-      if (event.type === "log.record" && event.message === "node stream closed") {
-        closedLog.resolve();
-      }
-    });
-    let failure: unknown;
     let ack: (() => void) | undefined;
     const ackArmed = createDeferred();
-    const running = harness
-      .run({
-        attachPath: `/node-desktop/attach?ticket=${ticket}`,
-        target: { port: targetPort },
-        closeAckMs: 40,
-        scheduleCloseAck: (callback, delayMs) => {
-          if (delayMs === 40) {
-            ack = callback;
-            ackArmed.resolve();
-            return () => {
-              if (ack === callback) {
-                ack = undefined;
-              }
-            };
-          }
-          return scheduleTimer(callback, delayMs);
-        },
-      })
-      .catch((error: unknown) => {
-        failure = error;
-      });
+    const running = harness.run({
+      attachPath: `/node-desktop/attach?ticket=${ticket}`,
+      target: { port: targetPort },
+      closeAckMs: 40,
+      scheduleCloseAck: (callback, delayMs) => {
+        if (delayMs === 40) {
+          ack = callback;
+          ackArmed.resolve();
+          return () => {
+            if (ack === callback) {
+              ack = undefined;
+            }
+          };
+        }
+        return scheduleTimer(callback, delayMs);
+      },
+    });
+    const settled = running.catch(() => undefined);
     try {
       await gotFrame.promise;
       targetPeer?.end();
       await ackArmed.promise;
       ack?.();
       await running;
-      expect(failure).toBeUndefined();
-      await closedLog.promise;
-      await logCapture.flush();
-      expect(
-        logCapture.records.find((record) => record.message === "node stream closed")?.attributes,
-      ).toMatchObject({
-        streamKind: "desktop",
-        trigger: "target-close",
-        closeCode: 1006,
-      });
+      await expect
+        .poll(async () => {
+          await logCapture.flush();
+          return logCapture.records.find((record) => record.message === STREAM_CLOSED)?.attributes;
+        })
+        .toMatchObject({
+          streamKind: "desktop",
+          trigger: "target-close",
+          closeCode: 1006,
+        });
     } finally {
       harness.controller.abort();
-      await running;
+      await settled;
       targetPeer?.destroy();
       await close(targetServer);
       await harness.cleanup();
-      stopClosedLog();
     }
   });
-
-  async function expectFlushBudget(payload: Buffer) {
-    let receivedSevens = 0;
-    const received = createDeferred();
-    const harness = await websocketHarness((ws) => {
-      ws.on("message", (data, isBinary) => {
-        if (!isBinary) {
-          return;
-        }
-        receivedSevens += rawDataToString(data, "latin1").split("\x07").length - 1;
-        if (receivedSevens >= payload.length) {
-          received.resolve();
-        }
-      });
-    });
-    const connected = createDeferred<net.Socket>();
-    const targetServer = net.createServer((peer) => {
-      connected.resolve(peer);
-    });
-    const targetPort = await listenServer(targetServer);
-    const delays: number[] = [];
-    const running = harness.run({
-      target: { port: targetPort },
-      closeAckMs: 40,
-      scheduleCloseAck: (callback, delayMs) => {
-        delays.push(delayMs);
-        if (delayMs >= 30_000) {
-          return () => undefined;
-        }
-        return scheduleTimer(callback, delayMs);
-      },
-    });
-    let targetPeer: net.Socket | undefined;
-    try {
-      targetPeer = await connected.promise;
-      targetPeer.write(payload);
-      targetPeer.end();
-      await received.promise;
-      for (const client of harness.wss.clients) {
-        client.close();
-      }
-      await running;
-      expect(delays).not.toContain(40);
-      expect(delays).not.toContain(5_000);
-      expect(receivedSevens).toBe(payload.length);
-    } finally {
-      harness.controller.abort();
-      await running;
-      targetPeer?.destroy();
-      await close(targetServer);
-      await harness.cleanup();
-    }
-  }
 
   it.each([1024, 200 * 1024])(
     "waits out a %i-byte forward instead of the short close acknowledgement",
     async (size) => {
-      await expectFlushBudget(Buffer.alloc(size, 7));
+      const payload = Buffer.alloc(size, 7);
+      let receivedSevens = 0;
+      const received = createDeferred();
+      const harness = await websocketHarness((ws) => {
+        ws.on("message", (data, isBinary) => {
+          if (!isBinary) {
+            return;
+          }
+          receivedSevens += rawDataToString(data, "latin1").split("\x07").length - 1;
+          if (receivedSevens >= payload.length) {
+            received.resolve();
+          }
+        });
+      });
+      const connected = createDeferred<net.Socket>();
+      const targetServer = net.createServer((peer) => {
+        connected.resolve(peer);
+      });
+      const targetPort = await listenServer(targetServer);
+      const delays: number[] = [];
+      const running = harness.run({
+        target: { port: targetPort },
+        closeAckMs: 40,
+        scheduleCloseAck: (callback, delayMs) => {
+          delays.push(delayMs);
+          if (delayMs >= 30_000) {
+            return () => undefined;
+          }
+          return scheduleTimer(callback, delayMs);
+        },
+      });
+      let targetPeer: net.Socket | undefined;
+      try {
+        targetPeer = await connected.promise;
+        targetPeer.write(payload);
+        targetPeer.end();
+        await received.promise;
+        for (const client of harness.wss.clients) {
+          client.close();
+        }
+        await running;
+        expect(delays).not.toContain(40);
+        expect(delays).not.toContain(5_000);
+        expect(receivedSevens).toBe(payload.length);
+      } finally {
+        harness.controller.abort();
+        await running;
+        targetPeer?.destroy();
+        await close(targetServer);
+        await harness.cleanup();
+      }
     },
   );
 
@@ -597,9 +564,7 @@ describe("node stream close acknowledgement", () => {
   });
 
   it("completes a drained forward when the gateway acknowledges close", async () => {
-    const harness = await websocketHarness((ws) => {
-      ws.on("message", () => undefined);
-    });
+    const harness = await websocketHarness();
     const { target } = harness;
     target.on("end", () => target.destroy());
     const delays: number[] = [];
@@ -641,10 +606,8 @@ describe("node stream close acknowledgement", () => {
     });
     const closeSpy = vi.spyOn(WebSocket.prototype, "close");
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    let failure: unknown;
-    const running = harness.run().catch((error: unknown) => {
-      failure = error;
-    });
+    const running = harness.run();
+    const settled = running.catch(() => undefined);
     try {
       await receivedFin.promise;
       expect(harness.target.readableEnded).toBe(false);
@@ -657,12 +620,11 @@ describe("node stream close acknowledgement", () => {
       expect(client.readyState).toBe(WebSocket.CLOSED);
       await closed;
       await running;
-      expect(failure).toBeUndefined();
     } finally {
       harness.controller.abort();
       harness.target.destroy();
       harness.destroyPeer();
-      await running;
+      await settled;
       closeSpy.mockRestore();
       vi.useRealTimers();
       await harness.cleanup();
