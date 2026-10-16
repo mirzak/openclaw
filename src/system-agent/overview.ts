@@ -93,7 +93,7 @@ function buildAgentSummaries(cfg: OpenClawConfig, defaultAgentId: string): Syste
       id,
       isDefault: id === defaultAgentId,
     };
-    if (typeof entry.name === "string") {
+    if (entry.name !== undefined) {
       summary.name = entry.name;
     }
     const model = resolveConfiguredPrimaryModelForAgent({ cfg, agentId: id });
@@ -104,7 +104,7 @@ function buildAgentSummaries(cfg: OpenClawConfig, defaultAgentId: string): Syste
     if (utility.kind === "explicit") {
       summary.utilityModel = utility.modelRef;
     }
-    if (typeof entry.workspace === "string") {
+    if (entry.workspace !== undefined) {
       summary.workspace = entry.workspace;
     }
     summaries.push(summary);

@@ -146,7 +146,7 @@ export async function finalizeCronRun(params: {
       contextTokens,
       promptTokens,
     });
-    if (typeof totalTokens === "number" && Number.isFinite(totalTokens) && totalTokens > 0) {
+    if (totalTokens !== undefined && totalTokens > 0) {
       prepared.cronSession.sessionEntry.totalTokens = totalTokens;
       prepared.cronSession.sessionEntry.totalTokensFresh = true;
       prepared.cronSession.sessionEntry.totalTokensVersion = SESSION_TOTAL_TOKENS_VERSION;

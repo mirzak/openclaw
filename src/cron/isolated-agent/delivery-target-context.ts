@@ -117,9 +117,7 @@ export async function readCronDeliveryTargetContexts(
           ? {
               sessionId: context ? (threadSessionKey ?? mainSessionKey) : selected!.sessionId,
               updatedAt: context ? 0 : selected!.updatedAt,
-              delivery: context
-                ? normalizeSessionDeliveryState({ context })
-                : structuredClone(selected?.delivery),
+              delivery: context ? normalizeSessionDeliveryState({ context }) : selected?.delivery,
             }
           : undefined,
       usedSharedMainFallback: !context && !threadEntry && mainEntry !== undefined,

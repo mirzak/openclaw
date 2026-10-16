@@ -99,12 +99,12 @@ export async function resolveCronModelSelectionOwner(params: {
   publishedRuntime?: PreparedReplyDispatchRuntime;
 }): Promise<CronModelSelectionOwner> {
   const owner = params.publishedRuntime
-    ? Object.freeze({
+    ? {
         ...params.publishedRuntime,
         metadataSnapshot: params.publishedRuntime.pluginGeneration.pluginMetadataSnapshot,
         modelCatalog:
           params.publishedRuntime.readFullModelCatalog?.() ?? params.publishedRuntime.modelCatalog,
-      })
+      }
     : await loadResolvedPublishedModelCatalogOwner({
         config: params.cfg,
         ...(params.agentId ? { agentId: params.agentId } : {}),
@@ -282,10 +282,7 @@ export async function resolveCronModelSelection(
   };
 
   const modelOverrideRaw = params.payload.kind === "agentTurn" ? params.payload.model : undefined;
-  const payloadSelection = override(
-    typeof modelOverrideRaw === "string" ? modelOverrideRaw.trim() : undefined,
-    "payload",
-  );
+  const payloadSelection = override(modelOverrideRaw?.trim(), "payload");
   if (payloadSelection) {
     return payloadSelection;
   }

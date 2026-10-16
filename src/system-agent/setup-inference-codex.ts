@@ -175,7 +175,7 @@ export async function prepareAutomaticSetupCodex(params: {
   const leaseOptions = { signal: params.signal, assertCurrent: params.beforePersistentApply };
   return await withPluginLifecycleLease(leaseOptions, async () => {
     const { ensureCodexRuntimePluginForSupervision } =
-      await import("../commands/codex-runtime-plugin-install.js");
+      await import("../commands/runtime-plugin-install.js");
     const prepared = await prepareCodexRuntimePlugin({
       ...params,
       automaticSetup: true,
@@ -197,7 +197,7 @@ export async function stageCodexCandidate(
   return await withPluginLifecycleLease(leaseOptions, async () => {
     const ensureCodex =
       ctx.deps.ensureCodexRuntimePlugin ??
-      (await import("../commands/codex-runtime-plugin-install.js"))
+      (await import("../commands/runtime-plugin-install.js"))
         .ensureCodexRuntimePluginForModelSelection;
     const prepared = await prepareCodexRuntimePlugin({
       cfg: ctx.cfg,

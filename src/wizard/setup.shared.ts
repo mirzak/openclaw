@@ -255,7 +255,7 @@ export async function requireRiskAcknowledgement(params: {
   return applySecurityAcknowledgement(params.config);
 }
 
-function applySecurityAcknowledgement(config: OpenClawConfig): OpenClawConfig {
+export function applySecurityAcknowledgement(config: OpenClawConfig): OpenClawConfig {
   if (config.wizard?.securityAcknowledgedAt) {
     return config;
   }

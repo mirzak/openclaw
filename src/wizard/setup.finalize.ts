@@ -246,8 +246,7 @@ export async function ensureGatewayServiceForOnboarding(params: {
     });
   }
 
-  const explicitInstallDaemon =
-    typeof opts.installDaemon === "boolean" ? opts.installDaemon : undefined;
+  const explicitInstallDaemon = opts.installDaemon;
   let installDaemon: boolean;
   if (explicitInstallDaemon !== undefined) {
     installDaemon = explicitInstallDaemon;

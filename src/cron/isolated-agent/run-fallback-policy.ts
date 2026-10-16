@@ -65,9 +65,8 @@ export function resolveCronFallbacksOverride(params: {
   inheritDefaultFallbacksForAgentStringModel?: boolean;
 }): string[] | undefined {
   const payload = params.job.payload.kind === "agentTurn" ? params.job.payload : undefined;
-  const payloadFallbacks = Array.isArray(payload?.fallbacks) ? payload.fallbacks : undefined;
-  const hasCronPayloadModelOverride =
-    typeof payload?.model === "string" && payload.model.trim().length > 0;
+  const payloadFallbacks = payload?.fallbacks;
+  const hasCronPayloadModelOverride = Boolean(payload?.model?.trim());
   if (payloadFallbacks !== undefined) {
     return payloadFallbacks;
   }

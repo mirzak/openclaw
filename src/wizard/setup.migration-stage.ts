@@ -179,16 +179,8 @@ export async function createSetupMigrationStage(params: {
     path.basename(params.reportDir),
   );
   const stageEnv = { ...process.env, OPENCLAW_STATE_DIR: stagedStateDir };
-  let currentStagedConfig: OpenClawConfig = {
-    ...structuredClone(params.targetConfig),
-    agents: {
-      ...structuredClone(params.targetConfig.agents),
-      defaults: {
-        ...structuredClone(params.targetConfig.agents?.defaults),
-        workspace: stagedWorkspaceDir,
-      },
-    },
-  };
+  let currentStagedConfig = structuredClone(params.targetConfig);
+  ((currentStagedConfig.agents ??= {}).defaults ??= {}).workspace = stagedWorkspaceDir;
   const stagedPaths = {
     stateDir: stagedStateDir,
     workspaceDir: stagedWorkspaceDir,
@@ -204,10 +196,10 @@ export async function createSetupMigrationStage(params: {
   const toFinal = toStage.map(([finalPath, stagedPath]) => [stagedPath, finalPath] as const);
   const projectConfigToFinal = (config: OpenClawConfig) =>
     projectValue(config, toFinal) as OpenClawConfig;
-  let finalConfig = structuredClone(params.targetConfig);
+  let finalConfig = params.targetConfig;
   const getStagedConfig = () => structuredClone(currentStagedConfig);
   const replaceStagedConfig = (config: OpenClawConfig) => {
-    finalConfig = structuredClone(projectConfigToFinal(config));
+    finalConfig = projectConfigToFinal(config);
     currentStagedConfig = structuredClone(config);
   };
   const mutateConfigFile = async (
@@ -325,7 +317,7 @@ export async function createSetupMigrationStage(params: {
           "Migration config changed before promotion. Review it and retry.",
         );
       }
-      const configTarget = structuredClone(finalConfig);
+      const configTarget = finalConfig;
       // Shared state is owned by the live runtime. Promote durable import artifacts,
       // then merge the derived agent registry fact instead of replacing its database.
       const components: PromotionComponent[] = [

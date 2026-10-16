@@ -137,16 +137,13 @@ async function setupUnderOwner(
     };
   }
   if (shouldWriteWorkspace && !writeInheritedWorkspaceOverride) {
-    const roster = structuredClone(listAgentEntries(next));
-    if (snapshot.exists && defaultEntryWorkspace) {
-      for (const entry of roster) {
-        if (normalizeAgentId(entry.id) === selectedAgentId) {
-          // An explicit workspace follows the resolved setup owner. Fresh and inherited
-          // workspaces stay in defaults so setup does not duplicate them into the roster.
-          entry.workspace = workspace;
-        }
-      }
-    }
+    // Only an existing explicit workspace follows the selected owner; inherited
+    // workspaces stay in defaults rather than being duplicated into the roster.
+    const roster = listAgentEntries(next).map((entry) =>
+      snapshot.exists && defaultEntryWorkspace && normalizeAgentId(entry.id) === selectedAgentId
+        ? Object.assign({}, entry, { workspace })
+        : entry,
+    );
     const entries = roster.length > 0 ? toAgentEntriesRecord(roster) : undefined;
     next = {
       ...next,

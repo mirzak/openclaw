@@ -162,7 +162,7 @@ describe("offsite backup CLI", () => {
     });
   });
 
-  it("stops retention when namespace takeover follows the first delete's ownership check", async () => {
+  it("stops retention when namespace takeover occurs during delete preparation", async () => {
     await withNamespaceRace(async (fixture) => {
       const expired = [
         "20260101T000000Z-11111111.tar.gz",
@@ -173,23 +173,16 @@ describe("offsite backup CLI", () => {
         await fs.writeFile(path.join(fixture.namespaceDir, key), Buffer.alloc(200));
       }
       const deleted: string[] = [];
-      let nextMarker = false;
       let displaced = false;
       fixture.intercept((backend) => {
         const get = backend.getObject;
         const remove = backend.deleteObject;
         backend.getObject = async (key, opts) => {
-          if (key === "openclaw-storage.json" && nextMarker) {
-            nextMarker = false;
+          if (key === "openclaw-storage.json" && deleted.length === 1 && !displaced) {
             displaced = true;
             await fixture.takeOver();
           }
-          const body = await get(key, opts);
-          if (key.endsWith("/owner.json") && deleted.length === 1 && !displaced) {
-            // Let the early claim read finish, then take over during the delete's marker check.
-            nextMarker = true;
-          }
-          return body;
+          return await get(key, opts);
         };
         backend.deleteObject = async (key, opts) => {
           await remove(key, opts);

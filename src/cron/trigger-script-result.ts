@@ -46,7 +46,7 @@ export function parseTriggerResult(
   return {
     kind: "evaluated",
     fire: candidate.fire,
-    ...(typeof candidate.message === "string" ? { message: candidate.message } : {}),
+    ...(candidate.message !== undefined ? { message: candidate.message } : {}),
     ...(state.stateChanged ? { state: state.state } : {}),
   };
 }

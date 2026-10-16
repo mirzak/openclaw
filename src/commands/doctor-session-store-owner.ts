@@ -100,18 +100,6 @@ export async function prepareSessionStoreOwnerRecovery(params: {
       );
       break;
     }
-    let currentBackup: string | undefined;
-    try {
-      currentBackup = readDoctorConfigBackup(backupPath);
-    } catch {
-      // Loss of readable evidence after confirmation must leave the candidate untouched.
-    }
-    if (currentBackup !== raw) {
-      unchanged.warnings.push(
-        `${backupPath} changed or became unreadable while confirming ${OWNER_KEY}; nothing was restored. Rerun Doctor to inspect the current backup.`,
-      );
-      break;
-    }
     const config = structuredClone(params.config);
     config.agents ??= {};
     config.agents.defaults ??= {};

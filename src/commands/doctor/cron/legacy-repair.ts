@@ -79,6 +79,7 @@ export type LegacyCronRepairState = {
   legacyQuarantine?: LegacyCronQuarantine;
   invalidConfigRows: QuarantinedCronConfigJob[];
   persistedQuarantine: CronQuarantinedJob[];
+  persistedQuarantineError?: string;
   projectedOwnersByJobId: ReadonlyMap<string, CronOwnerProjection>;
   rawJobs: Array<Record<string, unknown>>;
   jobsFingerprint: string | undefined;
@@ -134,11 +135,13 @@ export async function loadLegacyCronRepairState(params: {
     return null;
   }
   let persistedQuarantine: CronQuarantinedJob[];
+  let persistedQuarantineError: string | undefined;
   try {
     persistedQuarantine = await loadCronQuarantinedJobs(storePath, params.env);
   } catch (err) {
     rethrowSqliteSchemaVersionError(err);
     persistedQuarantine = [];
+    persistedQuarantineError = errorMessage(err);
   }
 
   const loaded = params.readOnly
@@ -195,6 +198,7 @@ export async function loadLegacyCronRepairState(params: {
     legacyQuarantine,
     invalidConfigRows,
     persistedQuarantine,
+    ...(persistedQuarantineError !== undefined ? { persistedQuarantineError } : {}),
     projectedOwnersByJobId,
     rawJobs: currentJobs,
     jobsFingerprint: loaded.jobsFingerprint,
@@ -534,7 +538,7 @@ export async function repairCronCodexModelRefsAfterConfigWrite(params: {
     if (!params.migrateCodexModelRefs && !params.repairRetiredModelRefs) {
       const loaded = await loadCronJobsStoreWithConfigJobsReadOnly(storePath);
       const { store } = loaded;
-      const repaired = structuredClone(store);
+      const repaired = { ...store, jobs: [...store.jobs] };
       const changes: string[] = [];
       for (const [index, job] of repaired.jobs.entries()) {
         const {

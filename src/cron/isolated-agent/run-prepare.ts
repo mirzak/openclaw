@@ -304,10 +304,7 @@ export async function prepareCronRunContext(params: {
         sessionKey: runSessionKey,
       });
       if (!cronSession.sessionEntry.label?.trim() && baseSessionKey.startsWith("cron:")) {
-        const labelSuffix =
-          typeof input.job.name === "string" && input.job.name.trim()
-            ? input.job.name.trim()
-            : input.job.id;
+        const labelSuffix = input.job.name.trim() || input.job.id;
         cronSession.sessionEntry.label = `Automation: ${labelSuffix}`;
       }
 

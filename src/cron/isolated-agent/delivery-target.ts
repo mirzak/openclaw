@@ -156,8 +156,8 @@ export async function resolveDeliveryTarget(
     sessionContext?: CronDeliveryTargetContext;
   },
 ): Promise<DeliveryTargetResolution> {
-  const requestedChannel = typeof jobPayload.channel === "string" ? jobPayload.channel : "last";
-  const explicitTo = typeof jobPayload.to === "string" ? jobPayload.to : undefined;
+  const requestedChannel = jobPayload.channel ?? "last";
+  const explicitTo = jobPayload.to;
   const allowMismatchedLastTo = requestedChannel === "last";
   const deliveryTargetRuntime = await deliveryTargetRuntimeLoader.load();
   const source = jobPayload.sourceConversation;
@@ -251,8 +251,7 @@ export async function resolveDeliveryTarget(
   // Prefer an explicit accountId from the job's delivery config (set via
   // --account on cron add/edit). Fall back to the session's lastAccountId,
   // then to the agent's bound account from bindings config.
-  const explicitAccountId =
-    typeof jobPayload.accountId === "string" ? jobPayload.accountId.trim() || undefined : undefined;
+  const explicitAccountId = jobPayload.accountId?.trim() || undefined;
   let accountId = explicitAccountId ?? resolved.accountId;
   if (!accountId && channel) {
     accountId = deliveryTargetRuntime.resolveFirstBoundAccountId({
