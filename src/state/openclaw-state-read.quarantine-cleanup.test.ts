@@ -109,6 +109,29 @@ function knownQuarantine(kind: "state" | "agent") {
   return reason;
 }
 
+function fail(error: Error) {
+  return () => {
+    throw error;
+  };
+}
+
+function agentOptions(agentId: string) {
+  const input = request();
+  const agentPath = path.join(path.dirname(input.databasePath), "openclaw-agent.sqlite");
+  fs.writeFileSync(agentPath, "mock agent source");
+  return { agentId, path: agentPath, env: input.context.environment };
+}
+
+function openFailure(options: ReturnType<typeof agentOptions>) {
+  try {
+    openOpenClawAgentDatabase(options);
+  } catch (error) {
+    assert(error instanceof Error);
+    return error;
+  }
+  throw new Error("Expected agent database admission to fail");
+}
+
 it.each([
   { known: true, readFails: false, closeFails: false },
   { known: true, readFails: false, closeFails: true },
@@ -123,14 +146,10 @@ it.each([
     const readFailure = new Error("quarantine metadata read failed");
     const closeFailure = new Error("quarantine native reader close failed");
     if (readFails) {
-      mock.read.mockImplementationOnce(() => {
-        throw readFailure;
-      });
+      mock.read.mockImplementationOnce(fail(readFailure));
     }
     if (closeFails) {
-      mock.close.mockImplementationOnce(() => {
-        throw closeFailure;
-      });
+      mock.close.mockImplementationOnce(fail(closeFailure));
     }
     const reply = await mock.handler(input);
     if (known) {
@@ -157,68 +176,45 @@ it.each([
   },
 );
 
-it("latches a known agent quarantine when metadata cleanup fails before source activation", () => {
-  const input = request();
-  const reason = knownQuarantine("agent");
-  const closeFailure = new Error("agent quarantine reader close failed after a valid decision");
-  mock.close.mockImplementationOnce(() => {
-    throw closeFailure;
-  });
-  const agentPath = path.join(path.dirname(input.databasePath), "openclaw-agent.sqlite");
-  fs.writeFileSync(agentPath, "mock agent source");
-  const options = { agentId: "quarantined-agent", path: agentPath, env: input.context.environment };
-  let failure: unknown;
-  try {
-    openOpenClawAgentDatabase(options);
-  } catch (error) {
-    failure = error;
-  }
-  assert(failure instanceof Error);
-  expect(failure).toMatchObject({
-    name: "SqliteIntegrityError",
-    message: expect.stringContaining(reason),
-    cause: { errors: [closeFailure] },
-  });
-  expect(mock.claimAgentLease).not.toHaveBeenCalled();
-  expect(mock.open).toHaveBeenCalledOnce();
-  expect(mock.close).toHaveBeenCalledOnce();
-
-  mock.open.mockClear();
-  expect(() => openOpenClawAgentDatabase(options)).toThrow(failure);
-  expect(mock.open).not.toHaveBeenCalled();
-});
-
-it.each([false, true])(
-  "keeps agent cleanup failures retryable without a validated decision (read also fails=%s)",
-  (readFails) => {
-    const input = request();
+it.each([
+  { known: true, readFails: false },
+  { known: false, readFails: false },
+  { known: false, readFails: true },
+])(
+  "latches known agent quarantine but retries unvalidated cleanup failures (%j)",
+  ({ known, readFails }) => {
+    const options = agentOptions("quarantine-agent");
+    const reason = known ? knownQuarantine("agent") : undefined;
     const readFailure = new Error("agent quarantine metadata unavailable");
     const closeFailure = new Error("agent quarantine reader close failed");
     if (readFails) {
-      mock.read.mockImplementation(() => {
-        throw readFailure;
-      });
+      mock.read.mockImplementation(fail(readFailure));
     }
-    mock.close.mockImplementation(() => {
-      throw closeFailure;
-    });
-    const agentPath = path.join(path.dirname(input.databasePath), "openclaw-agent.sqlite");
-    fs.writeFileSync(agentPath, "mock agent source");
-    const options = { agentId: "retryable-agent", path: agentPath, env: input.context.environment };
+    mock.close.mockImplementation(fail(closeFailure));
+    let firstFailure: Error | undefined;
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      let failure: unknown;
-      try {
-        openOpenClawAgentDatabase(options);
-      } catch (error) {
-        failure = error;
+      const failure = openFailure(options);
+      if (known) {
+        expect(failure).toMatchObject({
+          name: "SqliteIntegrityError",
+          message: expect.stringContaining(reason!),
+          cause: { errors: [closeFailure] },
+        });
+        if (attempt === 1) {
+          expect(failure).toBe(firstFailure);
+        }
+      } else {
+        expect(failure).toBeInstanceOf(AggregateError);
+        expect(failure).toMatchObject({
+          name: "OpenClawQuarantineReadCleanupError",
+          errors: [...(readFails ? [readFailure] : []), closeFailure],
+        });
+        expect(failure.cause).toBe(readFails ? readFailure : closeFailure);
       }
-      assert(failure instanceof AggregateError);
-      expect(failure.name).toBe("OpenClawQuarantineReadCleanupError");
-      expect(failure.errors).toEqual([...(readFails ? [readFailure] : []), closeFailure]);
-      expect(failure.cause).toBe(readFails ? readFailure : closeFailure);
+      firstFailure = failure;
+      expect(mock.open).toHaveBeenCalledTimes(known ? 1 : attempt + 1);
+      expect(mock.close).toHaveBeenCalledTimes(known ? 1 : attempt + 1);
     }
-    expect(mock.open).toHaveBeenCalledTimes(2);
-    expect(mock.close).toHaveBeenCalledTimes(2);
     expect(mock.claimAgentLease).not.toHaveBeenCalled();
   },
 );
