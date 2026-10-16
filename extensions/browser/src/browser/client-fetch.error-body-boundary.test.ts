@@ -29,22 +29,52 @@ const SUCCESS_STREAM_BODY_BYTES = 33 * 1024 * 1024;
 const BROWSER_SUCCESS_BODY_LIMIT_BYTES = 32 * 1024 * 1024;
 const MALFORMED_UTF8_STATUSES = [200, 401, 408, 500, 504] as const;
 
-function scheduleStreamChunk(writeNext: () => void): void {
-  // Separate event-loop turns preserve streaming and backpressure without a wall-clock sleep.
-  setImmediate(writeNext);
+function streamBody(res: http.ServerResponse, success: boolean, onClose: () => void) {
+  const chunk = success ? SUCCESS_STREAM_CHUNK : STREAM_CHUNK;
+  const total = success ? SUCCESS_STREAM_BODY_BYTES : STREAM_BODY_BYTES;
+  const state = { completed: false };
+  let written = 0;
+  let closed = false;
+  res.once("close", () => {
+    closed = true;
+    onClose();
+  });
+  res.writeHead(success ? 200 : 500, {
+    "Content-Type": success ? "application/json" : "text/plain",
+  });
+  if (success) {
+    res.write('{"payload":"');
+  }
+  const writeNext = () => {
+    if (closed) {
+      return;
+    }
+    if (written >= total) {
+      state.completed = true;
+      res.end(success ? '"}' : undefined);
+      return;
+    }
+    const next = chunk.subarray(0, total - written);
+    written += next.byteLength;
+    // Preserve separate event-loop turns and backpressure without wall-clock sleeps.
+    if (res.write(next)) {
+      setImmediate(writeNext);
+    } else {
+      res.once("drain", () => setImmediate(writeNext));
+    }
+  };
+  writeNext();
+  return state;
 }
 
 describe("fetchHttpJson error body boundary", () => {
   let server: http.Server;
   let baseUrl: string;
-  let streamClosed: Promise<void>;
-  let resolveStreamClosed: () => void;
-  let successStreamClosed: Promise<void>;
-  let resolveSuccessStreamClosed: () => void;
-  let malformedConnectionClosed: Map<number, Promise<void>>;
-  let resolveMalformedConnectionClosed: Map<number, () => void>;
-  let streamCompleted: boolean;
-  let successStreamCompleted: boolean;
+  let streamClosed: ReturnType<typeof Promise.withResolvers<void>>;
+  let successStreamClosed: ReturnType<typeof Promise.withResolvers<void>>;
+  let malformedConnectionClosed: Map<number, ReturnType<typeof Promise.withResolvers<void>>>;
+  let stream: ReturnType<typeof streamBody>;
+  let successStream: ReturnType<typeof streamBody>;
 
   beforeEach(async () => {
     for (const key of [
@@ -59,75 +89,28 @@ describe("fetchHttpJson error body boundary", () => {
     }
 
     vi.stubEnv("OPENCLAW_DEBUG_PROXY_ENABLED", "0");
-    streamClosed = new Promise<void>((resolve) => {
-      resolveStreamClosed = resolve;
-    });
-    successStreamClosed = new Promise<void>((resolve) => {
-      resolveSuccessStreamClosed = resolve;
-    });
-    malformedConnectionClosed = new Map();
-    resolveMalformedConnectionClosed = new Map();
-    for (const status of MALFORMED_UTF8_STATUSES) {
-      malformedConnectionClosed.set(
-        status,
-        new Promise<void>((resolve) => {
-          resolveMalformedConnectionClosed.set(status, resolve);
-        }),
-      );
-    }
-    streamCompleted = false;
-    successStreamCompleted = false;
+    streamClosed = Promise.withResolvers<void>();
+    successStreamClosed = Promise.withResolvers<void>();
+    malformedConnectionClosed = new Map(
+      MALFORMED_UTF8_STATUSES.map((status) => [status, Promise.withResolvers<void>()]),
+    );
     server = http.createServer((req, res) => {
       if (req.url === "/rate-limit") {
-        req.socket.once("close", () => resolveStreamClosed());
+        req.socket.once("close", () => streamClosed.resolve());
         res.writeHead(429, { "Content-Type": "application/json" });
         res.write('{"error":"rate-limited"');
         return;
       }
       const malformedStatus = Number(req.url?.match(/^\/malformed-utf8\/(\d+)$/)?.[1]);
       if (MALFORMED_UTF8_STATUSES.some((status) => status === malformedStatus)) {
-        req.socket.once("close", () => resolveMalformedConnectionClosed.get(malformedStatus)?.());
+        req.socket.once("close", () => malformedConnectionClosed.get(malformedStatus)?.resolve());
         res.writeHead(malformedStatus, { "Content-Type": "application/json" });
-        res.end(
-          Buffer.concat([
-            Buffer.from('{"error":"control '),
-            Buffer.from([0xff]),
-            Buffer.from('"}'),
-          ]),
-        );
+        // Latin-1 emits a literal 0xff byte, invalid in UTF-8.
+        res.end(Buffer.from('{"error":"control \xff"}', "latin1"));
         return;
       }
       if (req.url === "/success-large") {
-        let written = 0;
-        let closed = false;
-        res.once("close", () => {
-          closed = true;
-          resolveSuccessStreamClosed();
-        });
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.write('{"payload":"');
-        const writeNext = () => {
-          if (closed) {
-            return;
-          }
-          if (written >= SUCCESS_STREAM_BODY_BYTES) {
-            successStreamCompleted = true;
-            res.end('"}');
-            return;
-          }
-          const remaining = SUCCESS_STREAM_BODY_BYTES - written;
-          const chunk =
-            remaining >= SUCCESS_STREAM_CHUNK.byteLength
-              ? SUCCESS_STREAM_CHUNK
-              : SUCCESS_STREAM_CHUNK.subarray(0, remaining);
-          written += chunk.byteLength;
-          if (res.write(chunk)) {
-            scheduleStreamChunk(writeNext);
-          } else {
-            res.once("drain", () => scheduleStreamChunk(writeNext));
-          }
-        };
-        writeNext();
+        successStream = streamBody(res, true, successStreamClosed.resolve);
         return;
       }
 
@@ -143,30 +126,7 @@ describe("fetchHttpJson error body boundary", () => {
         return;
       }
 
-      res.writeHead(500, { "Content-Type": "text/plain" });
-      let written = 0;
-      let closed = false;
-      res.once("close", () => {
-        closed = true;
-        resolveStreamClosed();
-      });
-      const writeNext = () => {
-        if (closed) {
-          return;
-        }
-        if (written >= STREAM_BODY_BYTES) {
-          streamCompleted = true;
-          res.end();
-          return;
-        }
-        written += STREAM_CHUNK.byteLength;
-        if (res.write(STREAM_CHUNK)) {
-          scheduleStreamChunk(writeNext);
-        } else {
-          res.once("drain", () => scheduleStreamChunk(writeNext));
-        }
-      };
-      writeNext();
+      stream = streamBody(res, false, streamClosed.resolve);
     });
     await new Promise<void>((resolve) => {
       server.listen(0, "127.0.0.1", resolve);
@@ -190,15 +150,15 @@ describe("fetchHttpJson error body boundary", () => {
     await expect(fetchBrowserJson(`${baseUrl}/rate-limit`, { signal })).rejects.toThrow(
       /rate[ -]?limit/i,
     );
-    await streamClosed;
+    await streamClosed.promise;
   });
 
   it("cancels an overflowing stream and releases the guarded fetch", async () => {
     const error = await fetchBrowserJson(`${baseUrl}/large`).catch((err: unknown) => err);
 
     expect(error).toMatchObject({ name: "BrowserServiceError", message: "HTTP 500" });
-    await expect(streamClosed).resolves.toBeUndefined();
-    expect(streamCompleted).toBe(false);
+    await expect(streamClosed.promise).resolves.toBeUndefined();
+    expect(stream.completed).toBe(false);
   });
 
   it("cancels an overflowing successful JSON response", async () => {
@@ -208,8 +168,8 @@ describe("fetchHttpJson error body boundary", () => {
       name: "BrowserServiceError",
       message: `Browser control response exceeded ${BROWSER_SUCCESS_BODY_LIMIT_BYTES} bytes`,
     });
-    await expect(successStreamClosed).resolves.toBeUndefined();
-    expect(successStreamCompleted).toBe(false);
+    await expect(successStreamClosed.promise).resolves.toBeUndefined();
+    expect(successStream.completed).toBe(false);
   });
 
   it("rejects malformed UTF-8 responses, preserves retry policy, and releases each fetch", async () => {
@@ -233,7 +193,7 @@ describe("fetchHttpJson error body boundary", () => {
       }
       const connectionClosed = malformedConnectionClosed.get(status);
       expect(connectionClosed).toBeDefined();
-      await expect(connectionClosed).resolves.toBeUndefined();
+      await expect(connectionClosed?.promise).resolves.toBeUndefined();
     }
   });
 

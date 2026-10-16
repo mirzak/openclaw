@@ -1,5 +1,4 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-// Browser tests cover client fetch.loopback auth plugin behavior.
+import type { BrowserProfileConfig, OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import "../test-support/browser-security.mock.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BrowserControlAuth } from "./control-auth.js";
@@ -30,17 +29,46 @@ vi.mock("openclaw/plugin-sdk/ssrf-runtime", async () => {
   };
 });
 
+function stubHttpError(body: unknown, status: number) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () => new Response(typeof body === "string" ? body : JSON.stringify(body), { status }),
+    ),
+  );
+}
+
+function stubFetchFailure(error: Error) {
+  vi.stubGlobal("fetch", vi.fn().mockRejectedValue(error));
+}
+
+function profileConfig(name: string, profile: BrowserProfileConfig, attachOnly?: boolean) {
+  mocks.loadConfig.mockReturnValue({
+    browser: {
+      defaultProfile: name,
+      profiles: { [name]: { color: "#00AA00", ...profile } },
+      ...(attachOnly === undefined ? {} : { attachOnly }),
+    },
+  });
+}
+
+function dispatchError(status: number, body: BrowserDispatchResponse["body"]) {
+  mocks.dispatch.mockResolvedValueOnce({ status, body });
+}
+
+const retryOnce = ["Retry the browser tool once", "If the same error persists"];
+const externalProfile = [
+  "browser profile is external to OpenClaw",
+  "Restarting the OpenClaw gateway will not launch it",
+];
+
 function okDispatchResponse(): BrowserDispatchResponse {
   return { status: 200, body: { ok: true } };
 }
 
 const mocks = vi.hoisted(() => ({
   loadConfig: vi.fn<() => OpenClawConfig>(() => ({
-    gateway: {
-      auth: {
-        token: "loopback-token",
-      },
-    },
+    gateway: { auth: { token: "loopback-token" } },
   })),
   resolveBrowserControlAuth: vi.fn<() => BrowserControlAuth>(() => ({
     token: "loopback-token",
@@ -96,22 +124,16 @@ function stubJsonFetchOk() {
 }
 
 function requireFetchInit(fetchMock: ReturnType<typeof stubJsonFetchOk>) {
-  const [call] = fetchMock.mock.calls;
-  if (!call) {
-    throw new Error("expected browser fetch call");
-  }
-  const [, init] = call;
-  return init;
+  expect(fetchMock).toHaveBeenCalled();
+  return fetchMock.mock.calls[0]![1];
 }
 
 async function expectThrownBrowserFetchError(
-  request: () => Promise<unknown>,
-  params: {
-    contains: string[];
-    omits?: string[];
-  },
+  url: string,
+  params: { contains: string[]; omits?: string[] },
+  options?: Parameters<typeof fetchBrowserJson>[1],
 ) {
-  const thrown = await request().catch((err: unknown) => err);
+  const thrown = await fetchBrowserJson(url, options).catch((err: unknown) => err);
   expect(thrown).toBeInstanceOf(Error);
   if (!(thrown instanceof Error)) {
     throw new Error(`Expected Error, got ${String(thrown)}`);
@@ -141,11 +163,7 @@ describe("fetchBrowserJson loopback auth", () => {
     vi.stubEnv("OPENCLAW_GATEWAY_TOKEN", "loopback-token");
     mocks.loadConfig.mockClear();
     mocks.loadConfig.mockReturnValue({
-      gateway: {
-        auth: {
-          token: "loopback-token",
-        },
-      },
+      gateway: { auth: { token: "loopback-token" } },
     });
     mocks.startBrowserControlServiceFromConfig.mockReset().mockResolvedValue({ ok: true });
     mocks.dispatch.mockReset().mockResolvedValue(okDispatchResponse());
@@ -211,69 +229,35 @@ describe("fetchBrowserJson loopback auth", () => {
   it("preserves dispatcher timeout context with retry-once hint", async () => {
     mocks.dispatch.mockRejectedValueOnce(new Error("Chrome CDP handshake timeout"));
 
-    await expectThrownBrowserFetchError(() => fetchBrowserJson<{ ok: boolean }>("/tabs"), {
-      contains: [
-        "Chrome CDP handshake timeout",
-        "openclaw browser doctor",
-        "Retry the browser tool once",
-        "If the same error persists",
-      ],
+    await expectThrownBrowserFetchError("/tabs", {
+      contains: ["Chrome CDP handshake timeout", "openclaw browser doctor", ...retryOnce],
       omits: ["Can't reach the OpenClaw browser control service", "Do NOT retry the browser tool"],
     });
   });
 
   it("avoids restart-gateway guidance for existing-session dispatcher timeouts", async () => {
-    mocks.loadConfig.mockReturnValue({
-      browser: {
-        defaultProfile: "user",
-        profiles: {
-          user: {
-            driver: "existing-session",
-            attachOnly: true,
-            color: "#00AA00",
-          },
-        },
-      },
+    profileConfig("user", {
+      driver: "existing-session",
+      attachOnly: true,
     });
     mocks.dispatch.mockRejectedValueOnce(new DOMException("operation aborted", "AbortError"));
 
-    await expectThrownBrowserFetchError(() => fetchBrowserJson<{ ok: boolean }>("/tabs"), {
-      contains: [
-        "operation aborted",
-        "browser profile is external to OpenClaw",
-        "Restarting the OpenClaw gateway will not launch it",
-      ],
+    await expectThrownBrowserFetchError("/tabs", {
+      contains: ["operation aborted", ...externalProfile],
       omits: ["Restart the OpenClaw gateway", "Do NOT retry the browser tool"],
     });
   });
 
   it("avoids restart-gateway guidance for remote CDP dispatcher timeouts", async () => {
-    mocks.loadConfig.mockReturnValue({
-      browser: {
-        defaultProfile: "remote",
-        profiles: {
-          remote: {
-            cdpUrl: "https://browserless.example/chrome?token=test",
-            color: "#00AA00",
-          },
-        },
-      },
+    profileConfig("remote", {
+      cdpUrl: "https://browserless.example/chrome?token=test",
     });
     mocks.dispatch.mockRejectedValueOnce(new Error("timed out"));
 
-    await expectThrownBrowserFetchError(
-      () => fetchBrowserJson<{ ok: boolean }>("/tabs?profile=remote"),
-      {
-        contains: [
-          "timed out",
-          "browser profile is external to OpenClaw",
-          "Restarting the OpenClaw gateway will not launch it",
-          "Retry the browser tool once",
-          "If the same error persists",
-        ],
-        omits: ["Restart the OpenClaw gateway", "Do NOT retry the browser tool"],
-      },
-    );
+    await expectThrownBrowserFetchError("/tabs?profile=remote", {
+      contains: ["timed out", ...externalProfile, ...retryOnce],
+      omits: ["Restart the OpenClaw gateway", "Do NOT retry the browser tool"],
+    });
   });
 
   it("suggests browser diagnostics when dispatcher profile resolution fails", async () => {
@@ -282,61 +266,35 @@ describe("fetchBrowserJson loopback auth", () => {
     });
     mocks.dispatch.mockRejectedValueOnce(new Error("Chrome CDP handshake timeout"));
 
-    await expectThrownBrowserFetchError(
-      () => fetchBrowserJson<{ ok: boolean }>("/tabs?profile=manual"),
-      {
-        contains: [
-          "Chrome CDP handshake timeout",
-          "openclaw browser doctor",
-          "Retry the browser tool once",
-          "If the same error persists",
-        ],
-        omits: ["browser profile is external to OpenClaw", "Do NOT retry the browser tool"],
-      },
-    );
+    await expectThrownBrowserFetchError("/tabs?profile=manual", {
+      contains: ["Chrome CDP handshake timeout", "openclaw browser doctor", ...retryOnce],
+      omits: ["browser profile is external to OpenClaw", "Do NOT retry the browser tool"],
+    });
   });
 
   it("keeps no-retry hint but not restart guidance for persistent external profile failures", async () => {
-    mocks.loadConfig.mockReturnValue({
-      browser: {
-        attachOnly: true,
-        defaultProfile: "manual",
-        profiles: {
-          manual: {
-            cdpUrl: "http://127.0.0.1:9222",
-            attachOnly: true,
-            color: "#00AA00",
-          },
-        },
-      },
-    });
+    profileConfig("manual", { cdpUrl: "http://127.0.0.1:9222", attachOnly: true }, true);
     mocks.dispatch.mockRejectedValueOnce(new Error("Chrome CDP connection refused"));
 
-    await expectThrownBrowserFetchError(
-      () => fetchBrowserJson<{ ok: boolean }>("/tabs?profile=manual"),
-      {
-        contains: [
-          "Chrome CDP connection refused",
-          "browser profile is external to OpenClaw",
-          "Do NOT retry the browser tool",
-        ],
-        omits: ["Restart the OpenClaw gateway"],
-      },
-    );
+    await expectThrownBrowserFetchError("/tabs?profile=manual", {
+      contains: [
+        "Chrome CDP connection refused",
+        "browser profile is external to OpenClaw",
+        "Do NOT retry the browser tool",
+      ],
+      omits: ["Restart the OpenClaw gateway"],
+    });
   });
 
   it("preserves validated structured errors from dispatcher routes", async () => {
-    mocks.dispatch.mockResolvedValueOnce({
-      status: 409,
-      body: {
-        error: "display required",
-        reason: "no_display_for_headed_profile",
-        details: {
-          profile: "openclaw",
-          requestedHeadless: false,
-          headlessSource: "request",
-          displayPresent: false,
-        },
+    dispatchError(409, {
+      error: "display required",
+      reason: "no_display_for_headed_profile",
+      details: {
+        profile: "openclaw",
+        requestedHeadless: false,
+        headlessSource: "request",
+        displayPresent: false,
       },
     });
 
@@ -358,33 +316,21 @@ describe("fetchBrowserJson loopback auth", () => {
   });
 
   it("keeps Browserbase-specific wording for Browserbase 429 responses", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("max concurrent sessions exceeded", { status: 429 })),
-    );
+    stubHttpError("max concurrent sessions exceeded", 429);
 
-    await expectThrownBrowserFetchError(
-      () => fetchBrowserJson<{ ok: boolean }>("https://connect.browserbase.com/session"),
-      {
-        contains: ["Browserbase rate limit reached", "upgrade your plan"],
-        omits: ["max concurrent sessions exceeded"],
-      },
-    );
+    await expectThrownBrowserFetchError("https://connect.browserbase.com/session", {
+      contains: ["Browserbase rate limit reached", "upgrade your plan"],
+      omits: ["max concurrent sessions exceeded"],
+    });
   });
 
   it("non-429 errors still produce generic messages", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response("internal error", { status: 500 })),
-    );
+    stubHttpError("internal error", 500);
 
-    await expectThrownBrowserFetchError(
-      () => fetchBrowserJson<{ ok: boolean }>("http://127.0.0.1:18888/"),
-      {
-        contains: ["internal error"],
-        omits: ["rate limit", "Retry the browser tool once", "Do NOT retry the browser tool"],
-      },
-    );
+    await expectThrownBrowserFetchError("http://127.0.0.1:18888/", {
+      contains: ["internal error"],
+      omits: ["rate limit", "Retry the browser tool once", "Do NOT retry the browser tool"],
+    });
   });
 
   it("uses operation metadata rather than timeout wording over HTTP", async () => {
@@ -392,26 +338,17 @@ describe("fetchBrowserJson loopback auth", () => {
       error: "locator.fill: Timeout 700ms exceeded: element is not editable",
       code: "ACT_OPERATION_FAILED",
     };
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response(JSON.stringify(body), { status: 500 })),
-    );
-    const error = await expectThrownBrowserFetchError(
-      () => fetchBrowserJson("http://127.0.0.1:18888/act"),
-      {
-        contains: [body.error],
-        omits: ["Retry the browser tool", "browser is currently unavailable", "Restart"],
-      },
-    );
+    stubHttpError(body, 500);
+    const error = await expectThrownBrowserFetchError("http://127.0.0.1:18888/act", {
+      contains: [body.error],
+      omits: ["Retry the browser tool", "browser is currently unavailable", "Restart"],
+    });
     expect(error).toMatchObject({ name: "BrowserServiceError", code: body.code, status: 500 });
   });
 
   it("keeps authentication failure advice even with operation metadata", async () => {
-    mocks.dispatch.mockResolvedValueOnce({
-      status: 401,
-      body: { error: "Unauthorized", code: "ACT_OPERATION_FAILED" },
-    });
-    await expectThrownBrowserFetchError(() => fetchBrowserJson("/act"), {
+    dispatchError(401, { error: "Unauthorized", code: "ACT_OPERATION_FAILED" });
+    await expectThrownBrowserFetchError("/act", {
       contains: ["Unauthorized", "Do NOT retry the browser tool"],
       omits: ["Retry the browser tool once"],
     });
@@ -420,44 +357,27 @@ describe("fetchBrowserJson loopback auth", () => {
   it("keeps pre-annotated persistent payload hints mutually exclusive", async () => {
     const persistentHint =
       "Do NOT retry the browser tool — it will keep failing. Use an alternative approach or inform the user that the browser is currently unavailable.";
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        async () =>
-          new Response(JSON.stringify({ error: `browser request timed out. ${persistentHint}` }), {
-            status: 504,
-          }),
-      ),
-    );
+    stubHttpError({ error: `browser request timed out. ${persistentHint}` }, 504);
 
-    await expectThrownBrowserFetchError(
-      () => fetchBrowserJson<{ ok: boolean }>("http://127.0.0.1:18888/"),
-      {
-        contains: ["browser request timed out", persistentHint],
-        omits: ["Retry the browser tool once"],
-      },
-    );
+    await expectThrownBrowserFetchError("http://127.0.0.1:18888/", {
+      contains: ["browser request timed out", persistentHint],
+      omits: ["Retry the browser tool once"],
+    });
   });
 
   it("keeps transient dispatcher error payloads retryable once", async () => {
-    mocks.dispatch.mockResolvedValueOnce({
-      status: 500,
-      body: { error: "read ECONNRESET" },
-    });
+    dispatchError(500, { error: "read ECONNRESET" });
 
-    await expectThrownBrowserFetchError(() => fetchBrowserJson<{ ok: boolean }>("/tabs"), {
-      contains: ["read ECONNRESET", "Retry the browser tool once", "If the same error persists"],
+    await expectThrownBrowserFetchError("/tabs", {
+      contains: ["read ECONNRESET", ...retryOnce],
       omits: ["Do NOT retry the browser tool"],
     });
   });
 
   it("surfaces 429 from dispatcher path as rate-limit error", async () => {
-    mocks.dispatch.mockResolvedValueOnce({
-      status: 429,
-      body: { error: "too many sessions" },
-    });
+    dispatchError(429, { error: "too many sessions" });
 
-    await expectThrownBrowserFetchError(() => fetchBrowserJson<{ ok: boolean }>("/tabs"), {
+    await expectThrownBrowserFetchError("/tabs", {
       contains: ["Browser service rate limit reached", "Do NOT retry the browser tool"],
       omits: ["too many sessions"],
     });
@@ -465,75 +385,43 @@ describe("fetchBrowserJson loopback auth", () => {
 
   it("uses nested reset causes to classify generic fetch failures as transient", async () => {
     const reset = Object.assign(new Error("socket closed"), { code: "ECONNRESET" });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        throw new TypeError("fetch failed", { cause: reset });
-      }),
-    );
+    stubFetchFailure(new TypeError("fetch failed", { cause: reset }));
 
-    await expectThrownBrowserFetchError(
-      () => fetchBrowserJson<{ ok: boolean }>("http://example.com/"),
-      {
-        contains: ["fetch failed", "Retry the browser tool once", "If the same error persists"],
-        omits: ["Do NOT retry the browser tool"],
-      },
-    );
+    await expectThrownBrowserFetchError("http://example.com/", {
+      contains: ["fetch failed", ...retryOnce],
+      omits: ["Do NOT retry the browser tool"],
+    });
   });
 
   it("uses nested refusal causes to keep unavailable services non-retryable", async () => {
     const refused = Object.assign(new Error("connect refused"), { code: "ECONNREFUSED" });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        throw new TypeError("browser request timed out", { cause: refused });
-      }),
-    );
+    stubFetchFailure(new TypeError("browser request timed out", { cause: refused }));
 
-    await expectThrownBrowserFetchError(
-      () => fetchBrowserJson<{ ok: boolean }>("http://example.com/"),
-      {
-        contains: ["browser request timed out", "Do NOT retry the browser tool"],
-        omits: ["Retry the browser tool once"],
-      },
-    );
+    await expectThrownBrowserFetchError("http://example.com/", {
+      contains: ["browser request timed out", "Do NOT retry the browser tool"],
+      omits: ["Retry the browser tool once"],
+    });
   });
 
   it("uses the default timeout for non-finite absolute HTTP timeout failures", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        throw new Error("timed out");
-      }),
-    );
+    stubFetchFailure(new Error("timed out"));
 
     await expectThrownBrowserFetchError(
-      () => fetchBrowserJson<{ ok: boolean }>("http://example.com/", { timeoutMs: Number.NaN }),
+      "http://example.com/",
       {
-        contains: [
-          "timed out after 5000ms",
-          "Retry the browser tool once",
-          "If the same error persists",
-        ],
+        contains: ["timed out after 5000ms", ...retryOnce],
         omits: ["NaNms", "Do NOT retry the browser tool"],
       },
+      { timeoutMs: Number.NaN },
     );
   });
 
   it("omits no-retry hint for absolute HTTP abort failures", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => {
-        throw new DOMException("operation aborted", "AbortError");
-      }),
-    );
+    stubFetchFailure(new DOMException("operation aborted", "AbortError"));
 
-    await expectThrownBrowserFetchError(
-      () => fetchBrowserJson<{ ok: boolean }>("http://example.com/"),
-      {
-        contains: ["Browser control request was cancelled"],
-        omits: ["Do NOT retry the browser tool"],
-      },
-    );
+    await expectThrownBrowserFetchError("http://example.com/", {
+      contains: ["Browser control request was cancelled"],
+      omits: ["Do NOT retry the browser tool"],
+    });
   });
 });
