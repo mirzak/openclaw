@@ -9,6 +9,7 @@ import type {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GatewayClientRequestError } from "../../packages/gateway-client/src/request-error.js";
 import { stripAnsi } from "../../packages/terminal-core/src/ansi.js";
+import { createDeferred } from "../../test/helpers/promise.js";
 import { createTuiQuestionController } from "./tui-questions.js";
 
 const UP = "\x1b[A";
@@ -16,6 +17,23 @@ const DOWN = "\x1b[B";
 const ENTER = "\r";
 const ESC = "\x1b";
 const TAB = "\t";
+const PASTE_ERROR = "Secret paste contains line breaks or unsupported control characters.";
+
+type Question = QuestionRecord["questions"][number];
+
+function question(overrides: Partial<Question> = {}): Question {
+  return {
+    questionId: "target",
+    header: "Target",
+    question: "Where should the sample run?",
+    options: [
+      { label: "Staging", description: "Use the test environment" },
+      { label: "Production" },
+    ],
+    isOther: true,
+    ...overrides,
+  };
+}
 
 function questionRecord(overrides: Partial<QuestionRecord> = {}): QuestionRecord {
   return {
@@ -25,23 +43,11 @@ function questionRecord(overrides: Partial<QuestionRecord> = {}): QuestionRecord
     createdAtMs: 1_000,
     expiresAtMs: 61_000,
     status: "pending",
-    questions: [
-      {
-        questionId: "target",
-        header: "Target",
-        question: "Where should the sample run?",
-        options: [
-          { label: "Staging", description: "Use the test environment" },
-          { label: "Production" },
-        ],
-        isOther: true,
-      },
-    ],
+    questions: [question()],
     ...overrides,
   };
 }
 
-type Question = QuestionRecord["questions"][number];
 const secretStore = {
   name: "EXAMPLE_KEY",
   kind: "secret",
@@ -81,16 +87,6 @@ const answered = {
   answers: { answers: { target: ["Staging"] } },
 } satisfies QuestionResolveResult;
 
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason: unknown) => void;
-  const promise = new Promise<T>((done, fail) => {
-    resolve = done;
-    reject = fail;
-  });
-  return { promise, resolve, reject };
-}
-
 const controllers: Array<ReturnType<typeof createTuiQuestionController>> = [];
 
 function createHarness(initialRecord?: QuestionRecord) {
@@ -114,19 +110,16 @@ function createHarness(initialRecord?: QuestionRecord) {
       getBounds: () => undefined,
     } satisfies OverlayHandle;
   });
-  const listQuestions = vi
-    .fn<() => Promise<QuestionListResult>>()
-    .mockResolvedValue({ questions: [] });
-  const getQuestion = vi
-    .fn<(id: string) => Promise<QuestionGetResult>>()
-    .mockResolvedValue({ question: questionRecord() });
-  const resolveQuestion = vi
-    .fn<(params: QuestionResolveParams) => Promise<QuestionResolveResult>>()
-    .mockImplementation(async (params) =>
+  const listQuestions = vi.fn(async (): Promise<QuestionListResult> => ({ questions: [] }));
+  const getQuestion = vi.fn<(id: string) => Promise<QuestionGetResult>>(async () => ({
+    question: questionRecord(),
+  }));
+  const resolveQuestion = vi.fn(
+    async (params: QuestionResolveParams): Promise<QuestionResolveResult> =>
       "cancel" in params
         ? { status: "cancelled" }
         : { status: "answered", answers: params.answers },
-    );
+  );
   const controller = createTuiQuestionController({
     client: { listQuestions, getQuestion, resolveQuestion },
     chatLog: { addSystem },
@@ -143,7 +136,6 @@ function createHarness(initialRecord?: QuestionRecord) {
     addSystem,
     onPendingChange,
     openOverlay,
-    closeOverlay,
     listQuestions,
     getQuestion,
     resolveQuestion,
@@ -172,6 +164,17 @@ function createHarness(initialRecord?: QuestionRecord) {
       expect(harness.render()).toBe("");
       expect(onPendingChange).toHaveBeenLastCalledWith("");
     },
+    expectPending(text: string) {
+      expect(onPendingChange).toHaveBeenLastCalledWith(expect.stringContaining(text));
+    },
+    expectOutcome(status: "answered" | "cancelled" | "expired") {
+      expect(addSystem).toHaveBeenCalledExactlyOnceWith(
+        `Question: ${status === "cancelled" ? "skipped" : status}.`,
+      );
+    },
+    expectSystemOnce(line: string) {
+      expect(addSystem.mock.calls.filter(([message]) => message === line)).toHaveLength(1);
+    },
     rawRender(width = 100) {
       return shown?.render(width).join("\n") ?? "";
     },
@@ -189,6 +192,14 @@ async function settle() {
   for (let index = 0; index < 8; index += 1) {
     await Promise.resolve();
   }
+}
+
+function startSubmission(record = questionRecord(), ...keys: string[]) {
+  const harness = createHarness(record);
+  const submission = createDeferred<QuestionResolveResult>();
+  harness.resolveQuestion.mockReturnValueOnce(submission.promise);
+  harness.input(...keys, ENTER);
+  return { harness, submission };
 }
 
 beforeEach(() => {
@@ -214,18 +225,17 @@ describe("TUI questions", () => {
       resolutionId: expect.any(String),
     });
     expect(harness.render()).toBe("");
-    expect(harness.addSystem).toHaveBeenCalledExactlyOnceWith("Question: answered.");
+    harness.expectOutcome("answered");
   });
 
   it("advances three questions and submits Other text with the selected answers", async () => {
     const harness = createHarness();
-    const first = questionRecord().questions[0]!;
     harness.request(
       questionRecord({
         questions: [
-          first,
-          { ...first, questionId: "region", header: "Region" },
-          { ...first, questionId: "timing", header: "Timing" },
+          question(),
+          question({ questionId: "region", header: "Region" }),
+          question({ questionId: "timing", header: "Timing" }),
         ],
       }),
     );
@@ -243,9 +253,7 @@ describe("TUI questions", () => {
   });
 
   it("toggles multiple options, combines Other, and waits for explicit confirmation", async () => {
-    const harness = createHarness(
-      questionRecord({ questions: [{ ...questionRecord().questions[0]!, multiSelect: true }] }),
-    );
+    const harness = createHarness(questionRecord({ questions: [question({ multiSelect: true })] }));
     harness.input("1", "2", " ", " ");
     expect(harness.render()).toContain("[x] 1. Staging");
     expect(harness.render()).toContain("[x] 2. Production");
@@ -261,7 +269,7 @@ describe("TUI questions", () => {
       id: "request-1",
       cancel: true,
     });
-    expect(harness.addSystem).toHaveBeenCalledExactlyOnceWith("Question: skipped.");
+    harness.expectOutcome("cancelled");
   });
 
   it.each([false, true])(
@@ -308,9 +316,7 @@ describe("TUI questions", () => {
       await harness.answer();
       if (isSecret) {
         expect(harness.resolveQuestion).not.toHaveBeenCalled();
-        expect(harness.render()).toContain(
-          "Secret paste contains line breaks or unsupported control characters.",
-        );
+        expect(harness.render()).toContain(PASTE_ERROR);
       } else {
         expect(harness.resolveQuestion).toHaveBeenCalledTimes(1);
       }
@@ -323,9 +329,7 @@ describe("TUI questions", () => {
     expect(harness.render()).not.toContain("prefix");
     harness.input("\x1b[200~bad\nvalue\x1b[201~", ENTER);
     expect(harness.resolveQuestion).not.toHaveBeenCalled();
-    expect(harness.render()).toContain(
-      "Secret paste contains line breaks or unsupported control characters.",
-    );
+    expect(harness.render()).toContain(PASTE_ERROR);
     expect(harness.render()).not.toContain("bad");
     await harness.answer("\x15", "\x1b[200~prefix\tsuffix\x1b[201~");
     expectAnswers(harness, { value: ["prefix\tsuffix"] });
@@ -342,9 +346,7 @@ describe("TUI questions", () => {
     harness.input("3", "Draft answer", ESC);
     expect(harness.render()).toBe("");
     expect(harness.resolveQuestion).not.toHaveBeenCalled();
-    expect(harness.onPendingChange).toHaveBeenLastCalledWith(
-      expect.stringContaining("/question to open"),
-    );
+    harness.expectPending("/question to open");
     await harness.controller.reopen();
     expect(harness.render()).toContain("Draft answer");
     await harness.answer();
@@ -356,9 +358,7 @@ describe("TUI questions", () => {
     harness.controller.handleEvent("question.requested", questionRecord({ id: "second" }));
     harness.input(ESC);
     expect(harness.render()).toBe("");
-    expect(harness.onPendingChange).toHaveBeenLastCalledWith(
-      expect.stringContaining("Question pending (2)"),
-    );
+    harness.expectPending("Question pending (2)");
     expect(harness.resolveQuestion).not.toHaveBeenCalled();
   });
 
@@ -379,12 +379,9 @@ describe("TUI questions", () => {
     const rendered = harness.rawRender();
     expect(rendered).toContain("Question");
     expect(rendered).toContain("Choice");
-    expect(rendered).not.toContain("\u001b]52");
-    expect(rendered).not.toContain("\u001b[2J");
-    expect(rendered).not.toContain("\u0000");
-    expect(rendered).not.toContain("\u0007");
-    expect(rendered).not.toContain("\u202e");
-    expect(rendered).not.toContain("\u2066");
+    for (const control of ["\u001b]52", "\u001b[2J", "\u0000", "\u0007", "\u202e", "\u2066"]) {
+      expect(rendered).not.toContain(control);
+    }
   });
 
   it("restores only the active session and agent, including after switching sessions", async () => {
@@ -399,8 +396,7 @@ describe("TUI questions", () => {
     expect(harness.render()).toContain("Target");
     harness.selectSession("other", "agent:other:main");
     await harness.controller.sessionChanged();
-    harness.input(ENTER);
-    await settle();
+    await harness.answer();
     expect(harness.resolveQuestion).toHaveBeenCalledWith(expect.objectContaining({ id: "other" }));
     expect(harness.listQuestions).toHaveBeenCalledTimes(2);
   });
@@ -431,7 +427,7 @@ describe("TUI questions", () => {
 
   it("keeps event requests and resolutions newer than an in-flight list snapshot", async () => {
     const harness = createHarness();
-    const listing = deferred<QuestionListResult>();
+    const listing = createDeferred<QuestionListResult>();
     harness.listQuestions.mockReturnValueOnce(listing.promise);
     const refresh = harness.controller.refresh();
     harness.controller.handleEvent("question.requested", questionRecord({ id: "newer" }));
@@ -444,21 +440,16 @@ describe("TUI questions", () => {
   });
 
   it("deduplicates a resolution event and its RPC response, even with a concurrent refresh", async () => {
-    const harness = createHarness();
-    const submission = deferred<QuestionResolveResult>();
-    harness.resolveQuestion.mockReturnValueOnce(submission.promise);
-    harness.request();
-    harness.input(ENTER);
+    const { harness, submission } = startSubmission();
     await harness.controller.refresh();
     expect(harness.openOverlay).toHaveBeenCalledTimes(1);
     harness.controller.handleEvent("question.resolved", {
       id: "request-1",
-      status: "answered",
-      answers: answered.answers,
+      ...answered,
     });
     submission.resolve(answered);
     await settle();
-    expect(harness.addSystem).toHaveBeenCalledExactlyOnceWith("Question: answered.");
+    harness.expectOutcome("answered");
   });
 
   it("shows a countdown and expires a collapsed question without resolving it", async () => {
@@ -466,10 +457,10 @@ describe("TUI questions", () => {
     expect(harness.render()).toContain("Expires in 2s");
     harness.input(ESC);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(harness.onPendingChange).toHaveBeenLastCalledWith(expect.stringContaining("1s"));
+    harness.expectPending("1s");
     await vi.advanceTimersByTimeAsync(1_000);
     expect(harness.onPendingChange).toHaveBeenLastCalledWith("");
-    expect(harness.addSystem).toHaveBeenCalledExactlyOnceWith("Question: expired.");
+    harness.expectOutcome("expired");
     expect(harness.resolveQuestion).not.toHaveBeenCalled();
   });
 
@@ -506,22 +497,18 @@ describe("TUI questions", () => {
       await harness.answer();
       expect(harness.getQuestion).toHaveBeenCalledWith("request-1");
       expect(harness.render()).toBe("");
-      expect(harness.addSystem).toHaveBeenCalledExactlyOnceWith(
-        `Question: ${status === "cancelled" ? "skipped" : status}.`,
-      );
+      harness.expectOutcome(status);
     },
   );
 
   it.each([true, false])(
     "reports saved-secret refresh failures even when the resolved event arrives first (%s)",
     async (eventFirst) => {
-      const submission = deferred<QuestionResolveResult>();
       const secret = "synthetic-secret-with-private-suffix";
-      const harness = createHarness(
+      const { harness, submission } = startSubmission(
         textQuestion({ questionId: "key", isSecret: true, secretStore }),
+        secret,
       );
-      harness.resolveQuestion.mockReturnValueOnce(submission.promise);
-      harness.input(secret, ENTER);
       if (eventFirst) {
         harness.controller.handleEvent("question.resolved", {
           id: "request-1",
@@ -568,9 +555,7 @@ describe("TUI questions", () => {
       });
       harness.listQuestions.mockResolvedValue({ questions: [] });
       await harness.controller[action]();
-      expect(
-        harness.addSystem.mock.calls.filter(([line]) => line === "Question: answered."),
-      ).toHaveLength(1);
+      harness.expectSystemOnce("Question: answered.");
       harness.expectDismissed();
     },
   );
@@ -590,25 +575,17 @@ describe("TUI questions", () => {
       await harness.answer();
       await vi.advanceTimersByTimeAsync(2_000);
       harness.expectDismissed();
-      expect(
-        harness.addSystem.mock.calls.filter(
-          ([line]) =>
-            line ===
-            "Question outcome could not be recovered; check the conversation or secret store before requesting again.",
-        ),
-      ).toHaveLength(1);
+      harness.expectSystemOnce(
+        "Question outcome could not be recovered; check the conversation or secret store before requesting again.",
+      );
       expect(harness.addSystem.mock.calls.flat()).not.toContain("Question: expired.");
       expect(harness.resolveQuestion).toHaveBeenCalledTimes(1);
     },
   );
 
   it("ignores late list and submission results after disposal", async () => {
-    const harness = createHarness();
-    const submission = deferred<QuestionResolveResult>();
-    const listing = deferred<QuestionListResult>();
-    harness.resolveQuestion.mockReturnValueOnce(submission.promise);
-    harness.request();
-    harness.input(ENTER);
+    const { harness, submission } = startSubmission();
+    const listing = createDeferred<QuestionListResult>();
     harness.listQuestions.mockReturnValueOnce(listing.promise);
     const refresh = harness.controller.refresh();
     harness.controller.dispose();

@@ -8,11 +8,7 @@ import {
   makeTui,
   makeTuiBackend,
 } from "./tui-session-actions-test-support.js";
-import {
-  getPendingSubmitAcceptedRunId,
-  getPendingSubmitDraft,
-  type TuiPendingSubmit,
-} from "./tui-submit-state.js";
+import type { TuiPendingSubmit } from "./tui-submit-state.js";
 
 const acceptedSubmit = (runId: string, draftText: string | null = "pending"): TuiPendingSubmit => ({
   phase: "accepted",
@@ -25,59 +21,45 @@ function abortHarness(
   aborted = true,
   local = false,
 ) {
-  const spies = {
+  const backend = {
     abortChat: vi.fn<TuiBackend["abortChat"]>().mockResolvedValue({ ok: true, aborted }),
     loadHistory: vi
       .fn<TuiBackend["loadHistory"]>()
       .mockResolvedValue({ sessionInfo: { hasActiveRun: false } }),
-    addSystem: vi.fn(),
-    dropPendingUser: vi.fn(),
+  };
+  const chatLog = { addSystem: vi.fn(), clearAll: vi.fn(), dropPendingUser: vi.fn() };
+  const tui = { requestRender: vi.fn() };
+  const effects = {
     setActivityStatus: vi.fn(),
-    requestRender: vi.fn(),
     invalidateRunOwnership: vi.fn(),
   };
   const state = createBaseState({ historyLoaded: true, ...overrides });
   const actions = createTestSessionActions({
-    client: makeTuiBackend({
-      describeSession: vi.fn(),
-      abortChat: spies.abortChat,
-      loadHistory: spies.loadHistory,
-    }),
-    chatLog: makeChatLog({
-      addSystem: spies.addSystem,
-      clearAll: vi.fn(),
-      dropPendingUser: spies.dropPendingUser,
-    }),
-    tui: makeTui({ requestRender: spies.requestRender }),
+    client: makeTuiBackend({ describeSession: vi.fn(), ...backend }),
+    chatLog: makeChatLog(chatLog),
+    tui: makeTui(tui),
     opts: { local },
     state,
-    setActivityStatus: spies.setActivityStatus,
-    invalidateRunOwnership: spies.invalidateRunOwnership,
+    ...effects,
     resolveSessionSelection: (raw = state.currentSessionKey, agentId = state.currentAgentId) => ({
       key: raw,
       agentId,
     }),
   });
-  return { ...actions, ...spies, state };
+  return { ...actions, ...backend, ...chatLog, ...tui, ...effects, state };
 }
 
 describe("TUI selected-session abort", () => {
   it.each([
-    { name: "registered pending run", draft: null, active: null, global: false, aborted: true },
-    { name: "optimistic pending run", draft: "hello", active: null, global: false, aborted: true },
-    { name: "selected global run", draft: null, active: null, global: true, aborted: true },
-    { name: "queued gateway run", draft: null, active: "run-active", global: false, aborted: true },
-    { name: "missing backend run", draft: "hello", active: null, global: false, aborted: false },
-    {
-      name: "completed active run",
-      draft: null,
-      active: "run-active",
-      global: false,
-      aborted: false,
-    },
-  ])(
-    "reconciles $name after a session-scoped abort",
-    async ({ draft, active, global, aborted }) => {
+    ["registered pending run", null, null, false, true],
+    ["optimistic pending run", "hello", null, false, true],
+    ["selected global run", null, null, true, true],
+    ["queued gateway run", null, "run-active", false, true],
+    ["missing backend run", "hello", null, false, false],
+    ["completed active run", null, "run-active", false, false],
+  ] as const)(
+    "reconciles %s after a session-scoped abort",
+    async (_name, draft, active, global, aborted) => {
       const sessionKey = global ? "global" : "agent:main:main";
       const h = abortHarness(
         {
@@ -124,8 +106,7 @@ describe("TUI selected-session abort", () => {
     abort.resolve({ ok: true, aborted: true, runIds: ["run-active", "run-queued"] });
     await pendingAbort;
 
-    expect(h.dropPendingUser).toHaveBeenCalledTimes(1);
-    expect(h.dropPendingUser).toHaveBeenCalledWith("run-queued");
+    expect(h.dropPendingUser).toHaveBeenCalledExactlyOnceWith("run-queued");
   });
 
   it.each([true, undefined])(
@@ -143,8 +124,10 @@ describe("TUI selected-session abort", () => {
 
       await h.abortActive();
 
-      expect(h.state.activeChatRunId).toBe("run-finalizing");
-      expect(getPendingSubmitAcceptedRunId(h.state)).toBe("run-pending");
+      expect(h.state).toMatchObject({
+        activeChatRunId: "run-finalizing",
+        pendingSubmit: acceptedSubmit("run-pending"),
+      });
       expect(h.invalidateRunOwnership).not.toHaveBeenCalled();
       expect(h.dropPendingUser).not.toHaveBeenCalled();
       expect(h.setActivityStatus).not.toHaveBeenCalled();
@@ -190,7 +173,6 @@ describe("TUI selected-session abort", () => {
       sessionInfo: {
         key: nextKey,
         sessionId: "second-session",
-        model: "current-model",
       },
       messages: [],
     });
@@ -228,11 +210,7 @@ describe("TUI selected-session abort", () => {
       currentAgentId: initialKey === "global" ? "work" : "main",
       currentSessionId: "second-session",
       activeChatRunId: "second-active-run",
-    });
-    expect(getPendingSubmitAcceptedRunId(state)).toBe("second-pending-run");
-    expect(getPendingSubmitDraft(state)).toEqual({
-      runId: "second-pending-run",
-      text: "second draft",
+      pendingSubmit: acceptedSubmit("second-pending-run", "second draft"),
     });
     expect(dropPendingUser).not.toHaveBeenCalled();
     expect(addSystem).not.toHaveBeenCalled();

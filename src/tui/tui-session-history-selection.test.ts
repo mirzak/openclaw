@@ -19,6 +19,19 @@ const selectedHistory = (sessionKey: string, sessionId: string) => ({
   sessionInfo: { key: sessionKey, sessionId },
 });
 
+function heldCall<T = unknown>() {
+  const result = createDeferred<T>();
+  const entered = createDeferred();
+  return {
+    ...result,
+    entered: entered.promise,
+    call: vi.fn(() => {
+      entered.resolve();
+      return result.promise;
+    }),
+  };
+}
+
 function selectionHarness(
   commandOptions: Parameters<typeof createTuiCommandHandlersHarness>[0] = {},
   backend: Partial<TuiBackend> = {},
@@ -32,12 +45,13 @@ function selectionHarness(
     ...commandOptions,
   });
   const state = Object.assign(commands.state, stateFor(commands.state));
+  const sessionClient = makeTuiBackend(backend);
   const actions = createTestSessionActions({
     state,
-    client: makeTuiBackend(backend),
+    client: sessionClient,
     resolveSessionSelection,
   });
-  return { ...commands, state, actions };
+  return { ...commands, state, actions, sessionClient };
 }
 
 it.each([
@@ -52,30 +66,21 @@ it.each([
       key: previous,
       entry: { verboseLevel: "full" },
     } as const;
-    const patch = createDeferred<typeof reply>();
-    const patchEntered = createDeferred();
-    const history = createDeferred<unknown>();
-    const historyEntered = createDeferred();
-    const loadHistory = vi.fn(async () => {
-      historyEntered.resolve();
-      return history.promise;
-    });
+    const patch = heldCall<typeof reply>();
+    const history = heldCall();
     const commands = selectionHarness(
       {
         currentSessionKey: previous,
         currentSessionId: null,
-        patchSession: vi.fn(() => {
-          patchEntered.resolve();
-          return patch.promise;
-        }),
+        patchSession: patch.call,
       },
-      { loadHistory },
+      { loadHistory: history.call },
     );
     const { state, actions } = commands;
     const pending = commands.handleCommand("/verbose full");
-    await patchEntered.promise;
+    await patch.entered;
     const selecting = actions.setSession(next);
-    await historyEntered.promise;
+    await history.entered;
     try {
       patch.resolve(reply);
       await pending;
@@ -88,26 +93,25 @@ it.each([
       await Promise.all([pending, selecting]);
     }
     expect(state).toMatchObject({ currentSessionKey: next, currentSessionId: "selected-row" });
-    expect(loadHistory).toHaveBeenCalledOnce();
+    expect(history.call).toHaveBeenCalledOnce();
   },
 );
 
 it.each(["agent:research:main", "global"])(
   "resolves the missing qualified-global alias to Home %s",
   async (homeKey) => {
-    const state = stateFor();
     const loadHistory = vi
       .fn()
       .mockResolvedValueOnce({ messages: [] })
       .mockResolvedValueOnce({ messages: [], sessionId: "legacy-home" });
-    const actions = createTestSessionActions({
-      state,
-      client: makeTuiBackend({
+    const { state, actions } = selectionHarness(
+      { historyLoaded: false },
+      {
         loadHistory,
         describeSession: async () => ({ session: { key: homeKey, sessionId: "legacy-home" } }),
-      }),
-      resolveSessionSelection: (raw, agentId) => select(raw ?? homeKey, agentId),
-    });
+      },
+      (raw, agentId) => select(raw ?? homeKey, agentId),
+    );
     await expect(actions.loadHistory()).resolves.toMatchObject({ loaded: true });
     expect(loadHistory).toHaveBeenNthCalledWith(2, {
       sessionKey: homeKey,
@@ -129,36 +133,28 @@ it.each([
   ["partial reply", {}],
   ["malformed metadata", { messages: [], sessionInfo: "incomplete" }],
 ] as const)("does not reinterpret %s as a missing qualified row", async (_name, history) => {
-  const state = stateFor();
   const loadHistory = vi.fn(async () => history);
-  const actions = createTestSessionActions({ state, client: makeTuiBackend({ loadHistory }) });
+  const { state, actions } = selectionHarness({ historyLoaded: false }, { loadHistory });
   await actions.loadHistory();
   expect(state.currentSessionKey).toBe(key);
   expect(loadHistory).toHaveBeenCalledOnce();
 });
 
 it("does not adopt Home after another session is selected during the legacy lookup", async () => {
-  const entered = createDeferred();
-  const held = createDeferred<unknown>();
-  const state = stateFor();
+  const held = heldCall();
   const loadHistory = vi.fn(async ({ sessionKey }: { sessionKey: string }) => {
     if (sessionKey === key) {
       return { messages: [] };
     }
     if (sessionKey === "global") {
-      entered.resolve();
-      return held.promise;
+      return held.call();
     }
     return { messages: [], sessionId: "new-choice", sessionInfo: { key: sessionKey } };
   });
-  const actions = createTestSessionActions({
-    state,
-    client: makeTuiBackend({ loadHistory }),
-    resolveSessionSelection: select,
-  });
+  const { state, actions } = selectionHarness({ historyLoaded: false }, { loadHistory });
   const pending = actions.loadHistory();
   try {
-    await entered.promise;
+    await held.entered;
     await actions.setSession("agent:research:notes");
   } finally {
     held.resolve({ messages: [], sessionId: "late-home" });
@@ -178,10 +174,8 @@ it.each(
 )(
   "keeps a submit editable until selection resolves to $storedKey (coalesced=$coalesced)",
   async ({ storedKey, coalesced }) => {
-    const entered = createDeferred();
-    const exact = createDeferred<unknown>();
-    const pendingCommands: Promise<void>[] = [];
-    const pendingMessages: Promise<void>[] = [];
+    const exact = heldCall();
+    const pending: Promise<void>[] = [];
     const sendChat = vi.fn(async (_params: Parameters<TuiBackend["sendChat"]>[0]) => ({
       runId: "submitted",
       status: "accepted",
@@ -191,8 +185,7 @@ it.each(
       {
         loadHistory: async ({ sessionKey }) => {
           if (sessionKey === key) {
-            entered.resolve();
-            return exact.promise;
+            return exact.call();
           }
           return selectedHistory("global", "selected-conversation");
         },
@@ -200,7 +193,7 @@ it.each(
     );
     let editorText = "";
     const addToHistory = vi.fn();
-    const track = (work: Promise<void>, pending: Promise<void>[]) => {
+    const track = (work: Promise<void>) => {
       pending.push(work);
       return work;
     };
@@ -213,8 +206,8 @@ it.each(
         },
         addToHistory,
       },
-      handleCommand: (text) => track(commands.handleCommand(text), pendingCommands),
-      sendMessage: (text) => track(commands.sendMessage(text), pendingMessages),
+      handleCommand: (text) => track(commands.handleCommand(text)),
+      sendMessage: (text) => track(commands.sendMessage(text)),
       handleBangLine: vi.fn(),
       onSubmitError: vi.fn(),
       admitMessage: commands.resolveMessageAdmission,
@@ -234,12 +227,12 @@ it.each(
       burstWindowMs: 50,
     });
     submit(`/session ${key}`);
-    await entered.promise;
+    await exact.entered;
     try {
       if (coalesced) {
         bufferedSubmit("Immediate message");
         releaseExact();
-        await Promise.all(pendingCommands);
+        await Promise.all(pending);
         vi.advanceTimersByTime(50);
       } else {
         submit("Immediate message");
@@ -248,10 +241,10 @@ it.each(
       expect(editorText).toBe("Immediate message");
       expect(addToHistory).not.toHaveBeenCalledWith("Immediate message");
       releaseExact();
-      await Promise.all(pendingCommands);
+      await Promise.all(pending);
       editorText = "";
       submit("Immediate message");
-      await Promise.all(pendingMessages);
+      await Promise.all(pending);
       expect(sendChat).toHaveBeenCalledOnce();
       expect(sendChat.mock.calls[0]?.[0]).toMatchObject({
         sessionKey: storedKey,
@@ -263,7 +256,7 @@ it.each(
       exact.resolve({ messages: [] });
       bufferedSubmit.dispose();
       vi.useRealTimers();
-      await Promise.all([...pendingCommands, ...pendingMessages]);
+      await Promise.all(pending);
     }
   },
 );
@@ -279,13 +272,8 @@ it.each([
 ] as const)("blocks %s until history resolves", async (command, backend) => {
   const commands = selectionHarness({ historyLoaded: false, opts: { local: true } });
   if (backend === "abortChat") {
-    const abortChat = vi.fn(async () => ({ ok: true, aborted: false, runIds: [] }));
-    const actions = createTestSessionActions({
-      state: stateFor(),
-      client: makeTuiBackend({ abortChat }),
-    });
-    await actions.abortActive({ preferActive: true });
-    expect(abortChat).not.toHaveBeenCalled();
+    await commands.actions.abortActive({ preferActive: true });
+    expect(commands.sessionClient.abortChat).not.toHaveBeenCalled();
   } else {
     await commands.handleCommand(command);
     expect(commands.client[backend]).not.toHaveBeenCalled();
