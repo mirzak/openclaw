@@ -91,7 +91,7 @@ export function createGateway(
   });
   return {
     gateway,
-    emit(event: string, payload: unknown = {}) {
+    emit(this: void, event: string, payload: unknown = {}) {
       if (event === "cron" || event === "config.changed") {
         invalidateCronCatalog(client);
       }
@@ -101,7 +101,7 @@ export function createGateway(
       }
       publishEvent({ type: "event", event, payload });
     },
-    setConnected(nextConnected: boolean) {
+    setConnected(this: void, nextConnected: boolean) {
       if (!nextConnected) {
         invalidateCronCatalog(client);
         invalidateChatMetadataStore(client);
@@ -158,8 +158,10 @@ export async function mountPalette(context = createContext(createGateway(true).g
   provider.append(palette);
   document.body.append(provider);
   await palette.updateComplete;
-  const query: typeof palette.querySelector = palette.querySelector.bind(palette);
-  const queryAll: typeof palette.querySelectorAll = palette.querySelectorAll.bind(palette);
+  const query = <E extends Element = Element>(selector: string) =>
+    palette.querySelector<E>(selector);
+  const queryAll = <E extends Element = Element>(selector: string) =>
+    palette.querySelectorAll<E>(selector);
   return { palette, provider, query, queryAll };
 }
 

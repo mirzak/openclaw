@@ -53,7 +53,7 @@ afterEach(() => {
 async function mount(createdSessionKey = "agent:main:dashboard:mentioned") {
   const directory = vi.fn(async (): Promise<UsersMentionableResult> => people);
   const fixture = createDraftFixture({
-    selfUser: { id: "sender", identity: { type: "profile", id: "sender" } },
+    selfUser: { id: "sender" },
     request: async (method) => {
       if (method === "users.mentionable") {
         return directory();

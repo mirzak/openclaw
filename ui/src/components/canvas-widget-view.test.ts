@@ -33,7 +33,7 @@ const documentView: CanvasDocumentViewResult = {
   sandboxUrl: "/mcp-app-sandbox?frames=none",
   sandboxPort: 8444,
 };
-type WidgetClient = { request: ReturnType<typeof vi.fn> };
+type WidgetClient = { request: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<unknown>>> };
 let client: WidgetClient;
 
 type WidgetGatewaySnapshot = Omit<Partial<ApplicationGatewaySnapshot>, "client"> & {

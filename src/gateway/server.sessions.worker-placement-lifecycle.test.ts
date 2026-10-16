@@ -141,7 +141,7 @@ function placementReq<T = unknown>(
   key: string,
   context: Record<string, unknown>,
   params: Record<string, unknown> = {},
-) {
+): ReturnType<typeof directSessionReq<T>> {
   return directSessionReq<T>(method, { key, ...params }, { context });
 }
 

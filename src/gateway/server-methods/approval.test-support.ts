@@ -145,10 +145,11 @@ export function createApprovalInvocation(params: ApprovalInvocationParams) {
       new SharedGatewaySessionGenerationState({ current: undefined, required: null }).reader,
     );
   }
-  const options = bindGatewayRequestHandlerMutationAuthority(request, {
-    ...request,
-    params: params.body,
-  });
+  const options = bindGatewayRequestHandlerMutationAuthority(
+    request,
+    { ...request, params: params.body },
+    undefined,
+  );
   return {
     context,
     respond,

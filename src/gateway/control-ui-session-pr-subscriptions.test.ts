@@ -16,10 +16,10 @@ const CHANGED_EVENT = "controlUi.sessionPullRequests.changed";
 const READY: Snapshot = { pullRequests: [], rateLimited: false };
 
 let running: ReturnType<typeof createTestControlUiSessionPrSubscriptions> | undefined;
-let broadcastToConnIds: ReturnType<typeof vi.fn>;
+let broadcastToConnIds: ReturnType<typeof vi.fn<Options["broadcastToConnIds"]>>;
 
 beforeEach(() => {
-  broadcastToConnIds = vi.fn();
+  broadcastToConnIds = vi.fn<Options["broadcastToConnIds"]>();
 });
 
 afterEach(async () => {
@@ -265,9 +265,7 @@ describe("control UI session PR subscriptions", () => {
   it("loads agent-scoped global watch keys from the owning agent store", async () => {
     vi.useFakeTimers();
     const load = vi.fn(async () => READY);
-    active = createTestControlUiSessionPrSubscriptions({
-      broadcastToConnIds: vi.fn(),
-      scheduler: createTestGatewayScheduler(),
+    const active = start({
       load,
     });
 

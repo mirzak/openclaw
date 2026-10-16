@@ -44,12 +44,14 @@ vi.mock("../../infra/sqlite-worker-operation-admission.js", async (importOrigina
     ) => {
       const admission = actual.createSqliteWorkerOperationAdmission(...args);
       const descriptors = Object.getOwnPropertyDescriptors(admission);
-      for (const key of ["committed", "settlement"] as const) {
-        const read = expectDefined(descriptors[key].get, key);
-        vi.spyOn(admission, key, "get").mockImplementation(() =>
-          resultDelivery.hideReceipt ? undefined : read.call(admission),
-        );
-      }
+      const readCommitted = expectDefined(descriptors.committed.get, "commit getter");
+      const readSettlement = expectDefined(descriptors.settlement.get, "settlement getter");
+      vi.spyOn(admission, "committed", "get").mockImplementation(() =>
+        resultDelivery.hideReceipt ? undefined : readCommitted.call(admission),
+      );
+      vi.spyOn(admission, "settlement", "get").mockImplementation(() =>
+        resultDelivery.hideReceipt ? undefined : readSettlement.call(admission),
+      );
       return admission;
     },
   };

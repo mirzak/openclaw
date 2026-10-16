@@ -56,13 +56,13 @@ const ownershipEvidence = {
   policyRefs: ["tools.sessions.visibility"],
   contextFieldsUsed: ["requesterSessionKey", "targetSessionKey"],
   missingEvidence: ["session.owner"],
-};
+} satisfies Parameters<typeof expectDenial>[1];
 const disabledEvidence = {
   reasonCode: "agent_to_agent_disabled",
   policyRefs: ["tools.agentToAgent.enabled"],
   contextFieldsUsed: ["requesterAgentId", "targetAgentId"],
   missingEvidence: [],
-};
+} satisfies Parameters<typeof expectDenial>[1];
 
 function unavailable(message = "transport timeout") {
   return new GatewayClientRequestError({ code: "UNAVAILABLE", message, retryable: true });

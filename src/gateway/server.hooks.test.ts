@@ -82,11 +82,7 @@ async function postHook(
 const bindHookPost = (port: number) => postHook.bind(undefined, port);
 
 type HookPost = ReturnType<typeof bindHookPost>;
-type HookError = (
-  route: string,
-  body: Parameters<HookPost>[1],
-  error: string | ReturnType<typeof expect.stringContaining>,
-) => Promise<void>;
+type HookError = (route: string, body: Parameters<HookPost>[1], error: unknown) => Promise<void>;
 
 function withHooksServer(run: (post: HookPost, reject: HookError) => Promise<void>) {
   return withGatewayServer(async ({ port }) => {

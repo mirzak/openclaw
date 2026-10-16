@@ -103,7 +103,13 @@ const cases: BudgetCase[] = [
 ];
 it.each(cases)(
   "%s",
-  async (_name, blocks, anchorIndex, expectedIndices, { excess, placeholder } = {}) => {
+  async (
+    _name,
+    blocks,
+    anchorIndex,
+    expectedIndices,
+    { excess, placeholder }: NonNullable<BudgetCase[4]> = {},
+  ) => {
     const messages = blocks.map((length, index) => ({
       role: placeholder || (excess !== undefined && index === 0) ? "user" : "assistant",
       content: length

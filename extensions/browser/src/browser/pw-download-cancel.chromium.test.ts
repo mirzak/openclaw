@@ -183,7 +183,7 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
     };
     const pending =
       mode === "ref-based"
-        ? downloadViaPlaywright({ ...options, ref })
+        ? downloadViaPlaywright({ ...options, path: outputPath, ref })
         : waitForDownloadViaPlaywright(options);
     if (mode === "waiter") {
       await expect.poll(() => ensurePageState(controlled).downloadWaiterDepth).toBe(1);
@@ -555,6 +555,7 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
     const clickController = new AbortController();
     const cancelledClick = downloadViaPlaywright({
       ...captureOptions(target, outputRoot, sharedPath, clickController.signal),
+      path: sharedPath,
       ref: "e1",
     });
     const clickOutcome = cancelledClick.catch((error: unknown) => error);

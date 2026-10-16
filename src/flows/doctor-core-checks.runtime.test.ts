@@ -464,7 +464,7 @@ describe("doctor runtime tool schema checks", () => {
   it("filters MCP diagnostics through server-level deny policy", async () => {
     mockBundleDiagnostic();
     await expect(
-      collectRuntimeToolSchemaFindings({
+      inspectSchemas({
         tools: { deny: ["fuzzplugin__*"] },
         ...mcpConfig(),
       }),

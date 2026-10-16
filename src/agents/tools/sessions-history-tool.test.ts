@@ -9,9 +9,9 @@ import {
 } from "../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import { replaceSessionEntrySync } from "../../config/sessions/session-accessor.js";
 import { createSessionVisibilityChecker } from "../../plugin-sdk/session-visibility.js";
+import { deleteTestEnvValue, setTestEnvValue } from "../../test-utils/env.js";
 import { describeSessionLinkRule } from "../tool-description-presets.js";
 import { compactToolOutputHint } from "../tool-schema-hints.js";
-import { createSessionsHistoryTool } from "./sessions-history-tool.js";
 import {
   type CallGatewayRequest,
   readHistoryDetails,
@@ -19,9 +19,20 @@ import {
   requireGatewayRequest,
 } from "./sessions-history-tool.test-support.js";
 
+let createSessionsHistoryTool: typeof import("./sessions-history-tool.js").createSessionsHistoryTool;
+let previousConfigPath: string | undefined;
 let tempDir: string | undefined;
 const SESSION_LINK_BASE = "http://127.0.0.1:18789/control";
 const SESSION_LINK_RULE = describeSessionLinkRule(SESSION_LINK_BASE);
+
+function useLoggingConfig(name: string, logging: Record<string, unknown>): void {
+  if (!tempDir) {
+    throw new Error("tempDir not initialized");
+  }
+  const configPath = path.join(tempDir, name);
+  fs.writeFileSync(configPath, `${JSON.stringify({ logging })}\n`, "utf8");
+  setTestEnvValue("OPENCLAW_CONFIG_PATH", configPath);
+}
 
 function writeSessionStore(
   name: string,
@@ -140,11 +151,19 @@ function childHistoryFixture(name: string, replace = false) {
   return { ...fixture, targetSessionKey };
 }
 
-beforeAll(() => {
+beforeAll(async () => {
+  previousConfigPath = process.env.OPENCLAW_CONFIG_PATH;
   tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-sessions-history-redact-"));
+  useLoggingConfig("redaction-off.json", { redactSensitive: "off" });
+  ({ createSessionsHistoryTool } = await import("./sessions-history-tool.js"));
 });
 
 afterAll(() => {
+  if (previousConfigPath === undefined) {
+    deleteTestEnvValue("OPENCLAW_CONFIG_PATH");
+  } else {
+    setTestEnvValue("OPENCLAW_CONFIG_PATH", previousConfigPath);
+  }
   if (tempDir) {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

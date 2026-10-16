@@ -136,8 +136,10 @@ function harness(host = "github.com") {
     state,
     ...deps,
     fetchResponse,
-    load: (params: Partial<typeof target> = {}, overrides: Partial<typeof deps> = {}) =>
-      loadControlUiSessionPullRequestChecks({ ...target, ...params }, { ...deps, ...overrides }),
+    load: (
+      params: Partial<typeof target> = {},
+      overrides: Partial<Parameters<typeof loadControlUiSessionPullRequestChecks>[1]> = {},
+    ) => loadControlUiSessionPullRequestChecks({ ...target, ...params }, { ...deps, ...overrides }),
   };
 }
 

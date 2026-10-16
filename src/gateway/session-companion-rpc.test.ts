@@ -316,7 +316,9 @@ it("reads companion visibility while an unrelated writer remains admitted", asyn
     try {
       await withinTest(entered.promise, signal);
       reads.push(...keys.map(read));
-      const [visible, hidden] = await withinTest(Promise.all(reads), signal);
+      const results = await withinTest(Promise.all(reads), signal);
+      const visible = expectDefined(results[0], "visible response");
+      const hidden = expectDefined(results[1], "hidden response");
       success(visible, { exchanges });
       expectError(hidden, "INVALID_REQUEST");
       expect(state).toHaveBeenCalledExactlyOnceWith({ agentId: "main", sessionKey: keys[0] });

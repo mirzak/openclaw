@@ -653,7 +653,7 @@ describe("tui session actions", () => {
         { id: "off", label: "off" },
         { id: "ultra", label: "ultra" },
       ],
-    } satisfies NonNullable<Parameters<typeof applySessionInfoFromPatch>[0]["resolved"]>;
+    } satisfies NonNullable<Awaited<ReturnType<TuiBackend["patchSession"]>>["resolved"]>;
 
     applySessionInfoFromPatch({
       ok: true,

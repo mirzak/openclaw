@@ -364,14 +364,7 @@ describe("browser client", () => {
   });
 
   it("clamps oversized browser action timeouts before forwarding", async () => {
-    const calls: Array<{ url: string; init?: RequestInit & { timeoutMs?: number } }> = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string, init?: RequestInit & { timeoutMs?: number }) => {
-        calls.push({ url, init });
-        return jsonResponse({ ok: true, targetId: "t1", path: "/tmp/a.png" });
-      }),
-    );
+    const calls = captureFetch({ ok: true, targetId: "t1", path: "/tmp/a.png" });
 
     await browserAct("http://127.0.0.1:18791", {
       kind: "wait",

@@ -26,6 +26,7 @@ import {
   createDatabaseOptions,
   createManagers,
   getOperatorApproval,
+  invoke,
   registerExec,
   registerPlugin,
   registerSystemAgent,
@@ -99,7 +100,9 @@ describe("approval authority boundaries", () => {
         sessions: { others: "none" as const },
         agents: "*",
         scopes: ["operator.approvals"],
-      };
+      } satisfies NonNullable<
+        NonNullable<OpenClawConfig["gateway"]>["roles"]
+      >["definitions"][string];
       const cfg: OpenClawConfig = {
         gateway: { roles: { default: "guest", definitions: { guest } } },
       };

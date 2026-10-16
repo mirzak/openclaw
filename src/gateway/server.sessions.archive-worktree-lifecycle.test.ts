@@ -69,7 +69,7 @@ async function archiveFixture() {
     patchMany: (
       fields: Record<string, unknown>,
       targets = [target],
-      opts?: Parameters<typeof directSessionReq>[2],
+      opts?: Parameters<typeof directSessionReq<SessionsPatchManyResult>>[2],
     ) =>
       directSessionReq<SessionsPatchManyResult>(
         "sessions.patchMany",
@@ -721,7 +721,7 @@ test("automatic archive snapshots the checkout and restores its conversation", a
       }
     }
   });
-  onTestFinished(reads.restore);
+  onTestFinished(() => reads.restore());
 
   const result = await applySessionEntryLifecycleMutation({
     agentId: "main",

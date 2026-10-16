@@ -13,7 +13,11 @@ const READY: ControlUiSessionPullRequests = { pullRequests: [], rateLimited: fal
 const releases: Array<() => void> = [];
 const drains: Array<() => Promise<unknown>> = [];
 
-function drain(operations: Promise<unknown>[], settled = false, before?: () => Promise<void>) {
+function drain(
+  operations: Promise<unknown>[],
+  settled = false,
+  before?: () => void | Promise<void>,
+) {
   drains.push(async () => {
     if (before) {
       await before();
@@ -54,7 +58,7 @@ function targetFor(sessionKey: string, identity = sessionKey): ControlUiSessionP
 }
 
 let running: ReturnType<typeof createTestControlUiSessionPrSubscriptions> | undefined;
-let broadcastToConnIds: ReturnType<typeof vi.fn>;
+let broadcastToConnIds: ReturnType<typeof vi.fn<Options["broadcastToConnIds"]>>;
 let scheduler: ReturnType<typeof createTestGatewayScheduler>;
 type Options = Parameters<typeof createTestControlUiSessionPrSubscriptions>[0];
 
@@ -68,7 +72,7 @@ function start(options: Omit<Options, "scheduler" | "broadcastToConnIds">) {
 }
 
 beforeEach(() => {
-  broadcastToConnIds = vi.fn();
+  broadcastToConnIds = vi.fn<Options["broadcastToConnIds"]>();
 });
 afterEach(async () => {
   releaseHolds();
