@@ -135,53 +135,49 @@ describePosix("correction publication authority handoff", () => {
     );
   });
 
-  it.each(["auto", "graphql"] as const)(
-    "completes the first %s publication through protected-gate finalization",
-    (transport) => {
+  it.each([
+    ["auto", "prepare_push", "crabbox"],
+    ["graphql", "prepare_push", "crabbox"],
+    ["auto", "prepare_push", "github"],
+    ["graphql", "prepare_push", "github"],
+    ["graphql", "prepare_sync_head", "github"],
+  ] as const)(
+    "publishes a reviewed %s correction through %s with %s gates",
+    (transport, command, backend) => {
       const f = fixture(transport);
       const before = f.read("review.json");
-      const result = runCorrection(f);
+      if (backend === "github") {
+        f.write(
+          "gates.env",
+          `PR_NUMBER=4242\nGATES_MODE=github_pending\nHOSTED_GATES_TARGET_HEAD_SHA=${f.candidate}\n`,
+        );
+      }
+      const result = runCorrection(f, { command: `${command} 4242` });
       expect(result.status, result.stdout + result.stderr).toBe(0);
       const hosted = f.hosted();
+      const gates = f.read("gates.env");
+      const events = `${transport === "auto" ? "push" : "graphql"}\n${backend === "crabbox" ? "proof\n" : ""}`;
       expect(hosted === f.candidate).toBe(transport === "auto");
       expect(f.git("rev-parse", `${hosted}^{tree}`)).toBe(f.git("rev-parse", "HEAD^{tree}"));
-      expect(f.read("events")).toBe(`${transport === "auto" ? "push" : "graphql"}\nproof\n`);
-      expect(f.read("prepare-push-result.env")).toContain(`PUSHED_FROM_SHA=${f.source}\n`);
-      expect(f.read("prep.env")).toContain(`PREP_HEAD_SHA=${hosted}\n`);
+      expect(f.read("events")).toBe(events);
       expect(f.read("prep.env")).toContain(`LOCAL_PREP_HEAD_SHA=${f.candidate}\n`);
-      expect(f.read("gates.env")).toContain(
-        `GATES_MODE=remote_crabbox_aws\nHOSTED_GATES_TARGET_HEAD_SHA=''\nLAST_VERIFIED_HEAD_SHA=${hosted}\nFULL_GATES_HEAD_SHA=${hosted}\n`,
-      );
       expect(f.read("review.json")).toBe(before);
-    },
-  );
-
-  it.each([
-    ["auto", "prepare_push"],
-    ["graphql", "prepare_push"],
-    ["graphql", "prepare_sync_head"],
-  ] as const)(
-    "publishes and resumes a reviewed %s correction through %s with pending GitHub gates",
-    (transport, command) => {
-      const f = fixture(transport);
-      const incomingReview = f.read("review.json");
-      f.write(
-        "gates.env",
-        `PR_NUMBER=4242\nGATES_MODE=github_pending\nHOSTED_GATES_TARGET_HEAD_SHA=${f.candidate}\n`,
-      );
-      const published = runCorrection(f, { command: `${command} 4242` });
-      expect(published.status, published.stdout + published.stderr).toBe(0);
-      const hosted = f.hosted();
-      const gates = f.read("gates.env");
-      expect(gates).toContain(`HOSTED_GATES_TARGET_HEAD_SHA=${hosted}\n`);
-      expect(gates).not.toMatch(/GATES_PASSED_AT|LAST_VERIFIED_HEAD_SHA|FULL_GATES_HEAD_SHA/);
-      expect(f.read("prep.env")).toContain(`LOCAL_PREP_HEAD_SHA=${f.candidate}\n`);
-      expect(f.read("prep.md")).not.toContain("Gates passed");
-      const resumed = runCorrection(f);
-      expect(resumed.status, resumed.stdout + resumed.stderr).toBe(0);
-      expect(f.read("gates.env")).toBe(gates);
-      expect(f.read("events")).toBe(`${transport === "auto" ? "push" : "graphql"}\n`);
-      expect(f.read("review.json")).toBe(incomingReview);
+      if (backend === "crabbox") {
+        expect(f.read("prepare-push-result.env")).toContain(`PUSHED_FROM_SHA=${f.source}\n`);
+        expect(f.read("prep.env")).toContain(`PREP_HEAD_SHA=${hosted}\n`);
+        expect(gates).toContain(
+          `GATES_MODE=remote_crabbox_aws\nHOSTED_GATES_TARGET_HEAD_SHA=''\nLAST_VERIFIED_HEAD_SHA=${hosted}\nFULL_GATES_HEAD_SHA=${hosted}\n`,
+        );
+      } else {
+        expect(gates).toContain(`HOSTED_GATES_TARGET_HEAD_SHA=${hosted}\n`);
+        expect(gates).not.toMatch(/GATES_PASSED_AT|LAST_VERIFIED_HEAD_SHA|FULL_GATES_HEAD_SHA/);
+        expect(f.read("prep.md")).not.toContain("Gates passed");
+        const resumed = runCorrection(f);
+        expect(resumed.status, resumed.stdout + resumed.stderr).toBe(0);
+        expect(f.read("gates.env")).toBe(gates);
+        expect(f.read("events")).toBe(events);
+        expect(f.read("review.json")).toBe(before);
+      }
     },
   );
 
@@ -285,38 +281,28 @@ describePosix("correction publication authority handoff", () => {
     expect(f.read("prepare-push-result.env")).toContain(`PUSH_LOCAL_PREP_HEAD_SHA=${head}\n`);
   });
 
-  it.each(["review", "other receipt", "selected receipt", "removed receipt"])(
-    "rejects %s mutation while protected proof is running",
-    (changed) => {
-      const f = fixture();
-      if (changed === "removed receipt") {
-        f.write(
-          "prepare-sync-result.env",
-          `PUSH_PREP_HEAD_SHA=${f.source}\nPUSH_LOCAL_PREP_HEAD_SHA=${f.source}\nPUSHED_FROM_SHA=${f.source}\nPUSH_REPLACED_HOSTED_ANCESTRY=false\nPR_HEAD_SHA_AFTER_PUSH=${f.source}\n`,
-        );
-      }
-      const path =
-        changed === "review"
-          ? ".local/correction-review.json"
-          : changed === "other receipt"
-            ? ".local/prepare-sync-result.env"
-            : ".local/prepare-push-result.env";
-      const result = runCorrection(f, {
-        duringProof:
-          changed === "removed receipt"
-            ? "rm .local/prepare-sync-result.env"
-            : changed === "other receipt"
-              ? `cp .local/prepare-push-result.env ${path}`
-              : changed === "selected receipt"
-                ? `LC_ALL=C sort -o "${path}" "${path}"`
-                : `printf '\\n' >> ${path}`,
-      });
-      expect(result.status, result.stdout + result.stderr).not.toBe(0);
-      expect(result.stderr).toContain("Correction review authority changed");
-      expect(f.read("events")).toBe("graphql\nproof\n");
-      expectIncomplete(f);
-    },
-  );
+  it.each([
+    ["review", "printf '\\n' >> .local/correction-review.json"],
+    ["other receipt", "cp .local/prepare-push-result.env .local/prepare-sync-result.env"],
+    [
+      "selected receipt",
+      "LC_ALL=C sort -o .local/prepare-push-result.env .local/prepare-push-result.env",
+    ],
+    ["removed receipt", "rm .local/prepare-sync-result.env"],
+  ])("rejects %s mutation while protected proof is running", (changed, duringProof) => {
+    const f = fixture();
+    if (changed === "removed receipt") {
+      f.write(
+        "prepare-sync-result.env",
+        `PUSH_PREP_HEAD_SHA=${f.source}\nPUSH_LOCAL_PREP_HEAD_SHA=${f.source}\nPUSHED_FROM_SHA=${f.source}\nPUSH_REPLACED_HOSTED_ANCESTRY=false\nPR_HEAD_SHA_AFTER_PUSH=${f.source}\n`,
+      );
+    }
+    const result = runCorrection(f, { duringProof });
+    expect(result.status, result.stdout + result.stderr).not.toBe(0);
+    expect(result.stderr).toContain("Correction review authority changed");
+    expect(f.read("events")).toBe("graphql\nproof\n");
+    expectIncomplete(f);
+  });
 
   it("admits the named sync receipt with completed correction gates", () => {
     const f = fixture();

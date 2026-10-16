@@ -61,18 +61,23 @@ const ordinaryUiTests = [
   "ui/src/unrelated.browser.test.ts",
 ];
 
+const emptyFiles = (...files: string[]) =>
+  Object.fromEntries(files.map((file) => [file, "export {};\n"]));
+
 function createUiFixture() {
   return createTrackedFixture({
     "ui/src/presenter.ts": "export const value = 1;\n",
     "ui/src/theme.css": ".example { color: red; }\n",
     "ui/src/catalog.json": '{"label":"Example"}\n',
     "extensions/example/browser/view.ts": "export const view = 1;\n",
-    ...Object.fromEntries(ordinaryUiTests.map((file) => [file, "export {};\n"])),
-    "ui/src/e2e/example.e2e.test.ts": "export {};\n",
-    "ui/src/ignored.live.test.ts": "export {};\n",
-    "ui/src/vendor/ignored.test.ts": "export {};\n",
-    "ui/src/node_modules/ignored.test.ts": "export {};\n",
-    "ui/src/._ignored.test.ts": "export {};\n",
+    ...emptyFiles(
+      ...ordinaryUiTests,
+      "ui/src/e2e/example.e2e.test.ts",
+      "ui/src/ignored.live.test.ts",
+      "ui/src/vendor/ignored.test.ts",
+      "ui/src/node_modules/ignored.test.ts",
+      "ui/src/._ignored.test.ts",
+    ),
     "src/ui-consumer.test.ts": 'import "../ui/src/presenter.js";\n',
     "test/scripts/ui-catalog-reader.test.ts":
       'import { readFileSync } from "node:fs"; readFileSync("ui/src/catalog.json", "utf8");\n',
@@ -139,36 +144,31 @@ describe("Crabbox PR-derived gate plan", () => {
 
   it.each([
     ...["ui/src/presenter.ts", "ui/src/theme.css", "extensions/example/browser/view.ts"].map(
-      (file) => ({
-        paths: [file],
-        readers: ["src/ui-consumer.test.ts"],
-        explicit: false,
-      }),
+      (file) => [[file], [...ordinaryUiTests, "src/ui-consumer.test.ts"].toSorted()],
     ),
-    {
-      paths: ["ui/src/catalog.json"],
-      readers: ["src/ui-consumer.test.ts", "test/scripts/ui-catalog-reader.test.ts"],
-      explicit: false,
-    },
-    ...["ui/src/presenter.test.ts", "ui/src/e2e/example.e2e.test.ts"].map((file) => ({
-      paths: [file],
-      readers: [],
-      explicit: true,
-    })),
-    {
-      paths: [
+    [
+      ["ui/src/catalog.json"],
+      [
+        ...ordinaryUiTests,
+        "src/ui-consumer.test.ts",
+        "test/scripts/ui-catalog-reader.test.ts",
+      ].toSorted(),
+    ],
+    ...["ui/src/presenter.test.ts", "ui/src/e2e/example.e2e.test.ts"].map((file) => [
+      [file],
+      [file],
+    ]),
+    [
+      [
         "ui/src/presenter.ts",
         "ui/src/theme.css",
         "ui/src/presenter.test.ts",
         "ui/src/e2e/example.e2e.test.ts",
       ],
-      readers: ["src/ui-consumer.test.ts", "ui/src/e2e/example.e2e.test.ts"],
-      explicit: false,
-    },
-  ])("materializes precise UI coverage for $paths", ({ paths, readers, explicit }) => {
-    expect(planFixture(createUiFixture(), paths).targets).toEqual(
-      explicit ? paths : [...ordinaryUiTests, ...readers].toSorted(),
-    );
+      [...ordinaryUiTests, "src/ui-consumer.test.ts", "ui/src/e2e/example.e2e.test.ts"].toSorted(),
+    ],
+  ])("materializes precise UI coverage for %s", (paths, targets) => {
+    expect(planFixture(createUiFixture(), paths).targets).toEqual(targets);
   });
 
   it("uses the E2E helper's whole family, including native QA fixtures", () => {
@@ -178,12 +178,9 @@ describe("Crabbox PR-derived gate plan", () => {
       "extensions/qa-lab/src/session-host-command-state.real-gateway.e2e.test.ts",
       "ui/src/e2e/example.e2e.test.ts",
     ];
-    const cwd = createTrackedFixture({
-      [helper]: "export {};\n",
-      ...Object.fromEntries(tests.map((file) => [file, "export {};\n"])),
-      "ui/src/presenter.test.ts": "export {};\n",
-      "ui/src/vendor/ignored.e2e.test.ts": "export {};\n",
-    });
+    const cwd = createTrackedFixture(
+      emptyFiles(helper, ...tests, "ui/src/presenter.test.ts", "ui/src/vendor/ignored.e2e.test.ts"),
+    );
     const plan = planFixture(cwd, [helper]);
     expect(plan.targets).toEqual(tests);
     expect(buildVitestRunPlans(plan.targets, cwd)).toEqual([
@@ -243,10 +240,7 @@ describe("Crabbox PR-derived gate plan", () => {
     expect(planFixture(first, ["ui/src/presenter.ts"]).targets).not.toContain(
       "ui/src/untracked.test.ts",
     );
-    const second = createTrackedFixture({
-      "ui/src/another.ts": "export {};\n",
-      "ui/src/another.test.ts": "export {};\n",
-    });
+    const second = createTrackedFixture(emptyFiles("ui/src/another.ts", "ui/src/another.test.ts"));
     expect(planFixture(second, ["ui/src/another.ts"]).targets).toEqual(["ui/src/another.test.ts"]);
   });
 

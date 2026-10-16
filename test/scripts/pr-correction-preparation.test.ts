@@ -23,6 +23,7 @@ function fixture(phase: "incoming" | "corrected" | "reviewed" | "approved" = "in
   const local = (name: string) => join(f.root, ".local", name);
   return {
     ...f,
+    shell: (...lines: string[]) => f.run(lines.join("\n")),
     read: (name: string) => readFileSync(local(name), "utf8"),
     write: (name: string, value: string | Buffer) => writeFileSync(local(name), value),
     has: (name: string) => existsSync(local(name)),
@@ -76,13 +77,11 @@ describePosix("native correction preparation", () => {
     f.review.recommendation = "READY FOR /prepare-pr";
     f.review.findings = [];
     f.write("review.json", JSON.stringify(f.review));
-    const result = f.run(
-      [
-        'pr_observe() { echo "unexpected replacement observation" >&2; return 99; }',
-        'prepare_gates() { [ "$1" = 42 ] && [ "$2" = "$(cat .local/pr-meta.json)" ] && touch .local/gates-reached; }',
-        'prepare_push() { [ "$1" = 42 ] && [ "$2" = "$(cat .local/pr-meta.json)" ] && touch .local/push-reached; }',
-        'prepare_run 42 "$(cat .local/pr-meta.json)"',
-      ].join("\n"),
+    const result = f.shell(
+      'pr_observe() { echo "unexpected replacement observation" >&2; return 99; }',
+      'prepare_gates() { [ "$1" = 42 ] && [ "$2" = "$(cat .local/pr-meta.json)" ] && touch .local/gates-reached; }',
+      'prepare_push() { [ "$1" = 42 ] && [ "$2" = "$(cat .local/pr-meta.json)" ] && touch .local/push-reached; }',
+      'prepare_run 42 "$(cat .local/pr-meta.json)"',
     );
     expect(result.status, result.stdout + result.stderr).toBe(0);
     expect(f.read("prep-context.env")).toContain("PREP_REVIEW_MODE=ready");
@@ -134,19 +133,17 @@ describePosix("native correction preparation", () => {
     (operation) => {
       const f = fixture("corrected");
       f.write("gates.env", "GATES_MODE=full\n");
-      const result = f.run(
-        [
-          'source "$script_parent_dir/pr-lib/gates.sh"',
-          "resolve_pr_gates_remote_mode() { echo local; }",
-          "mark_pr_operation_side_effects_if_available() { :; }",
-          "derive_prepare_gate_change_plan() { touch .local/execution-reached; return 1; }",
-          "push_prep_head_to_pr_branch() { touch .local/execution-reached; return 1; }",
-          operation === "gates"
-            ? "prepare_gates 42"
-            : operation === "push"
-              ? "prepare_push 42"
-              : "prepare_sync_head 42",
-        ].join("\n"),
+      const result = f.shell(
+        'source "$script_parent_dir/pr-lib/gates.sh"',
+        "resolve_pr_gates_remote_mode() { echo local; }",
+        "mark_pr_operation_side_effects_if_available() { :; }",
+        "derive_prepare_gate_change_plan() { touch .local/execution-reached; return 1; }",
+        "push_prep_head_to_pr_branch() { touch .local/execution-reached; return 1; }",
+        operation === "gates"
+          ? "prepare_gates 42"
+          : operation === "push"
+            ? "prepare_push 42"
+            : "prepare_sync_head 42",
       );
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("correction-review.json");
@@ -204,10 +201,7 @@ describePosix("native correction preparation", () => {
       }));
       f.git("checkout", "--detach", f.incoming);
       if (changed) {
-        const finding = f.review.findings[0];
-        if (!finding) {
-          throw new Error("Missing incoming fixture finding");
-        }
+        const finding = f.review.findings[0]!;
         finding.fix = "A different obligation with the same I1 identifier";
         f.write("review.json", JSON.stringify(f.review));
       }
@@ -226,11 +220,9 @@ describePosix("native correction preparation", () => {
     const f = fixture("approved");
     const qualified = f.git("rev-parse", "HEAD");
     const publish = () =>
-      f.run(
-        [
-          "push_prep_head_to_pr_branch() { touch .local/execution-reached; return 73; }",
-          operation === "push" ? "prepare_push 42" : "prepare_sync_head 42",
-        ].join("\n"),
+      f.shell(
+        "push_prep_head_to_pr_branch() { touch .local/execution-reached; return 73; }",
+        operation === "push" ? "prepare_push 42" : "prepare_sync_head 42",
       );
     expect(publish().status).toBe(1);
     expect(f.has("execution-reached")).toBe(false);
@@ -248,15 +240,13 @@ describePosix("native correction preparation", () => {
 
   it("qualifies the reviewed correction for deferred GitHub gates without success stamps", () => {
     const f = fixture("approved");
-    const result = f.run(
-      [
-        "resolve_pr_gates_remote_mode() { echo github; }",
-        "mark_pr_operation_side_effects_if_available() { :; }",
-        `derive_prepare_gate_change_plan() { PREPARE_GATE_BASE_SHA=${f.incoming}; PREPARE_GATE_CHANGED_FILES=docs/fix.md; PREPARE_GATE_DOCS_ONLY=false; PREPARE_GATE_CHANGELOG_ONLY=false; PREPARE_GATE_CHANGELOG_REQUIRED=false; PREPARE_GATE_CHANGELOG_UPDATE=false; }`,
-        "push_prep_head_to_pr_branch() { touch .local/execution-reached; return 73; }",
-        "prepare_gates 42",
-        "prepare_push 42",
-      ].join("\n"),
+    const result = f.shell(
+      "resolve_pr_gates_remote_mode() { echo github; }",
+      "mark_pr_operation_side_effects_if_available() { :; }",
+      `derive_prepare_gate_change_plan() { PREPARE_GATE_BASE_SHA=${f.incoming}; PREPARE_GATE_CHANGED_FILES=docs/fix.md; PREPARE_GATE_DOCS_ONLY=false; PREPARE_GATE_CHANGELOG_ONLY=false; PREPARE_GATE_CHANGELOG_REQUIRED=false; PREPARE_GATE_CHANGELOG_UPDATE=false; }`,
+      "push_prep_head_to_pr_branch() { touch .local/execution-reached; return 73; }",
+      "prepare_gates 42",
+      "prepare_push 42",
     );
     expect(result.status, result.stdout + result.stderr).toBe(73);
     const gates = f.read("gates.env");
@@ -304,16 +294,14 @@ describePosix("native correction preparation", () => {
         baseRefOid: f.incoming,
         headRefOid: hosted,
       });
-      const result = f.run(
-        [
-          "source .local/prep-context.env",
-          `resolve_prep_publication_target 42 ${local}`,
-          `test "$PREP_PUBLICATION_LEASE_SHA" = ${hosted}`,
-          "require_prepared_review 42",
-          `require_active_org_admin_for_crabbox_gate() { [ '${state}' != revoked ]; }`,
-          `gh() { printf '%s\\n' '${target}'; }`,
-          `require_correction_publication_gates 42 ${local} true`,
-        ].join("\n"),
+      const result = f.shell(
+        "source .local/prep-context.env",
+        `resolve_prep_publication_target 42 ${local}`,
+        `test "$PREP_PUBLICATION_LEASE_SHA" = ${hosted}`,
+        "require_prepared_review 42",
+        `require_active_org_admin_for_crabbox_gate() { [ '${state}' != revoked ]; }`,
+        `gh() { printf '%s\\n' '${target}'; }`,
+        `require_correction_publication_gates 42 ${local} true`,
       );
       const allowed = state === "completed" || state === "pending";
       expect(result.status, result.stdout + result.stderr).toBe(allowed ? 0 : 1);
@@ -337,11 +325,10 @@ describePosix("native correction preparation", () => {
         baseRefOid: f.incoming,
         headRefOid: f.incoming,
       });
-      const result = f.run(
-        [
-          "resolve_pr_gates_remote_mode() { echo crabbox-aws; }",
-          "mark_pr_operation_side_effects_if_available() { :; }",
-          `require_active_org_admin_for_crabbox_gate() {
+      const result = f.shell(
+        "resolve_pr_gates_remote_mode() { echo crabbox-aws; }",
+        "mark_pr_operation_side_effects_if_available() { :; }",
+        `require_active_org_admin_for_crabbox_gate() {
             local phase=qualification
             [ ! -e .local/publication-started ] || phase=publication
             printf '%s\\n' "$phase" >> .local/admin-checks
@@ -349,13 +336,12 @@ describePosix("native correction preparation", () => {
             if [ '${authorization}' = revoked ] && [ "$phase" = publication ]; then return 1; fi
             echo fixture-admin
           }`,
-          `derive_prepare_gate_change_plan() { PREPARE_GATE_BASE_SHA=${f.incoming}; PREPARE_GATE_CHANGED_FILES=docs/fix.md; PREPARE_GATE_DOCS_ONLY=false; PREPARE_GATE_CHANGELOG_ONLY=false; PREPARE_GATE_CHANGELOG_REQUIRED=false; PREPARE_GATE_CHANGELOG_UPDATE=false; }`,
-          `gh() { printf '%s\\n' '${target}'; }`,
-          "push_prep_head_to_pr_branch() { touch .local/execution-reached; return 73; }",
-          "prepare_gates 42",
-          "touch .local/publication-started",
-          "prepare_push 42",
-        ].join("\n"),
+        `derive_prepare_gate_change_plan() { PREPARE_GATE_BASE_SHA=${f.incoming}; PREPARE_GATE_CHANGED_FILES=docs/fix.md; PREPARE_GATE_DOCS_ONLY=false; PREPARE_GATE_CHANGELOG_ONLY=false; PREPARE_GATE_CHANGELOG_REQUIRED=false; PREPARE_GATE_CHANGELOG_UPDATE=false; }`,
+        `gh() { printf '%s\\n' '${target}'; }`,
+        "push_prep_head_to_pr_branch() { touch .local/execution-reached; return 73; }",
+        "prepare_gates 42",
+        "touch .local/publication-started",
+        "prepare_push 42",
       );
       const allowed = !fork && authorization === "granted";
       expect(result.status, result.stdout + result.stderr).toBe(allowed ? 73 : 1);
@@ -409,21 +395,19 @@ describePosix("native correction preparation", () => {
             : change === "Markdown"
               ? "printf 'obsolete presentation\\n' > .local/correction-review.md"
               : ":";
-      const result = f.run(
-        [
-          'source "$script_parent_dir/pr-lib/push.sh"',
-          "PREP_PUBLICATION_PR=42; PREP_PUBLICATION_ALLOW_PENDING=false",
-          "PREP_PUBLICATION_REVIEW_SNAPSHOT=$(correction_review_snapshot 42)",
-          'pr_git() { if [ "$1" = push ]; then touch .local/publication; return 0; fi; git "$@"; }',
-          `pr_gh_plain() { touch .local/publication; printf '%s\\n' '{"data":{"createCommitOnBranch":{"commit":{"oid":"${head}"}}}}'; }`,
-          `verify_prep_commit_range_signed() { ${mutation}; return 0; }`,
-          `verify_prep_head_extends_hosted_head() { git merge-base --is-ancestor "$1" HEAD || return 1; ${mutation}; }`,
-          "PRHEAD_REMOTE_URL=https://example.invalid/repo.git; OPENCLAW_PR_PUSH_MODE=git",
-          'revalidate_pr_publication() { [ "$1" = 42 ] && [ "$2" = fixture-observation ] && [ "$3" = topic ] && [ "$5" = "$(git rev-parse HEAD)" ]; }',
-          route === "git"
-            ? `push_prep_head_once topic ${f.incoming} ${head} 42 fixture-observation`
-            : `graphql_push_to_fork fixture/repo topic ${f.incoming} 42 fixture-observation ${head}`,
-        ].join("\n"),
+      const result = f.shell(
+        'source "$script_parent_dir/pr-lib/push.sh"',
+        "PREP_PUBLICATION_PR=42; PREP_PUBLICATION_ALLOW_PENDING=false",
+        "PREP_PUBLICATION_REVIEW_SNAPSHOT=$(correction_review_snapshot 42)",
+        'pr_git() { if [ "$1" = push ]; then touch .local/publication; return 0; fi; git "$@"; }',
+        `pr_gh_plain() { touch .local/publication; printf '%s\\n' '{"data":{"createCommitOnBranch":{"commit":{"oid":"${head}"}}}}'; }`,
+        `verify_prep_commit_range_signed() { ${mutation}; return 0; }`,
+        `verify_prep_head_extends_hosted_head() { git merge-base --is-ancestor "$1" HEAD || return 1; ${mutation}; }`,
+        "PRHEAD_REMOTE_URL=https://example.invalid/repo.git; OPENCLAW_PR_PUSH_MODE=git",
+        'revalidate_pr_publication() { [ "$1" = 42 ] && [ "$2" = fixture-observation ] && [ "$3" = topic ] && [ "$5" = "$(git rev-parse HEAD)" ]; }',
+        route === "git"
+          ? `push_prep_head_once topic ${f.incoming} ${head} 42 fixture-observation`
+          : `graphql_push_to_fork fixture/repo topic ${f.incoming} 42 fixture-observation ${head}`,
       );
       const changedAuthority = change === "JSON" || change === "publication receipt";
       expect(result.status, result.stdout + result.stderr).toBe(changedAuthority ? 1 : 0);
@@ -442,12 +426,7 @@ describePosix("native correction preparation", () => {
       name.startsWith("correction-review-retained."),
     );
     expect(retained).toBeTruthy();
-    if (!retained) {
-      throw new Error("Missing retained review");
-    }
-    expect(readFileSync(join(f.root, ".local", retained, "correction-review.json"), "utf8")).toBe(
-      original,
-    );
+    expect(f.read(`${retained}/correction-review.json`)).toBe(original);
     expect(f.run("require_prepared_review 42").status).toBe(1);
   });
 
@@ -468,22 +447,20 @@ describePosix("native correction preparation", () => {
         change === "review"
           ? "printf '\\n' >> .local/correction-review.json"
           : `printf '%s' '${changedReceipt}' > .local/prepare-push-result.env`;
-      const result = f.run(
-        [
-          'source "$script_parent_dir/pr-lib/worktree.sh"',
-          'source "$script_parent_dir/pr-lib/push.sh"',
-          "source .local/prep-context.env",
-          "PREP_PUBLICATION_PR=42; PREP_PUBLICATION_ALLOW_PENDING=false",
-          "PREP_PUBLICATION_REVIEW_SNAPSHOT=$(correction_review_snapshot 42)",
-          "resolve_head_push_url() { echo https://example.invalid/repo.git; }",
-          `resolve_prhead_remote_sha() { PRHEAD_REMOTE_SHA=${hosted}; }`,
-          "revalidate_pr_publication() { :; }",
-          `wait_for_pr_head_sha() { PR_OBSERVATION='{"headRefOid":"${hosted}"}'; }`,
-          "verify_pr_publication_identity() { :; }",
-          `fetch_pr_head() { git update-ref "$3" "$2"; ${mutation}; }`,
-          `push_prep_head_to_pr_branch 42 topic ${hosted} ${hosted} .local/prepare-push-result.env "$(cat .local/pr-meta.json)"`,
-          "touch .local/completed",
-        ].join("\n"),
+      const result = f.shell(
+        'source "$script_parent_dir/pr-lib/worktree.sh"',
+        'source "$script_parent_dir/pr-lib/push.sh"',
+        "source .local/prep-context.env",
+        "PREP_PUBLICATION_PR=42; PREP_PUBLICATION_ALLOW_PENDING=false",
+        "PREP_PUBLICATION_REVIEW_SNAPSHOT=$(correction_review_snapshot 42)",
+        "resolve_head_push_url() { echo https://example.invalid/repo.git; }",
+        `resolve_prhead_remote_sha() { PRHEAD_REMOTE_SHA=${hosted}; }`,
+        "revalidate_pr_publication() { :; }",
+        `wait_for_pr_head_sha() { PR_OBSERVATION='{"headRefOid":"${hosted}"}'; }`,
+        "verify_pr_publication_identity() { :; }",
+        `fetch_pr_head() { git update-ref "$3" "$2"; ${mutation}; }`,
+        `push_prep_head_to_pr_branch 42 topic ${hosted} ${hosted} .local/prepare-push-result.env "$(cat .local/pr-meta.json)"`,
+        "touch .local/completed",
       );
       expect(result.status, result.stdout + result.stderr).toBe(1);
       expect(result.stderr).toContain("Correction review authority changed");
