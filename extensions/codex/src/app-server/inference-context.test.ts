@@ -36,6 +36,19 @@ function fixture(assertCurrent = () => {}) {
   return { context, controller, register };
 }
 
+function forkContext(
+  context: ReturnType<typeof createCodexInferenceContext>,
+  overrides: Partial<Parameters<typeof context.fork>[0]> = {},
+) {
+  return context.fork({
+    sourceThreadId: "root",
+    threadId: "fork",
+    signal: new AbortController().signal,
+    assertCurrent: () => {},
+    ...overrides,
+  });
+}
+
 describe("native inference metadata", () => {
   it("reconciles native body and HTTP metadata and rejects conflicting attribution", () => {
     const nested = {
@@ -162,9 +175,7 @@ describe("parent-local inference context", () => {
     expect(() => context.prepare(request("root", parent.generation))).toThrow("current admitted");
     let forkActive = true;
     const forkController = new AbortController();
-    const fork = context.fork({
-      sourceThreadId: "root",
-      threadId: "fork",
+    const fork = forkContext(context, {
       signal: forkController.signal,
       assertCurrent: () => {
         if (!forkActive) {
@@ -178,23 +189,11 @@ describe("parent-local inference context", () => {
     parent.release();
     expect(context.prepare(source).body.instructions).toBe(expectedInstructions);
     expect(() => context.prepare(request("fork", parent.generation))).toThrow("current admitted");
-    expect(() =>
-      context.fork({
-        sourceThreadId: "missing",
-        threadId: "another",
-        signal: forkController.signal,
-        assertCurrent: () => {},
-      }),
-    ).toThrow("prepared parent");
+    expect(() => forkContext(context, { sourceThreadId: "missing", threadId: "another" })).toThrow(
+      "prepared parent",
+    );
     context.forget("root");
-    expect(() =>
-      context.fork({
-        sourceThreadId: "root",
-        threadId: "later",
-        signal: forkController.signal,
-        assertCurrent: () => {},
-      }),
-    ).toThrow("prepared parent");
+    expect(() => forkContext(context, { threadId: "later" })).toThrow("prepared parent");
     expect(context.prepare(source).body.instructions).toBe(expectedInstructions);
     forkActive = false;
     expect(() => context.prepare(source)).toThrow("fork authority ended");
@@ -223,12 +222,7 @@ describe("parent-local inference context", () => {
       input: [{ type: "function_call_output", call_id: "call", output: "one" }],
     });
     parent.release();
-    const fork = context.fork({
-      sourceThreadId: "root",
-      threadId: "fork",
-      signal: new AbortController().signal,
-      assertCurrent: () => {},
-    });
+    const fork = forkContext(context);
     const history = [
       { role: "user", content: "native reconstructed parent task" },
       { role: "assistant", content: "native reconstructed answer" },
@@ -271,13 +265,7 @@ describe("parent-local inference context", () => {
       });
       parent.release();
     };
-    const fork = (index: number) =>
-      contextAt(index).fork({
-        sourceThreadId: "parent",
-        threadId: "fork",
-        signal: new AbortController().signal,
-        assertCurrent: () => {},
-      });
+    const fork = (index: number) => forkContext(contextAt(index), { sourceThreadId: "parent" });
     try {
       prepareParent(0);
       prepareParent(1);
@@ -475,23 +463,17 @@ describe("parent-local inference context", () => {
     context.forget("thread-0");
     const replacement = register("replacement");
     replacement.release();
-    const fork = context.fork({
+    const fork = forkContext(context, {
       sourceThreadId: "replacement",
       threadId: "side",
       signal: controller.signal,
-      assertCurrent: () => {},
     });
     expect(context.prepare(request("side", fork.generation)).body.instructions).toBe(
       "native base\n\nprepared",
     );
     context.close();
     expect(() =>
-      context.fork({
-        sourceThreadId: "replacement",
-        threadId: "after-close",
-        signal: controller.signal,
-        assertCurrent: () => {},
-      }),
+      forkContext(context, { sourceThreadId: "replacement", threadId: "after-close" }),
     ).toThrow("closed");
   });
 

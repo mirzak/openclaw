@@ -32,6 +32,25 @@ afterEach(async () => {
   await cleanupDynamicToolBuildFixture(root, closers);
 });
 
+async function writeProfile(profileDir: string) {
+  await fs.mkdir(profileDir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(
+    path.join(profileDir, "hosts.yml"),
+    "github.com:\n  oauth_token: synthetic-selected-token\n",
+    { mode: 0o600 },
+  );
+}
+
+async function effectCommand(body = '"unexpected"') {
+  const effect = path.join(root, "effect");
+  const script = path.join(root, "write-effect.cjs");
+  await fs.writeFile(script, `require("node:fs").writeFileSync(process.argv[2], ${body});`);
+  const command = [process.execPath, script, effect]
+    .map((value) => JSON.stringify(value))
+    .join(" ");
+  return { effect, command };
+}
+
 async function fixture(
   options: { mode?: "full" | "deny"; assertCurrent?: () => void; mutateSelection?: boolean } = {},
 ) {
@@ -62,12 +81,7 @@ async function fixture(
   closers.push(host.close);
   const environment = host.capabilities.preparedEnvironment!();
   const profileDir = environment.localIdentityEnv.GH_CONFIG_DIR!;
-  await fs.mkdir(profileDir, { recursive: true, mode: 0o700 });
-  await fs.writeFile(
-    path.join(profileDir, "hosts.yml"),
-    "github.com:\n  oauth_token: synthetic-selected-token\n",
-    { mode: 0o600 },
-  );
+  await writeProfile(profileDir);
   if (options.mutateSelection) {
     params.config.tools!.github!.profileId = "ghp_22222222222222222222222222222222";
   }
@@ -104,15 +118,9 @@ describe.skipIf(process.platform === "win32")("Codex host-owned credential execu
     const f = await fixture({ mutateSelection: true });
     expect(f.native).toBe(false);
     expect(f.tools.find((tool) => tool.name === "exec")?.catalogMode).toBe("direct-only");
-    const effect = path.join(root, "effect");
-    const script = path.join(root, "write-effect.cjs");
-    await fs.writeFile(
-      script,
-      'require("node:fs").writeFileSync(process.argv[2], process.env.GH_TOKEN === "synthetic-selected-token" ? "selected" : "wrong");',
+    const { effect, command } = await effectCommand(
+      'process.env.GH_TOKEN === "synthetic-selected-token" ? "selected" : "wrong"',
     );
-    const command = [process.execPath, script, effect]
-      .map((value) => JSON.stringify(value))
-      .join(" ");
     const response = await f.execute(command);
     expect(response, JSON.stringify(response.contentItems)).toMatchObject({ success: true });
     expect(await fs.readFile(effect, "utf8")).toBe("selected");
@@ -121,12 +129,7 @@ describe.skipIf(process.platform === "win32")("Codex host-owned credential execu
     const failed = await f.execute(command);
     expect(JSON.stringify(failed)).toContain("Reconnect or change GitHub Identity");
     expect(await fs.stat(effect).catch(() => undefined)).toBeUndefined();
-    await fs.mkdir(f.profileDir, { recursive: true, mode: 0o700 });
-    await fs.writeFile(
-      path.join(f.profileDir, "hosts.yml"),
-      "github.com:\n  oauth_token: synthetic-selected-token\n",
-      { mode: 0o600 },
-    );
+    await writeProfile(f.profileDir);
     expect(await f.execute(command)).toMatchObject({ success: true });
     expect(await fs.readFile(effect, "utf8")).toBe("selected");
   });
@@ -144,9 +147,7 @@ describe.skipIf(process.platform === "win32")("Codex host-owned credential execu
         },
       });
       expect(f.native).toBe(false);
-      const effect = path.join(root, "forbidden-effect");
-      const script = path.join(root, "forbidden.cjs");
-      await fs.writeFile(script, 'require("node:fs").writeFileSync(process.argv[2], "unexpected")');
+      const { effect, command } = await effectCommand();
       if (state === "closed") {
         f.host.close();
       }
@@ -156,9 +157,7 @@ describe.skipIf(process.platform === "win32")("Codex host-owned credential execu
       if (state === "reassigned") {
         caller = "replacement";
       }
-      const result = await f.execute(
-        [process.execPath, script, effect].map((value) => JSON.stringify(value)).join(" "),
-      );
+      const result = await f.execute(command);
       expect(result.success).toBe(false);
       expect(JSON.stringify(result.contentItems)).toContain(
         state === "denied" ? "denied" : "no longer active",
@@ -192,12 +191,8 @@ describe.skipIf(process.platform === "win32")("Codex host-owned credential execu
           },
         ]),
       );
-      const effect = path.join(root, "after-hook-effect");
-      const script = path.join(root, "after-hook.cjs");
-      await fs.writeFile(script, 'require("node:fs").writeFileSync(process.argv[2], "unexpected")');
-      const pending = f.execute(
-        [process.execPath, script, effect].map((value) => JSON.stringify(value)).join(" "),
-      );
+      const { effect, command } = await effectCommand();
+      const pending = f.execute(command);
       await entered.promise;
       if (state === "closed") {
         f.host.close();

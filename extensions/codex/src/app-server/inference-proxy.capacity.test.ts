@@ -26,13 +26,77 @@ import { WebSocket } from "openclaw/plugin-sdk/websocket-runtime";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { CODEX_INFERENCE_GENERATION_KEY } from "./inference-context.js";
 
+async function fillHttp(
+  http: ReturnType<typeof holdHttpResponses>,
+  count: number,
+  start = () => post(),
+) {
+  const responses: ReturnType<typeof post>[] = [];
+  for (let index = 0; index < count; index += 16) {
+    responses.push(...Array.from({ length: Math.min(16, count - index) }, start));
+    await http.waitFor(responses.length);
+  }
+  return responses;
+}
+
+async function finishHttp(
+  streams: ReadableStreamDefaultController<Uint8Array>[],
+  responses: ReturnType<typeof post>[],
+) {
+  streams.forEach((stream) => stream.close());
+  expect((await Promise.all(responses)).every(({ status }) => status === 200)).toBe(true);
+}
+
+async function idleWebSockets(count: number) {
+  for (let index = 0; index < count; index++) {
+    const stream = await open();
+    await send(stream.client, stream.upstream, prewarm);
+    await complete(stream.client, stream.upstream);
+  }
+}
+
+async function queueHttp(compressed = false) {
+  const controllers = Array.from({ length: 16 }, () => new AbortController());
+  const waiting = [];
+  const closed = [];
+  for (const controller of controllers) {
+    const incoming = once(relayServer(), "request");
+    waiting.push(post(controller.signal, compressed).catch(() => undefined));
+    const [req] = await incoming;
+    closed.push(once(req.socket, "close"));
+  }
+  return { waiting, closed, abort: () => controllers.forEach((controller) => controller.abort()) };
+}
+
+async function pipeline() {
+  const target = new URL(proxy.baseUrl + "/responses");
+  const socket = createConnection({ host: target.hostname, port: Number(target.port) });
+  socket.on("error", () => {});
+  await once(socket, "connect");
+  const body = JSON.stringify(child);
+  const wire = `POST ${target.pathname} HTTP/1.1\r\nHost: ${target.host}\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+  return { socket, wire };
+}
+
+function holdSend(socket: WebSocket, receive: (release: () => void) => void) {
+  const sendNow = socket.send.bind(socket);
+  vi.spyOn(socket, "send").mockImplementation((data, options, callback) => {
+    sendNow(data, options, (error) => receive(() => callback?.(error)));
+  });
+}
+
+async function expectHandshake(response: IncomingMessage, status: number, body: string) {
+  const chunks: Buffer[] = [];
+  for await (const chunk of response) {
+    chunks.push(Buffer.from(chunk));
+  }
+  expect(response.statusCode).toBe(status);
+  expect(Buffer.concat(chunks).toString()).toBe(body);
+}
+
 describe("inference relay capacity", () => {
   it("reclaims completed WebSockets for HTTP pressure without a 16-response bottleneck", async () => {
-    for (let index = 0; index < 64; index++) {
-      const stream = await open();
-      await send(stream.client, stream.upstream, prewarm);
-      await complete(stream.client, stream.upstream);
-    }
+    await idleWebSockets(64);
     const http = holdHttpResponses();
     const responses = Array.from({ length: 16 }, () => post());
     await http.waitFor(16);
@@ -40,10 +104,7 @@ describe("inference relay capacity", () => {
     responses.push(post());
     await Promise.all([closed, http.waitFor(17)]);
     expect(clients.slice(1).every((client) => client.readyState === WebSocket.OPEN)).toBe(true);
-    for (const stream of http.streams) {
-      stream.close();
-    }
-    expect((await Promise.all(responses)).every(({ status }) => status === 200)).toBe(true);
+    await finishHttp(http.streams, responses);
   });
 
   it("keeps a new handshake until its first response completes under resident pressure", async () => {
@@ -74,34 +135,17 @@ describe("inference relay capacity", () => {
     const closed = once(fresh, "close");
     await complete(fresh, upstream);
     await Promise.all([closed, http.waitFor(17)]);
-    for (const stream of http.streams) {
-      stream.close();
-    }
-    expect((await Promise.all(responses)).every(({ status }) => status === 200)).toBe(true);
+    await finishHttp(http.streams, responses);
   });
 
   it("bounds resident HTTP operations at 80 plus 16 waiters and recovers after cancellation", async () => {
     const http = holdHttpResponses();
-    const responses = [];
-    for (let index = 0; index < 80; index += 16) {
-      responses.push(...Array.from({ length: 16 }, () => post()));
-      await http.waitFor(responses.length);
-    }
+    const responses = await fillHttp(http, 80);
     for (let cycle = 0; cycle < 3; cycle++) {
-      const controllers = Array.from({ length: 16 }, () => new AbortController());
-      const waiting = [];
-      const closed = [];
-      for (const controller of controllers) {
-        const incoming = once(relayServer(), "request");
-        waiting.push(post(controller.signal).catch(() => undefined));
-        const [req] = await incoming;
-        closed.push(once(req.socket, "close"));
-      }
+      const { waiting, closed, abort } = await queueHttp();
       expect(await post()).toMatchObject({ status: 503, retryAfter: "1" });
       expect(transport.fetch).toHaveBeenCalledTimes(80);
-      for (const controller of controllers) {
-        controller.abort();
-      }
+      abort();
       await Promise.all(closed);
       expect(await Promise.all(waiting)).toEqual(Array(16).fill(undefined));
     }
@@ -111,10 +155,7 @@ describe("inference relay capacity", () => {
     expect((await firstResponse).status).toBe(200);
     responses.push(post());
     await http.waitFor(81);
-    for (const stream of http.streams.slice(1)) {
-      stream.close();
-    }
-    expect((await Promise.all(responses)).every(({ status }) => status === 200)).toBe(true);
+    await finishHttp(http.streams.slice(1), responses);
   });
 
   it("holds residency through physical upstream closure after a cancelled handshake", async () => {
@@ -138,10 +179,7 @@ describe("inference relay capacity", () => {
       }
     })();
     try {
-      for (let index = 0; index < 79; index += 16) {
-        responses.push(...Array.from({ length: Math.min(16, 79 - index) }, startHttp));
-        await http.waitFor(responses.length);
-      }
+      responses.push(...(await fillHttp(http, 79, startHttp)));
       const received = createDeferred<void>();
       const peerClosed = createDeferred<void>();
       server.removeAllListeners("upgrade");
@@ -218,10 +256,7 @@ describe("inference relay capacity", () => {
         calls: 80,
       });
       await Promise.all([http.waitFor(80), peerClosed.promise]);
-      for (const stream of http.streams) {
-        stream.close();
-      }
-      expect((await Promise.all(responses)).every(({ status }) => status === 200)).toBe(true);
+      await finishHttp(http.streams, responses);
     } finally {
       allowDestroy.resolve();
       responseController.abort();
@@ -231,17 +266,8 @@ describe("inference relay capacity", () => {
 
   it("charges pipelined HTTP operations independently on a shared downstream socket", async () => {
     const http = holdHttpResponses();
-    const responses = [];
-    for (let index = 0; index < 79; index += 16) {
-      responses.push(...Array.from({ length: Math.min(16, 79 - index) }, () => post()));
-      await http.waitFor(responses.length);
-    }
-    const target = new URL(proxy.baseUrl + "/responses");
-    const socket = createConnection({ host: target.hostname, port: Number(target.port) });
-    socket.on("error", () => {});
-    await once(socket, "connect");
-    const body = JSON.stringify(child);
-    const wire = `POST ${target.pathname} HTTP/1.1\r\nHost: ${target.host}\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+    const responses = await fillHttp(http, 79);
+    const { socket, wire } = await pipeline();
     let incoming = 0;
     const received = createDeferred<void>();
     relayServer().on("request", () => {
@@ -255,10 +281,7 @@ describe("inference relay capacity", () => {
     http.streams[0]!.close();
     await responses[0];
     await http.waitFor(81);
-    for (const stream of http.streams.slice(1, 79)) {
-      stream.close();
-    }
-    expect((await Promise.all(responses)).every(({ status }) => status === 200)).toBe(true);
+    await finishHttp(http.streams.slice(1, 79), responses);
     const closed = once(socket, "close");
     socket.destroy();
     await closed;
@@ -268,13 +291,6 @@ describe("inference relay capacity", () => {
     if (process.env.OPENCLAW_VITEST_RUNTIME === "bun") {
       expect(process.versions.bun).toBeTruthy();
     }
-    console.info("inference pipeline worker", {
-      pid: process.pid,
-      node: process.version,
-      bun: process.versions.bun ?? null,
-      platform: process.platform,
-      arch: process.arch,
-    });
     const started = createDeferred<void>();
     const backpressured = createDeferred<void>();
     const released = createDeferred<void>();
@@ -319,12 +335,7 @@ describe("inference relay capacity", () => {
         });
       }
     });
-    const target = new URL(proxy.baseUrl + "/responses");
-    const socket = createConnection({ host: target.hostname, port: Number(target.port) });
-    socket.on("error", () => {});
-    await once(socket, "connect");
-    const body = JSON.stringify(child);
-    const wire = `POST ${target.pathname} HTTP/1.1\r\nHost: ${target.host}\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
+    const { socket, wire } = await pipeline();
     socket.write(wire + wire);
     await Promise.all([started.promise, backpressured.promise]);
     expect(incoming).toHaveLength(2);
@@ -371,10 +382,7 @@ describe("inference relay capacity", () => {
     await next;
     expect(transport.fetch).toHaveBeenCalledTimes(17);
     await Promise.all(uploads.slice(1).map((body) => new Response(body).arrayBuffer()));
-    for (const stream of streams) {
-      stream.close();
-    }
-    expect((await Promise.all(responses)).every(({ status }) => status === 200)).toBe(true);
+    await finishHttp(streams, responses);
   });
 
   it("does not evict a completed response until its final frame has drained", async () => {
@@ -382,19 +390,12 @@ describe("inference relay capacity", () => {
     await send(active.client, active.upstream);
     const downstream = transport.downstreams[0];
     assert(downstream);
-    const nativeSend = downstream.send.bind(downstream);
     let drained: (() => void) | undefined;
-    vi.spyOn(downstream, "send").mockImplementation((data, options, callback) => {
-      nativeSend(data, options, (error) => {
-        drained = () => callback?.(error);
-      });
+    holdSend(downstream, (release) => {
+      drained = release;
     });
     await complete(active.client, active.upstream);
-    for (let index = 0; index < 63; index++) {
-      const stream = await open();
-      await send(stream.client, stream.upstream, prewarm);
-      await complete(stream.client, stream.upstream);
-    }
+    await idleWebSockets(63);
     const oldestIdle = clients[1];
     assert(oldestIdle);
     const evicted = Promise.race([
@@ -447,9 +448,7 @@ describe("inference relay capacity", () => {
     });
     expect(upstreams).toHaveLength(0);
     transport.resolve.mockResolvedValue({ lookup: undefined });
-    for (const resolve of pending) {
-      resolve();
-    }
+    pending.forEach((resolve) => resolve());
     await Promise.all(opened);
     expect(upstreams).toHaveLength(32);
     expect((await post()).status).toBe(200);
@@ -461,10 +460,7 @@ describe("inference relay capacity", () => {
     const busy: number[] = [];
     for (let index = 0; index < 33; index++) {
       const stream = await open();
-      const nativeSend = stream.remote.send.bind(stream.remote);
-      vi.spyOn(stream.remote, "send").mockImplementation((data, options, callback) => {
-        nativeSend(data, options, (error) => releases.push(() => callback?.(error)));
-      });
+      holdSend(stream.remote, (release) => releases.push(release));
       stream.client.on("message", () => busy.push(index));
       streams.push(stream);
     }
@@ -479,22 +475,15 @@ describe("inference relay capacity", () => {
     await Promise.all(first);
     expect(busy).toEqual([32]);
     expect(releases).toHaveLength(16);
-    for (const release of releases.splice(0)) {
-      release();
-    }
+    releases.splice(0).forEach((release) => release());
     await Promise.all(second);
-    for (const release of releases.splice(0)) {
-      release();
-    }
+    releases.splice(0).forEach((release) => release());
   });
 
   it("keeps a late old send callback from releasing the next frame's upload", async () => {
     const reused = await open();
-    const nativeSend = reused.remote.send.bind(reused.remote);
     const callbacks: (() => void)[] = [];
-    vi.spyOn(reused.remote, "send").mockImplementation((data, options, callback) => {
-      nativeSend(data, options, (error) => callbacks.push(() => callback?.(error)));
-    });
+    holdSend(reused.remote, (release) => callbacks.push(release));
     await send(reused.client, reused.upstream);
     await complete(reused.client, reused.upstream);
     await send(reused.client, reused.upstream);
@@ -503,10 +492,7 @@ describe("inference relay capacity", () => {
     const held: (() => void)[] = [];
     for (let index = 0; index < 14; index++) {
       const stream = await open();
-      const sendNow = stream.remote.send.bind(stream.remote);
-      vi.spyOn(stream.remote, "send").mockImplementation((data, options, callback) => {
-        sendNow(data, options, (error) => held.push(() => callback?.(error)));
-      });
+      holdSend(stream.remote, (release) => held.push(release));
       await send(stream.client, stream.upstream);
     }
     const firstCallback = callbacks[0]!;
@@ -519,15 +505,11 @@ describe("inference relay capacity", () => {
     // An idempotent old callback cannot release the second frame again.
     firstCallback();
     callbacks[1]!();
-    for (const release of held) {
-      release();
-    }
+    held.forEach((release) => release());
     await complete(reused.client, reused.upstream);
     // Both original leases must be gone; releasing a mutable newer handle would
     // leave the old frame charged and prevent a complete replacement batch.
-    for (const stream of await holdUploads()) {
-      stream.releaseUpload();
-    }
+    (await holdUploads()).forEach((stream) => stream.releaseUpload());
   });
 
   it("keeps cancelled native decompression charged until its callback settles", async () => {
@@ -539,19 +521,9 @@ describe("inference relay capacity", () => {
         started.resolve();
       }
     };
-    const controllers = Array.from({ length: 16 }, () => new AbortController());
-    const closed = [];
-    const cancelled = [];
-    for (const controller of controllers) {
-      const incoming = once(relayServer(), "request");
-      cancelled.push(post(controller.signal, true).catch(() => undefined));
-      const [req] = await incoming;
-      closed.push(once(req.socket, "close"));
-    }
+    const { waiting: cancelled, closed, abort } = await queueHttp(true);
     await started.promise;
-    for (const controller of controllers) {
-      controller.abort();
-    }
+    abort();
     await Promise.all([...cancelled, ...closed]);
     const replacements = [];
     for (let index = 0; index < 16; index++) {
@@ -564,9 +536,7 @@ describe("inference relay capacity", () => {
     expect((await post()).status).toBe(503);
     expect(jobs).toHaveLength(16);
     transport.decompressions = undefined;
-    for (const finish of jobs.splice(0)) {
-      finish();
-    }
+    jobs.splice(0).forEach((finish) => finish());
     expect((await Promise.all(replacements)).every(({ status }) => status === 200)).toBe(true);
     expect(transport.fetch).toHaveBeenCalledTimes(16);
   });
@@ -590,20 +560,10 @@ describe("inference relay capacity", () => {
   it("bounds queued HTTP work, cancels waiters, and admits a later request", async () => {
     const streams = await holdUploads();
     for (let cycle = 0; cycle < 3; cycle++) {
-      const controllers = Array.from({ length: 16 }, () => new AbortController());
-      const waiting = [];
-      const disconnected = [];
-      for (const controller of controllers) {
-        const received = once(relayServer(), "request");
-        waiting.push(post(controller.signal).catch(() => undefined));
-        const [incoming] = await received;
-        disconnected.push(once(incoming.socket, "close"));
-      }
+      const { waiting, closed, abort } = await queueHttp();
       expect(await post()).toMatchObject({ status: 503, retryAfter: "1" });
-      for (const controller of controllers) {
-        controller.abort();
-      }
-      await Promise.all(disconnected);
+      abort();
+      await Promise.all(closed);
       expect(await Promise.all(waiting)).toEqual(Array(16).fill(undefined));
     }
     const first = streams[0];
@@ -677,9 +637,7 @@ describe("inference relay capacity", () => {
         await forwarded;
         expect(staleForwarded).not.toHaveBeenCalled();
         await complete(next.client, next.upstream);
-        for (const stream of streams) {
-          stream.releaseUpload();
-        }
+        streams.forEach((stream) => stream.releaseUpload());
         registration.release();
         const closedSockets: Promise<unknown>[] = [];
         for (const stream of [stale, next, ...streams]) {
@@ -717,12 +675,9 @@ describe("inference relay capacity", () => {
         dns.resolve({ lookup: undefined });
       }
       const [, response] = await rejected;
-      const chunks: Buffer[] = [];
-      for await (const chunk of response) {
-        chunks.push(Buffer.from(chunk));
-      }
-      expect(response.statusCode).toBe(504);
-      expect(Buffer.concat(chunks).toString()).toBe(
+      await expectHandshake(
+        response,
+        504,
         "Codex parent-local inference transport failed; retry on a fresh connection.",
       );
       dns.resolve({ lookup: undefined });
@@ -790,19 +745,14 @@ describe("inference relay capacity", () => {
         finishBody();
       }
       const [, response] = await rejected;
-      const chunks: Buffer[] = [];
-      for await (const chunk of response) {
-        chunks.push(Buffer.from(chunk));
-      }
-      expect(response.statusCode).toBe(504);
-      expect(Buffer.concat(chunks).toString()).toBe(
+      await expectHandshake(
+        response,
+        504,
         "Codex parent-local inference transport failed; retry on a fresh connection.",
       );
       stalled.terminate();
       await Promise.all([closed, disconnected.promise]);
-      for (const handler of handlers) {
-        server.on("upgrade", handler);
-      }
+      handlers.forEach((handler) => server.on("upgrade", handler));
       expect(await holdUploads()).toHaveLength(16);
     },
   );
@@ -831,12 +781,7 @@ describe("inference relay capacity", () => {
     expect(downstream.destroyed).toBe(false);
     flush();
     const [, response] = await rejected;
-    const chunks: Buffer[] = [];
-    for await (const chunk of response) {
-      chunks.push(Buffer.from(chunk));
-    }
-    expect(response.statusCode).toBe(401);
-    expect(Buffer.concat(chunks).toString()).toBe("denied");
+    await expectHandshake(response, 401, "denied");
   });
 
   it("expires only proven idle connections, not active streams, then admits their replacements", async () => {

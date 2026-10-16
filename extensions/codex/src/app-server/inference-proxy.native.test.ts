@@ -146,6 +146,55 @@ async function startNative(
   return client;
 }
 
+function responseEvents(id: string, item?: JsonObject) {
+  return [
+    { type: "response.created", response: { id } },
+    ...(item ? [{ type: "response.output_item.done", item }] : []),
+    {
+      type: "response.completed",
+      response: { id, usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } },
+    },
+  ];
+}
+
+const assistantMessage = (id: string, text: string) => ({
+  type: "message",
+  role: "assistant",
+  id,
+  content: [{ type: "output_text", text }],
+});
+
+function nativeConfig(model: string, provider: string, extra: string[] = []) {
+  return [
+    `model=${JSON.stringify(model)}`,
+    `model_provider=${JSON.stringify(provider)}`,
+    'cli_auth_credentials_store="ephemeral"',
+    'web_search="disabled"',
+    'approval_policy="never"',
+    'sandbox_mode="read-only"',
+    "allow_login_shell=false",
+    "[features]",
+    "shell_snapshot=false",
+    ...extra,
+    "[analytics]",
+    "enabled=false",
+    "[feedback]",
+    "enabled=false",
+  ];
+}
+
+function fixtureProvider(name: string, baseUrl: string, websockets: boolean) {
+  return [
+    `[model_providers.${websockets ? "admission" : "http"}-fixture]`,
+    `name=${JSON.stringify(name)}`,
+    `base_url=${JSON.stringify(baseUrl)}`,
+    'wire_api="responses"',
+    "requires_openai_auth=false",
+    `supports_websockets=${websockets}`,
+    ...(!websockets ? ["request_max_retries=1"] : []),
+  ];
+}
+
 // One real app-server complements the deterministic admission/clock tests.
 // It never reaches a provider or the operator's HOME.
 describe.skipIf(process.platform === "win32")("native inference admission", () => {
@@ -201,16 +250,9 @@ describe.skipIf(process.platform === "win32")("native inference admission", () =
       let spawned = false;
       const reply = (socket: WebSocket, item?: JsonObject) => {
         const id = `synthetic-${++responseSequence}`;
-        socket.send(JSON.stringify({ type: "response.created", response: { id } }));
-        if (item) {
-          socket.send(JSON.stringify({ type: "response.output_item.done", item }));
+        for (const event of responseEvents(id, item)) {
+          socket.send(JSON.stringify(event));
         }
-        socket.send(
-          JSON.stringify({
-            type: "response.completed",
-            response: { id, usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } },
-          }),
-        );
       };
       const finish = (threadId: string) => {
         const socket = held.get(threadId);
@@ -218,12 +260,7 @@ describe.skipIf(process.platform === "win32")("native inference admission", () =
           throw new Error("Fixture thread has no held response");
         }
         held.delete(threadId);
-        reply(socket, {
-          type: "message",
-          role: "assistant",
-          id: `answer-${responseSequence}`,
-          content: [{ type: "output_text", text: "synthetic complete" }],
-        });
+        reply(socket, assistantMessage(`answer-${responseSequence}`, "synthetic complete"));
         changed.emit("changed");
       };
       wss.on("connection", (socket) => {
@@ -265,12 +302,7 @@ describe.skipIf(process.platform === "win32")("native inference admission", () =
                 arguments: JSON.stringify({ message: "Reply synthetic child complete." }),
               });
             } else {
-              reply(socket, {
-                type: "message",
-                role: "assistant",
-                id: "parent-answer",
-                content: [{ type: "output_text", text: "Child dispatched." }],
-              });
+              reply(socket, assistantMessage("parent-answer", "Child dispatched."));
             }
           } else {
             held.set(info.thread_id, socket);
@@ -306,34 +338,12 @@ describe.skipIf(process.platform === "win32")("native inference admission", () =
       await fs.writeFile(
         path.join(native.codexHome, "config.toml"),
         [
-          'model="gpt-5.5"',
-          'model_provider="admission-fixture"',
-          'cli_auth_credentials_store="ephemeral"',
-          'web_search="disabled"',
-          'approval_policy="never"',
-          'sandbox_mode="read-only"',
-          "allow_login_shell=false",
-          "[features]",
-          "shell_snapshot=false",
-          "multi_agent=true",
-          "multi_agent_v2=false",
-          "[analytics]",
-          "enabled=false",
-          "[feedback]",
-          "enabled=false",
-          "[model_providers.admission-fixture]",
-          'name="Synthetic admission provider"',
-          `base_url=${JSON.stringify(proxy.baseUrl)}`,
-          'wire_api="responses"',
-          "requires_openai_auth=false",
-          "supports_websockets=true",
-          "[model_providers.http-fixture]",
-          'name="Synthetic HTTP provider"',
-          `base_url=${JSON.stringify(proxy.baseUrl)}`,
-          'wire_api="responses"',
-          "requires_openai_auth=false",
-          "supports_websockets=false",
-          "request_max_retries=1",
+          ...nativeConfig("gpt-5.5", "admission-fixture", [
+            "multi_agent=true",
+            "multi_agent_v2=false",
+          ]),
+          ...fixtureProvider("Synthetic admission provider", proxy.baseUrl, true),
+          ...fixtureProvider("Synthetic HTTP provider", proxy.baseUrl, false),
         ].join("\n"),
       );
       const client = await startNative(context, native);
@@ -457,22 +467,10 @@ describe.skipIf(process.platform === "win32")("native inference admission", () =
           };
         }
         const id = "http-retry-response";
-        const events = [
-          { type: "response.created", response: { id } },
-          {
-            type: "response.output_item.done",
-            item: {
-              type: "message",
-              role: "assistant",
-              id: "http-answer",
-              content: [{ type: "output_text", text: "synthetic HTTP complete" }],
-            },
-          },
-          {
-            type: "response.completed",
-            response: { id, usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } },
-          },
-        ];
+        const events = responseEvents(
+          id,
+          assistantMessage("http-answer", "synthetic HTTP complete"),
+        );
         return {
           response: new Response(
             events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""),
@@ -506,21 +504,7 @@ describe.skipIf(process.platform === "win32")("native inference admission", () =
       context.onTestFinished(() => proxy.close());
       await fs.writeFile(
         path.join(native.codexHome, "config.toml"),
-        [
-          `model=${JSON.stringify(process.env.OPENCLAW_LIVE_CODEX_MODEL || "gpt-5.5")}`,
-          'model_provider="openai"',
-          'cli_auth_credentials_store="ephemeral"',
-          'web_search="disabled"',
-          'approval_policy="never"',
-          'sandbox_mode="read-only"',
-          "allow_login_shell=false",
-          "[features]",
-          "shell_snapshot=false",
-          "[analytics]",
-          "enabled=false",
-          "[feedback]",
-          "enabled=false",
-        ].join("\n"),
+        nativeConfig(process.env.OPENCLAW_LIVE_CODEX_MODEL || "gpt-5.5", "openai").join("\n"),
       );
       const client = await startNative(context, native);
       await client.request("account/login/start", { type: "apiKey", apiKey });
