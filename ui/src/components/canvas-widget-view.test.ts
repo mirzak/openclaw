@@ -26,6 +26,7 @@ import { flush } from "../test-helpers/solid-settle.ts";
 import { CanvasWidgetView, type OpenClawCanvasWidgetView } from "./canvas-widget-view.ts";
 import { WIDGET_PROMPT_EVENT } from "./mcp-app-security.ts";
 
+const repeat = (length: number) => "x".repeat(length);
 const elementName = "openclaw-canvas-widget-view";
 const documentView: CanvasDocumentViewResult = {
   html: "<p>Widget ready</p>",
@@ -116,10 +117,11 @@ function message(
   data: unknown,
   ports: MessagePort[] = [],
   origin?: string,
+  source: MessageEventSource | null = frame.contentWindow,
 ) {
   window.dispatchEvent(
     new MessageEvent("message", {
-      source: frame.contentWindow,
+      source,
       origin: origin ?? new URL(frame.src).origin,
       data,
       ports,
@@ -146,6 +148,11 @@ function expectRead(client: { request: ReturnType<typeof vi.fn> }, docId: string
     { docId },
     { timeoutMs: 30_000 },
   );
+}
+
+function expectRecovering(view: OpenClawCanvasWidgetView) {
+  expect(view.querySelector('[role="alert"]')).toBeNull();
+  expect(view.querySelector('[role="status"]')?.textContent).toContain("recover automatically");
 }
 
 describe("Canvas widget view", () => {
@@ -249,8 +256,7 @@ describe("Canvas widget view", () => {
     expect(interactiveFrame.hasAttribute("srcdoc")).toBe(false);
     interactiveFrame.dispatchEvent(new Event("error"));
     await view.updateComplete;
-    expect(view.querySelector('[role="alert"]')).toBeNull();
-    expect(view.querySelector('[role="status"]')?.textContent).toContain("recover automatically");
+    expectRecovering(view);
     view.allowScripts = false;
     await view.updateComplete;
     expect(view.querySelector("iframe")?.srcdoc).toBe(documentView.html);
@@ -369,15 +375,14 @@ describe("Canvas widget view", () => {
     });
     const scrollSibling = vi.fn();
     sibling.scrollBy = scrollSibling;
-    const client = { request: vi.fn().mockResolvedValue(documentView) };
-    const view = mount(client, "cv_scroll", thread);
-    const start = async (frame: HTMLIFrameElement) => {
-      const post = vi.spyOn(frame.contentWindow!, "postMessage");
-      proxyReady(frame);
+    const { view, frame } = await loaded("cv_scroll", thread);
+    const start = async (target: HTMLIFrameElement) => {
+      const post = vi.spyOn(target.contentWindow!, "postMessage");
+      proxyReady(target);
       await settle(view);
       expect(post).toHaveBeenCalledWith(
         { type: "openclaw:widget-board-host", nonce: expect.any(String) },
-        new URL(frame.src).origin,
+        new URL(target.src).origin,
       );
       const nonce = post.mock.calls.find(([data]) => data.type === "openclaw:widget-board-host")![0]
         .nonce;
@@ -385,18 +390,17 @@ describe("Canvas widget view", () => {
         ([data]) => data.method === "ui/notifications/sandbox-resource-ready",
       )![0].params.renderId;
       post.mockClear();
-      message(frame, {
+      message(target, {
         method: "ui/notifications/sandbox-resource-loaded",
         params: { renderId },
       });
       // Stored wrappers can miss host state until their document finishes loading.
       expect(post).toHaveBeenCalledWith(
         { type: "openclaw:widget-board-host", nonce },
-        new URL(frame.src).origin,
+        new URL(target.src).origin,
       );
       return nonce;
     };
-    const frame = await frameFor(view);
     const nonce = await start(frame);
     const scroll = { type: "openclaw:widget-scroll", nonce, deltaY: 120 };
     const foreignFrame = document.createElement("iframe");
@@ -426,13 +430,7 @@ describe("Canvas widget view", () => {
     const currentNonce = await start(current);
     expect(currentNonce).not.toBe(nonce);
     message(current, scroll);
-    window.dispatchEvent(
-      new MessageEvent("message", {
-        source: oldSource,
-        origin: new URL(current.src).origin,
-        data: { ...scroll, nonce: currentNonce },
-      }),
-    );
+    message(current, { ...scroll, nonce: currentNonce }, [], undefined, oldSource);
     expect(events).toEqual([]);
     message(current, { ...scroll, nonce: currentNonce, deltaY: -80 });
     expect(events).toEqual([
@@ -451,9 +449,7 @@ describe("Canvas widget view", () => {
   it.each(["credential", "session", "denied"])(
     "retires retained content after %s changes",
     async (change) => {
-      const client = { request: vi.fn().mockResolvedValue(documentView) };
-      const view = mount(client);
-      const frame = await frameFor(view);
+      const { client, view, frame } = await loaded();
       connection(view, "reconnecting");
       await settle(view);
       client.request.mockRejectedValue(
@@ -575,30 +571,12 @@ describe("Canvas widget view", () => {
   });
 
   it.each([
-    {
-      label: "surrogate title boundary",
-      title: `${"x".repeat(79)}😀tail`,
-      expectedTitle: "x".repeat(79),
-      message: "x".repeat(600),
-      expectedMessage: "x".repeat(500),
-    },
-    {
-      label: "surrogate message boundary",
-      title: "Status",
-      expectedTitle: "Status",
-      message: `${"x".repeat(499)}😀tail`,
-      expectedMessage: "x".repeat(499),
-    },
-    {
-      label: "stored dangling surrogate",
-      title: "Status",
-      expectedTitle: "Status",
-      message: `${"x".repeat(499)}\ud83d`,
-      expectedMessage: `${"x".repeat(499)}\ufffd`,
-    },
+    ["surrogate title", `${repeat(79)}😀tail`, repeat(79), repeat(600), repeat(500)],
+    ["surrogate message", "Status", "Status", `${repeat(499)}😀tail`, repeat(499)],
+    ["dangling surrogate", "Status", "Status", `${repeat(499)}\ud83d`, `${repeat(499)}\ufffd`],
   ])(
-    "shows a bounded script error and wakes only once with a $label",
-    async ({ label, title, expectedTitle, message: errorMessage, expectedMessage }) => {
+    "bounds script errors and wakes once at the %s boundary",
+    async (label, title, expectedTitle, errorMessage, expectedMessage) => {
       const now = 1_800_000_000_000;
       vi.spyOn(Date, "now").mockReturnValue(now);
       const client = { request: vi.fn().mockResolvedValue(documentView) };
@@ -615,13 +593,7 @@ describe("Canvas widget view", () => {
         column: 7,
       };
       message(frame, report, [], "https://wrong.example");
-      window.dispatchEvent(
-        new MessageEvent("message", {
-          source: window,
-          origin: new URL(frame.src).origin,
-          data: report,
-        }),
-      );
+      message(frame, report, [], undefined, window);
       expect(client.request).toHaveBeenCalledOnce();
       message(frame, report);
       message(frame, report);

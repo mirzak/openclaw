@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, expect, vi } from "vitest";
+import { afterEach, beforeEach, expect, onTestFinished, vi } from "vitest";
 import type { SessionsListResult } from "../api/types.ts";
 import { createAgentSelectionCapability } from "../app/agent-selection.ts";
 import { createApplicationConfigCapability } from "../app/config.ts";
 import type { ApplicationContext, ApplicationGateway } from "../app/context.ts";
+import { createWebPushCapability } from "../app/web-push.ts";
 import { createAgentIdentityCapability } from "../lib/agents/identity.ts";
 import { createAgentCapability } from "../lib/agents/index.ts";
 import { invalidateChatMetadataStore } from "../lib/chat/chat-metadata-cache.ts";
@@ -121,15 +122,6 @@ export function createGateway(
   };
 }
 
-const disposeContexts = new Set<() => void>();
-
-afterEach(() => {
-  for (const dispose of disposeContexts) {
-    dispose();
-  }
-  disposeContexts.clear();
-});
-
 export function createContext(
   gateway: ApplicationGateway,
   list: ApplicationContext["sessions"]["list"] = vi.fn(async () => null),
@@ -139,7 +131,7 @@ export function createContext(
   // Keep the canonical empty roster and subscription lifecycle, not a fabricated agent.
   agents.ensureList = async () => null;
   const agentSelection = createAgentSelectionCapability(gateway, agents);
-  disposeContexts.add(() => {
+  onTestFinished(() => {
     agentSelection.dispose();
     agents.dispose();
   });
@@ -175,14 +167,59 @@ export async function mountPalette(context = createContext(createGateway(true).g
   provider.append(palette);
   document.body.append(provider);
   await palette.updateComplete;
-  return { palette, provider };
+  const query: typeof palette.querySelector = palette.querySelector.bind(palette);
+  const queryAll: typeof palette.querySelectorAll = palette.querySelectorAll.bind(palette);
+  return { palette, provider, query, queryAll };
+}
+
+export async function mountSearch(
+  options: Parameters<typeof createGateway>[1] = {},
+  list: ApplicationContext["sessions"]["list"] = vi.fn(async () => null),
+) {
+  const harness = createGateway(true, options);
+  const context = createContext(harness.gateway, list);
+  return { ...harness, context, ...(await mountPalette(context)) };
+}
+
+export function prepareDraftContext(context: ApplicationContext) {
+  const connection = createApplicationGateway(context.gateway.snapshot);
+  Object.assign(connection.gateway, {
+    connectionRevision: 1,
+    connection: context.gateway.connection,
+    setSessionKey: context.gateway.setSessionKey,
+  });
+  const webPush = createWebPushCapability(connection.gateway);
+  onTestFinished(() => webPush.dispose());
+  Object.assign(context, {
+    gateway: connection.gateway,
+    webPush,
+    navigate: vi.fn(),
+    agentIdentity: {
+      subscribe: () => () => {},
+      ensure: vi.fn(async () => {}),
+      get: () => undefined,
+    },
+  });
+  Object.assign(context.agentSelection, { subscribe: () => () => {} });
+  Object.assign(context.agents.state, { connected: true, client: context.gateway.snapshot.client });
+  Object.assign(context.sessions, { list: vi.fn(async () => null) });
+  return () => connection.publish(context.gateway.snapshot);
 }
 
 export async function enterQuery(palette: CommandPalette, query: string) {
-  palette.openPalette();
-  await palette.updateComplete;
+  await openPalette(palette);
   setInputValue(paletteInput(palette), query, true);
   await palette.updateComplete;
+}
+
+export async function openPalette(palette: CommandPalette) {
+  palette.openPalette();
+  await palette.updateComplete;
+}
+
+export async function searchPalette(palette: CommandPalette, query: string) {
+  await enterQuery(palette, query);
+  await settlePalette(palette);
 }
 
 export const paletteInput = (palette: CommandPalette) =>

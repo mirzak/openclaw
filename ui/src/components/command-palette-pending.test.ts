@@ -14,12 +14,32 @@ import {
   expectPalettePromptMode,
   findPaletteOption,
   mountPalette,
+  mountSearch,
+  searchPalette,
   settlePalette,
   paletteInput,
   setInputValue,
   pressKey,
 } from "./command-palette.test-support.ts";
 import "./command-palette.tsx";
+
+function transcriptResult(roster: SessionsListResult, snippet: string): SessionsSearchResult {
+  const sessionKey = roster.sessions[0]!.key;
+  return {
+    sessions: roster.sessions,
+    results: [
+      {
+        sessionKey,
+        sessionId: sessionKey.split(":").at(-1)!,
+        messageId: "message",
+        role: "assistant",
+        timestamp: 1,
+        score: 1,
+        snippet,
+      },
+    ],
+  };
+}
 
 describe("CommandPalette pending searches", () => {
   let restoreDialogPolyfill: () => void;
@@ -40,25 +60,23 @@ describe("CommandPalette pending searches", () => {
     "debounces input until the final key or IME commit: %s",
     async (composing) => {
       const request = vi.fn(async (_method: string) => ({ sessions: [], results: [], models: [] }));
-      const { gateway } = createGateway(true, { methods: ["sessions.search"], request });
       const list = vi.fn(async () => null);
-      const { palette } = await mountPalette(createContext(gateway, list));
+      const { palette, query } = await mountSearch({ methods: ["sessions.search"], request }, list);
       await enterQuery(palette, composing ? "plugins" : "");
-      const original = palette.querySelector(".cmd-palette__search")!.textContent;
+      const original = query(".cmd-palette__search")!.textContent;
       const input = paletteInput(palette);
       if (composing) {
         input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
       }
-      for (const query of composing
+      for (const value of composing
         ? ["plugin"]
         : ["p", "pl", "plu", "plug", "plugi", "plugin", "plugins"]) {
-        setInputValue(input, query);
+        setInputValue(input, value);
         await palette.updateComplete;
-        expect(input.value).toBe(query);
-        expect(palette.querySelector(".cmd-palette__search")!.textContent).toBe(original);
+        expect(input.value).toBe(value);
+        expect(query(".cmd-palette__search")!.textContent).toBe(original);
         await vi.advanceTimersByTimeAsync(100);
-        expect(list).not.toHaveBeenCalled();
-        expect(request).not.toHaveBeenCalled();
+        expect([list.mock.calls, request.mock.calls]).toEqual([[], []]);
       }
       if (composing) {
         await vi.advanceTimersByTimeAsync(200);
@@ -85,9 +103,11 @@ describe("CommandPalette pending searches", () => {
     const request = vi.fn(async (method: string) =>
       method === "sessions.search" ? { results: [], sessions: [] } : { models: [] },
     );
-    const { gateway } = createGateway(true, { methods: ["sessions.search"], request });
     const list = vi.fn(async () => createSessionResult("agent:main:plugins", "Plugins discussion"));
-    const { palette } = await mountPalette(createContext(gateway, list));
+    const { palette, queryAll } = await mountSearch(
+      { methods: ["sessions.search"], request },
+      list,
+    );
     await enterQuery(palette, "plugins");
     expect(palette.textContent).not.toContain("Searching sessions");
     await vi.advanceTimersByTimeAsync(199);
@@ -98,11 +118,9 @@ describe("CommandPalette pending searches", () => {
     await palette.updateComplete;
     await settlePalette(palette, 100);
 
-    expect(list).not.toHaveBeenCalled();
-    expect(request).not.toHaveBeenCalled();
+    expect([list.mock.calls, request.mock.calls]).toEqual([[], []]);
     expectPalettePromptMode(palette);
-    const enter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
-    input.dispatchEvent(enter);
+    pressKey(input, "Enter", { cancelable: true });
     expect(palette.onNavigate).not.toHaveBeenCalled();
     expect(palette.onSelectSession).not.toHaveBeenCalled();
     expect(palette.isOpen).toBe(true);
@@ -111,7 +129,7 @@ describe("CommandPalette pending searches", () => {
     setInputValue(input, "");
     await palette.updateComplete;
     expect(findPaletteOption(palette, "Plugins", true)).toBeDefined();
-    expect(palette.querySelectorAll('[role="option"]').length).toBeGreaterThan(0);
+    expect(queryAll('[role="option"]').length).toBeGreaterThan(0);
     expect(list).not.toHaveBeenCalled();
 
     setInputValue(input, "plugins");
@@ -122,7 +140,7 @@ describe("CommandPalette pending searches", () => {
       expect.objectContaining({ query: "plugins" }),
     );
     expect(request).toHaveBeenCalledWith("models.list", expect.anything());
-    expect(palette.querySelectorAll(".cmd-palette__filter")).toHaveLength(3);
+    expect(queryAll(".cmd-palette__filter")).toHaveLength(3);
     findPaletteOption(palette, "Plugins discussion")!.click();
     expect(palette.onSelectSession).toHaveBeenCalledWith("agent:main:plugins");
   });
@@ -138,9 +156,11 @@ describe("CommandPalette pending searches", () => {
     const request = vi.fn((method: string) =>
       method === "sessions.search" ? transcript.promise : catalog.promise,
     );
-    const { gateway } = createGateway(true, { methods: ["sessions.search"], request });
     const list = vi.fn(() => metadata.promise);
-    const { palette } = await mountPalette(createContext(gateway, list));
+    const { palette, query, queryAll } = await mountSearch(
+      { methods: ["sessions.search"], request },
+      list,
+    );
     await enterQuery(palette, "zzfixtureunique");
     await vi.advanceTimersByTimeAsync(200);
     expect(list).toHaveBeenCalledOnce();
@@ -152,18 +172,7 @@ describe("CommandPalette pending searches", () => {
     const stale = createSessionResult("agent:main:stale", "zzfixtureunique stale session");
     metadata.resolve(stale);
     transcript.resolve({
-      sessions: stale.sessions,
-      results: [
-        {
-          sessionKey: "agent:main:stale",
-          sessionId: "stale",
-          messageId: "message",
-          role: "assistant",
-          timestamp: 1,
-          score: 1,
-          snippet: "zzfixtureunique stale transcript",
-        },
-      ],
+      ...transcriptResult(stale, "zzfixtureunique stale transcript"),
       indexing: true,
       archivedTranscriptsExcluded: 2,
     });
@@ -180,9 +189,9 @@ describe("CommandPalette pending searches", () => {
 
     setInputValue(input, "zzfixtureunique");
     await palette.updateComplete;
-    expect(palette.querySelector('[inert][aria-hidden="true"]')).toBeNull();
-    expect(palette.querySelectorAll('[role="option"]')).toHaveLength(0);
-    expect(palette.querySelector(".cmd-palette__source-error")).toBeNull();
+    expect(query('[inert][aria-hidden="true"]')).toBeNull();
+    expect(queryAll('[role="option"]')).toHaveLength(0);
+    expect(query(".cmd-palette__source-error")).toBeNull();
     expect(list).toHaveBeenCalledOnce();
     expect(request).toHaveBeenCalledTimes(2);
   });
@@ -191,11 +200,10 @@ describe("CommandPalette pending searches", () => {
     "announces session search through debounce and deferred settlement: %s",
     async (outcome) => {
       const deferred = createDeferred<SessionsListResult | null>();
-      const { gateway } = createGateway(true);
       const list = vi.fn(() => deferred.promise);
-      const { palette } = await mountPalette(createContext(gateway, list));
+      const { palette, query, queryAll } = await mountSearch({}, list);
       await enterQuery(palette, outcome === "static command" ? "plugins" : "zzfixtureunique");
-      const results = palette.querySelector('[role="listbox"]')!;
+      const results = query('[role="listbox"]')!;
       expect(results.getAttribute("aria-busy")).toBe("true");
       expect(palette.textContent).not.toContain("Searching sessions");
       expect(palette.textContent).not.toContain("No results");
@@ -203,7 +211,7 @@ describe("CommandPalette pending searches", () => {
       expect(list).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(1);
       expect(list).toHaveBeenCalledOnce();
-      expect(palette.querySelector('.cmd-palette__search [role="status"]')?.textContent).toContain(
+      expect(query('.cmd-palette__search [role="status"]')?.textContent).toContain(
         "Searching sessions",
       );
       expect(results.getAttribute("aria-busy")).toBe("true");
@@ -212,7 +220,7 @@ describe("CommandPalette pending searches", () => {
         expect(palette.onNavigate).toHaveBeenCalledWith("plugins");
         return;
       }
-      expect(palette.querySelectorAll('[role="option"]')).toHaveLength(0);
+      expect(queryAll('[role="option"]')).toHaveLength(0);
       if (outcome === "failure") {
         deferred.reject(new Error("Search failed"));
       } else {
@@ -230,7 +238,7 @@ describe("CommandPalette pending searches", () => {
         expect(palette.onSelectSession).toHaveBeenCalledWith("agent:main:fixture");
       } else if (outcome === "empty") {
         expect(palette.textContent).toContain("No results found");
-        const empty = palette.querySelector(".cmd-palette__no-results")!;
+        const empty = query(".cmd-palette__no-results")!;
         expect(empty.querySelector("h2")?.textContent).toBe("No results found");
         expect(empty.textContent).toContain("to start a new session.");
         expect(empty.querySelector("button")).toBeNull();
@@ -244,30 +252,28 @@ describe("CommandPalette pending searches", () => {
   it("waits for uncached command sources without announcing a session search when unavailable", async () => {
     const catalog = createDeferred<{ models: { id: string; provider: string; name: string }[] }>();
     const request = vi.fn(() => catalog.promise);
-    const { gateway } = createGateway(true, { request });
     const list = vi.fn(async () => null);
-    const { palette } = await mountPalette(createContext(gateway, list));
+    const { palette, query } = await mountSearch({ request }, list);
     palette.onSelectSession = undefined;
     await enterQuery(palette, "zzcatalog");
     expect(palette.textContent).not.toContain("Searching commands");
     await vi.advanceTimersByTimeAsync(200);
     expect(palette.textContent).toContain("Searching commands");
     expect(palette.textContent).not.toContain("Searching sessions");
-    expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
+    expect(query('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
     expect(palette.textContent).not.toContain("No results");
     const input = paletteInput(palette);
     setInputValue(input, "z");
     await palette.updateComplete;
-    expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
+    expect(query('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
     expect(palette.textContent).not.toContain("No results");
     catalog.resolve({ models: [{ id: "fixture", provider: "fixture", name: "zzcatalog model" }] });
     await settlePalette(palette);
     expect(findPaletteOption(palette, "zzcatalog model")).toBeDefined();
-    expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
-    await enterQuery(palette, "zzmissing");
-    await settlePalette(palette);
+    expect(query('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
+    await searchPalette(palette, "zzmissing");
     expect(palette.textContent).toContain("No results");
-    expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
+    expect(query('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
     expect(request).toHaveBeenCalledOnce();
     expect(list).not.toHaveBeenCalled();
   });
@@ -278,32 +284,21 @@ describe("CommandPalette pending searches", () => {
     const list = vi.fn<ApplicationContext["sessions"]["list"]>(async (options) =>
       options?.search ? { ...roster, sessions: [] } : roster,
     );
-    const { gateway } = createGateway(true, {
-      methods: ["sessions.search"],
-      request: (method) => (method === "sessions.search" ? transcript.promise : { models: [] }),
-    });
-    const { palette } = await mountPalette(createContext(gateway, list));
+    const { palette, query } = await mountSearch(
+      {
+        methods: ["sessions.search"],
+        request: (method) => (method === "sessions.search" ? transcript.promise : { models: [] }),
+      },
+      list,
+    );
     await enterQuery(palette, "zzfixtureunique");
     await vi.advanceTimersByTimeAsync(200);
     expect(list).toHaveBeenCalledOnce();
-    expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
+    expect(query('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
     expect(palette.textContent).not.toContain("No results");
-    transcript.resolve({
-      sessions: roster.sessions,
-      results: [
-        {
-          sessionKey: "agent:main:fixture",
-          sessionId: "fixture",
-          messageId: "message",
-          role: "assistant",
-          timestamp: 1,
-          score: 1,
-          snippet: "zzfixtureunique transcript match",
-        },
-      ],
-    });
+    transcript.resolve(transcriptResult(roster, "zzfixtureunique transcript match"));
     await settlePalette(palette, 0);
-    expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
+    expect(query('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
     expect(findPaletteOption(palette, "Unrelated title")?.textContent).toContain(
       "zzfixtureunique transcript match",
     );
@@ -340,11 +335,10 @@ describe("CommandPalette pending searches", () => {
       const list = vi.fn<ApplicationContext["sessions"]["list"]>(async (options) =>
         options?.search ? { ...roster, sessions: [] } : roster,
       );
-      const { palette } = await mountPalette(createContext(gateway, list));
-      await enterQuery(palette, "zzfixtureunique");
-      await settlePalette(palette);
+      const { palette, query } = await mountPalette(createContext(gateway, list));
+      await searchPalette(palette, "zzfixtureunique");
       expect(palette.textContent).toContain(notice);
-      expect(palette.querySelector(".cmd-palette__no-results")).toBeNull();
+      expect(query(".cmd-palette__no-results")).toBeNull();
       const input = paletteInput(palette);
       setInputValue(input, "zzfixtureunique\nSummarize the findings in a new session.");
       await settlePalette(palette);
@@ -356,20 +350,19 @@ describe("CommandPalette pending searches", () => {
   it("does not let an old query settle or select rows during a newer debounce", async () => {
     const old = createDeferred<SessionsListResult | null>();
     const current = createDeferred<SessionsListResult | null>();
-    const { gateway } = createGateway(true);
     const list = vi
       .fn<ApplicationContext["sessions"]["list"]>()
       .mockReturnValueOnce(old.promise)
       .mockReturnValueOnce(current.promise);
-    const { palette } = await mountPalette(createContext(gateway, list));
+    const { palette, query, queryAll } = await mountSearch({}, list);
     await enterQuery(palette, "zzold");
     await vi.advanceTimersByTimeAsync(200);
     const input = paletteInput(palette);
     setInputValue(input, "zznew");
     old.resolve(createSessionResult("agent:main:old", "zzold match"));
     await settlePalette(palette, 0);
-    expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
-    expect(palette.querySelectorAll('[role="option"]')).toHaveLength(0);
+    expect(query('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
+    expect(queryAll('[role="option"]')).toHaveLength(0);
     pressKey(input, "Enter");
     expect(list).toHaveBeenCalledTimes(2);
     expect(list).toHaveBeenLastCalledWith(expect.objectContaining({ search: "zznew" }));
@@ -381,7 +374,7 @@ describe("CommandPalette pending searches", () => {
     await settlePalette(palette, 0);
     expect(palette.textContent).not.toContain("zzold match");
     expect(findPaletteOption(palette, "zznew match")).toBeDefined();
-    expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
+    expect(query('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
     expect(palette.onSelectSession).not.toHaveBeenCalled();
     pressKey(input, "Enter");
     expect(palette.onSelectSession).toHaveBeenCalledExactlyOnceWith("agent:main:new");
@@ -391,9 +384,9 @@ describe("CommandPalette pending searches", () => {
     "clears pending search on %s and ignores its late completion",
     async (action) => {
       const deferred = createDeferred<SessionsListResult | null>();
-      const harness = createGateway(true);
-      const { palette, provider } = await mountPalette(
-        createContext(harness.gateway, () => deferred.promise),
+      const { palette, provider, query, setConnected } = await mountSearch(
+        {},
+        () => deferred.promise,
       );
       await enterQuery(palette, "zzfixtureunique");
       await vi.advanceTimersByTimeAsync(200);
@@ -405,17 +398,17 @@ describe("CommandPalette pending searches", () => {
         provider.append(palette);
         palette.openPalette();
       } else if (action === "disconnect") {
-        harness.setConnected(false);
+        setConnected(false);
       } else {
         const input = paletteInput(palette);
         setInputValue(input, "z");
       }
       await palette.updateComplete;
       if (action === "short-query") {
-        expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
+        expect(query('[role="listbox"]')?.getAttribute("aria-busy")).toBe("true");
         await vi.advanceTimersByTimeAsync(200);
       }
-      expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
+      expect(query('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");
       deferred.resolve(createSessionResult("agent:main:stale", "zzfixtureunique stale"));
       await settlePalette(palette, 0);
       expect(palette.textContent).not.toContain("Searching sessions");

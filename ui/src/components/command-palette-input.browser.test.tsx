@@ -1,25 +1,18 @@
 import { createSignal } from "solid-js";
 import type { ComponentProps } from "solid-js";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { nextFrame } from "../test-helpers/modal-dialog.ts";
 import { mountSolid } from "../test-helpers/mount-solid.ts";
 import { flush } from "../test-helpers/solid-settle.ts";
 import "../styles.css";
 import { CommandPaletteInput } from "./command-palette-input.tsx";
 
 const hasBrowserLayout = !navigator.userAgent.toLowerCase().includes("jsdom");
-const nextFrame = () =>
-  new Promise<void>((resolve) => {
-    requestAnimationFrame(() => resolve());
-  });
 
 describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
-  let host: HTMLDivElement;
-  let unmount: (() => void) | undefined;
-  let update: ((next: ComponentProps<typeof CommandPaletteInput>) => void) | undefined;
-  const propsFor = (
-    value: string,
-    extra: Partial<ComponentProps<typeof CommandPaletteInput>> = {},
-  ) => ({
+  type InputProps = ComponentProps<typeof CommandPaletteInput>;
+  let cleanup = () => {};
+  const propsFor = (value: string, extra: Partial<InputProps> = {}): InputProps => ({
     value,
     placeholder: "Search or start a task…",
     onInputRef: () => undefined,
@@ -34,46 +27,43 @@ describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
     expect(["top", "bottom"].map((edge) => entry.hasAttribute("data-scroll-fade-" + edge))).toEqual(
       [top, bottom],
     );
-  beforeEach(() => {
-    host = document.body.appendChild(document.createElement("div"));
-    host.style.cssText = "width: 740px; max-width: 100%;";
-  });
-  const renderInput = (props: ComponentProps<typeof CommandPaletteInput>) => {
-    if (update) {
-      update(props);
-    } else {
-      const [current, setCurrent] = createSignal(props);
-      update = (next) => setCurrent(() => next);
-      unmount = mountSolid(() => <CommandPaletteInput {...current()} />, {
-        container: host!,
-      }).unmount;
-    }
+  function mountInput(initial: InputProps, css = "width: 740px; max-width: 100%;") {
+    const host = document.body.appendChild(document.createElement("div"));
+    host.style.cssText = css;
+    const [current, setCurrent] = createSignal(initial);
+    const mounted = mountSolid(() => <CommandPaletteInput {...current()} />, { container: host });
+    cleanup = () => {
+      mounted.unmount();
+      host.remove();
+    };
     flush();
-  };
-
+    return {
+      host,
+      input: host.querySelector("textarea")!,
+      entry: host.querySelector<HTMLElement>(".cmd-palette__entry")!,
+      renderInput: (next: InputProps) => {
+        setCurrent(() => next);
+        flush();
+      },
+    };
+  }
   afterEach(() => {
-    unmount?.();
-    unmount = undefined;
-    update = undefined;
-    host.remove();
+    cleanup();
     vi.restoreAllMocks();
   });
 
   it("preserves the prompt without remeasuring result navigation and measures again on reconnect", async () => {
-    // Reconnection must cross a wrapping boundary independently of the
-    // runner's viewport and platform font metrics.
-    host.style.cssText = "width: 740px; font-family: monospace;";
     const props = propsFor("Keep this prompt and its caret while changing preferences.", {
       actions: <button type="button">Settings</button>,
     });
-    renderInput(props);
+    // A fixed width/font makes reconnection cross a wrapping boundary.
+    const { host, input, renderInput } = mountInput(props, "width: 740px; font-family: monospace;");
     await document.fonts.ready;
     // Initial layout installs ResizeObserver; its first delivery schedules
     // the next frame. Observe result navigation after that commit completes.
     await nextFrame();
     await nextFrame();
     await nextFrame();
-    const input = host.querySelector("textarea")!;
     const originalHeight = input.clientHeight;
     expect(host.clientWidth).toBe(740);
     expect(originalHeight).toBe(24);
@@ -85,12 +75,12 @@ describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
     renderInput({ ...props, activeDescendant: "next-result" });
     await nextFrame();
     expect(document.activeElement).toBe(settings);
-    expect(input.value).toBe(props.value);
-    expect([input.selectionStart, input.selectionEnd, input.selectionDirection]).toEqual([
-      5,
-      11,
-      "backward",
-    ]);
+    expect(input).toMatchObject({
+      value: props.value,
+      selectionStart: 5,
+      selectionEnd: 11,
+      selectionDirection: "backward",
+    });
     expect(measureContent).not.toHaveBeenCalled();
     expect(input.clientHeight).toBe(originalHeight);
 
@@ -111,9 +101,7 @@ describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
         },
       },
     );
-    renderInput(props);
-    const input = host.querySelector("textarea")!;
-    const entry = host.querySelector(".cmd-palette__entry")!;
+    const { host, input, entry, renderInput } = mountInput(props);
     await vi.waitFor(() => expect(input.style.overflowY).toBe("auto"));
     input.focus();
     input.setSelectionRange(input.value.length, input.value.length);
@@ -154,7 +142,7 @@ describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
   });
 
   it("grows down through three lines, keeps actions fixed and fades clear of the far-right scrollbar", async () => {
-    renderInput(
+    const { host, input, entry } = mountInput(
       propsFor("One line", {
         actions: (
           <button type="button" class="cmd-palette__create">
@@ -163,8 +151,6 @@ describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
         ),
       }),
     );
-    const input = host.querySelector("textarea")!;
-    const entry = host.querySelector<HTMLElement>(".cmd-palette__entry")!;
     const actions = host.querySelector<HTMLElement>(".cmd-palette__input-actions")!;
     const textScroll = host.querySelector<HTMLElement>(".cmd-palette__input-scroll")!;
     await nextFrame();
@@ -197,16 +183,11 @@ describe.skipIf(!hasBrowserLayout)("command palette input layout", () => {
       Number.parseFloat(getComputedStyle(textScroll, "::after").right);
     expect(fadeRight).toBeLessThan(actions.getBoundingClientRect().left);
     // Autofocus keeps an edited caret visible; explicitly inspect the top edge.
-    input.scrollTop = 0;
-    input.dispatchEvent(new Event("scroll"));
-    expectFades(entry, false, true);
-
-    input.scrollTop = input.scrollHeight;
-    input.dispatchEvent(new Event("scroll"));
-    expectFades(entry, true, false);
-    input.scrollTop = 0;
-    input.dispatchEvent(new Event("scroll"));
-    expectFades(entry, false, true);
+    for (const scrollTop of [0, input.scrollHeight, 0]) {
+      input.scrollTop = scrollTop;
+      input.dispatchEvent(new Event("scroll"));
+      expectFades(entry, scrollTop > 0, scrollTop === 0);
+    }
 
     edit(input, "A short task");
     expect(input.clientHeight).toBe(24);

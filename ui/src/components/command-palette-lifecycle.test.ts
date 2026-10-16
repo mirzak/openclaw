@@ -6,6 +6,7 @@ import type { SessionsListResult } from "../api/types.ts";
 import type { ApplicationContext } from "../app/context.ts";
 import { subscribeNativeOverlayOcclusion } from "../lib/native-overlay-occlusion.ts";
 import {
+  openPalette,
   createContext,
   createGateway,
   createSessionResult,
@@ -13,6 +14,8 @@ import {
   expectPalettePromptMode,
   findPaletteOption,
   mountPalette,
+  mountSearch,
+  searchPalette,
   registerCommandPaletteTestHooks,
   settlePalette,
   paletteInput,
@@ -28,21 +31,19 @@ describe("CommandPalette lifecycle", () => {
     vi.stubGlobal("webkit", {
       messageHandlers: { openclawBrowser: { postMessage: vi.fn() } },
     });
-    const { palette } = await mountPalette();
+    const { palette, query } = await mountPalette();
     const changes = vi.fn();
     const unsubscribe = subscribeNativeOverlayOcclusion(changes, () => null);
     try {
-      palette.openPalette();
-      await palette.updateComplete;
-      await palette.querySelector("openclaw-modal-dialog")?.updateComplete;
+      await openPalette(palette);
+      await query("openclaw-modal-dialog")?.updateComplete;
       expect(changes.mock.calls).toEqual([[false], [true]]);
 
       pressKey(paletteInput(palette), "Escape", { cancelable: true });
       await palette.updateComplete;
       expect(changes).toHaveBeenLastCalledWith(false);
-      palette.openPalette();
-      await palette.updateComplete;
-      await palette.querySelector("openclaw-modal-dialog")?.updateComplete;
+      await openPalette(palette);
+      await query("openclaw-modal-dialog")?.updateComplete;
       expect(changes).toHaveBeenLastCalledWith(true);
       palette.remove();
       expect(changes).toHaveBeenLastCalledWith(false);
@@ -52,14 +53,12 @@ describe("CommandPalette lifecycle", () => {
   });
 
   it("closes and clears its query before a retained element reconnects", async () => {
-    const { gateway } = createGateway(true);
     const list = vi.fn(async () => createSessionResult("agent:main:old", "Old chat"));
-    const { palette, provider } = await mountPalette(createContext(gateway, list));
-    await enterQuery(palette, "old");
-    await settlePalette(palette);
+    const { palette, provider, query } = await mountSearch({}, list);
+    await searchPalette(palette, "old");
     expect(palette.textContent).toContain("Old chat");
 
-    const modal = palette.querySelector("openclaw-modal-dialog");
+    const modal = query("openclaw-modal-dialog");
     const dialog = modal?.querySelector("dialog");
     palette.remove();
     expect(palette.isOpen).toBe(false);
@@ -67,17 +66,15 @@ describe("CommandPalette lifecycle", () => {
     provider.append(palette);
     await palette.updateComplete;
 
-    expect(palette.querySelector("dialog[open]")).toBeNull();
-    palette.openPalette();
-    await palette.updateComplete;
-    expect(palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")?.value).toBe("");
+    expect(query("dialog[open]")).toBeNull();
+    await openPalette(palette);
+    expect(query<HTMLTextAreaElement>(".cmd-palette__input")?.value).toBe("");
     expect(palette.textContent).not.toContain("Old chat");
   });
 
   it("keeps local filtering usable if the connection drops during typing", async () => {
-    const { gateway, setConnected } = createGateway(true);
     const list = vi.fn(async () => null);
-    const { palette } = await mountPalette(createContext(gateway, list));
+    const { palette, setConnected } = await mountSearch({}, list);
     await enterQuery(palette, "plugins");
     await vi.advanceTimersByTimeAsync(100);
     setConnected(false);
@@ -91,13 +88,13 @@ describe("CommandPalette lifecycle", () => {
   it.each(["reconnect", "replacement"])(
     "retires stale search results across a Gateway %s",
     async (change) => {
-      const harness = createGateway(true);
       const stale = createDeferred<SessionsListResult | null>();
       const list = vi
         .fn<ApplicationContext["sessions"]["list"]>()
         .mockImplementationOnce(() => stale.promise)
         .mockResolvedValueOnce(createSessionResult("agent:main:retry", "Retry chat"));
-      const { palette, provider } = await mountPalette(createContext(harness.gateway, list));
+      const harness = await mountSearch({}, list);
+      const { palette, provider, query } = harness;
       await enterQuery(palette, "retry");
       await vi.advanceTimersByTimeAsync(200);
       expect(list).toHaveBeenCalledOnce();
@@ -125,14 +122,12 @@ describe("CommandPalette lifecycle", () => {
         expect(palette.textContent).toContain("Retry chat");
       } else {
         expect(palette.isOpen).toBe(false);
-        expect(palette.querySelector(".cmd-palette__input")).toBeNull();
-        palette.openPalette();
-        await palette.updateComplete;
-        expect(palette.querySelector<HTMLTextAreaElement>(".cmd-palette__input")?.value).toBe("");
+        expect(query(".cmd-palette__input")).toBeNull();
+        await openPalette(palette);
+        expect(query<HTMLTextAreaElement>(".cmd-palette__input")?.value).toBe("");
         expect(replacementList).not.toHaveBeenCalled();
         expect(palette.textContent).not.toContain("Stale chat");
-        await enterQuery(palette, "retry");
-        await settlePalette(palette);
+        await searchPalette(palette, "retry");
         expect(replacementList).toHaveBeenCalledOnce();
         expect(palette.textContent).toContain("Fresh chat");
       }
@@ -147,15 +142,13 @@ describe("CommandPalette lifecycle", () => {
           ? { results: [], sessions: [] }
           : { models: [{ id: "fixture", provider: "fixture", name: "Needle model" }] },
       );
-      const harness = createGateway(true, { methods: ["sessions.search"], request });
       const list = vi.fn(async () => createSessionResult("agent:main:needle", "Needle session"));
-      const context = createContext(harness.gateway, list);
-      const { palette } = await mountPalette(context);
+      const harness = await mountSearch({ methods: ["sessions.search"], request }, list);
+      const { palette, context, queryAll } = harness;
       const prompt = "needle\nSummarize the discussion and prepare a follow-up task.";
       await enterQuery(palette, prompt);
       await vi.advanceTimersByTimeAsync(200);
-      expect(list).not.toHaveBeenCalled();
-      expect(request).not.toHaveBeenCalled();
+      expect([list.mock.calls, request.mock.calls]).toEqual([[], []]);
 
       if (change === "reconnect") {
         harness.setConnected(false);
@@ -170,8 +163,7 @@ describe("CommandPalette lifecycle", () => {
       await settlePalette(palette);
       const input = paletteInput(palette);
       expect(input.value).toBe(prompt);
-      expect(list).not.toHaveBeenCalled();
-      expect(request).not.toHaveBeenCalled();
+      expect([list.mock.calls, request.mock.calls]).toEqual([[], []]);
       expectPalettePromptMode(palette);
 
       setInputValue(input, "needle");
@@ -184,7 +176,7 @@ describe("CommandPalette lifecycle", () => {
       expect(request).toHaveBeenCalledWith("models.list", expect.anything());
       expect(findPaletteOption(palette, "Needle session")).toBeDefined();
       expect(findPaletteOption(palette, "Needle model")).toBeDefined();
-      expect(palette.querySelectorAll(".cmd-palette__filter")).toHaveLength(3);
+      expect(queryAll(".cmd-palette__filter")).toHaveLength(3);
     },
   );
 });

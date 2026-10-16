@@ -5,19 +5,24 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 import { createDeferred } from "../../../test/helpers/promise.ts";
 import { CommandPaletteLoading } from "../app/app-shell-command-palette-loading-view.tsx";
 import { ShellCommandPaletteOwner } from "../app/app-shell-command-palette-loading.ts";
+import type { ApplicationContext } from "../app/context.ts";
 import {
   COMMAND_PALETTE_ELEMENT,
   createLazyCustomElementRequests,
 } from "../app/lazy-custom-element.ts";
-import { createWebPushCapability } from "../app/web-push.ts";
 import * as toast from "../lib/toast.ts";
 import * as payloads from "../pages/chat/attachment-payload-store.ts";
 import { createDraftFixture } from "../pages/new-session/draft-submission-flow.test-support.ts";
-import { createApplicationGateway } from "../test-helpers/application-context.ts";
 import { installDialogPolyfill } from "../test-helpers/modal-dialog.ts";
 import { mountSolid } from "../test-helpers/mount-solid.ts";
 import { flush } from "../test-helpers/solid-settle.ts";
-import { mountPalette, paletteInput, setInputValue } from "./command-palette.test-support.ts";
+import {
+  openPalette,
+  prepareDraftContext,
+  mountPalette,
+  paletteInput,
+  setInputValue,
+} from "./command-palette.test-support.ts";
 import "./command-palette.tsx";
 
 let restoreDialog: () => void;
@@ -40,24 +45,26 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-function createLoading(
-  host: Pick<ConstructorParameters<typeof ShellCommandPaletteOwner>[0], "context"> = {},
-) {
-  const { state, dispose } = createRoot((disposeRoot) => ({
-    state: new ShellCommandPaletteOwner(
+const imageFields = {
+  mimeType: "image/png",
+  fileName: "pasted.png",
+  content: "aW1hZ2U=",
+};
+
+function createLoading(context?: ApplicationContext) {
+  return createRoot((dispose) => {
+    onTestFinished(dispose);
+    return new ShellCommandPaletteOwner(
       {
-        ...host,
+        context,
         commandPaletteElement: COMMAND_PALETTE_ELEMENT,
         lazyCustomElements: createLazyCustomElementRequests(),
         chatNavigationOptions: () => undefined,
         navigate: () => {},
       },
       { request: () => {}, clear: () => {}, cancel: () => {}, pending: () => false },
-    ).loading,
-    dispose: disposeRoot,
-  }));
-  onTestFinished(dispose);
-  return state;
+    ).loading;
+  });
 }
 
 function paste(input: HTMLTextAreaElement, files: File[] = [], text = "") {
@@ -91,33 +98,13 @@ function key(input: HTMLTextAreaElement, init: KeyboardEventInit) {
 async function mount(options: Parameters<typeof createDraftFixture>[0] = {}) {
   const fixture = createDraftFixture(options);
   const { context } = fixture;
-  const connection = createApplicationGateway(context.gateway.snapshot);
-  Object.assign(connection.gateway, {
-    connectionRevision: 1,
-    connection: context.gateway.connection,
-    setSessionKey: context.gateway.setSessionKey,
-  });
-  const webPush = createWebPushCapability(connection.gateway);
-  onTestFinished(() => webPush.dispose());
-  Object.assign(context, { gateway: connection.gateway, webPush });
-  Object.assign(context.agentSelection, { subscribe: () => () => {} });
-  Object.assign(context.agents.state, { connected: true, client: context.gateway.snapshot.client });
-  Object.assign(context.sessions, { list: vi.fn(async () => null) });
-  Object.assign(context, {
-    agentIdentity: {
-      subscribe: () => () => {},
-      ensure: vi.fn(async () => {}),
-      get: () => undefined,
-    },
-    navigate: vi.fn(),
-  });
+  const publish = prepareDraftContext(context);
   vi.mocked(context.sessions.createResult).mockResolvedValue({
     key: "agent:main:dashboard:image-task",
     initialRun: { status: "idle" },
   });
   const { palette } = await mountPalette(context);
-  palette.openPalette();
-  await palette.updateComplete;
+  await openPalette(palette);
   const input = paletteInput(palette);
   input.focus();
   const start = () => palette.querySelector<HTMLButtonElement>(".cmd-palette__create")!;
@@ -126,7 +113,7 @@ async function mount(options: Parameters<typeof createDraftFixture>[0] = {}) {
     palette,
     input,
     start,
-    publish: () => connection.publish(context.gateway.snapshot),
+    publish,
   };
 }
 
@@ -145,7 +132,7 @@ describe("command palette paste-only images", () => {
       ).toBe(false);
       if (!uploadsEnabled) {
         expect(paste(input, [image()]).defaultPrevented).toBe(true);
-        const loading = createLoading({ context });
+        const loading = createLoading(context);
         loading.begin();
         const loadingInput = document.createElement("textarea");
         loadingInput.addEventListener("paste", (event) => loading.handlePaste(event));
@@ -181,14 +168,7 @@ describe("command palette paste-only images", () => {
     expect(context.sessions.createResult).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         message,
-        attachments: [
-          expect.objectContaining({
-            type: "image",
-            mimeType: "image/png",
-            fileName: "pasted.png",
-            content: "aW1hZ2U=",
-          }),
-        ],
+        attachments: [expect.objectContaining({ type: "image", ...imageFields })],
       }),
       { reconciliation: "background" },
     );
@@ -219,8 +199,7 @@ describe("command palette paste-only images", () => {
       expect(payloads.getChatAttachmentDataUrl(attachment)).toBeNull();
       expect(registered).toHaveBeenCalledOnce();
       if (reason !== "disconnect") {
-        palette.openPalette();
-        await palette.updateComplete;
+        await openPalette(palette);
         expect(palette.querySelector(".chat-attachments-preview")).toBeNull();
       }
       expect(context.sessions.createResult).not.toHaveBeenCalled();
@@ -265,8 +244,7 @@ describe("command palette paste-only images", () => {
     expect(context.sessions.createResult).toHaveBeenCalledOnce();
     key(input, { key: "Escape" });
     await palette.updateComplete;
-    palette.openPalette();
-    await palette.updateComplete;
+    await openPalette(palette);
     expect(palette.querySelector(".chat-attachment-thumb img")).not.toBeNull();
     expect(palette.querySelector(".cmd-palette__footer button")?.textContent).toContain(
       "Open session",
@@ -285,14 +263,16 @@ describe("command palette paste-only images", () => {
     "oversized",
     "partial",
   ] as const)("settles a cold submit exactly once after %s preparation", async (outcome) => {
-    const delayedPolicy = outcome === "policy-delayed" || outcome === "text-policy-delayed";
+    const textOnly = outcome === "text-policy-delayed";
+    const delayedPolicy = outcome === "policy-delayed" || textOnly;
+    const limited = outcome === "oversized" || outcome === "partial";
     const policy = createDeferred<{ sessionPlacement: Record<string, never> }>();
-    const { palette, context, publish } = await mount(
+    const { palette, context, publish, start } = await mount(
       delayedPolicy ? { placementPolicy: () => policy.promise } : {},
     );
     palette.togglePalette();
     await palette.updateComplete;
-    if (outcome === "oversized" || outcome === "partial") {
+    if (limited) {
       Object.assign(context.gateway.snapshot.hello!, {
         policy: {
           maxPayload: 25 * 1024 * 1024,
@@ -314,15 +294,13 @@ describe("command palette paste-only images", () => {
     flush();
     const coldInput = loader.querySelector("textarea")!;
     if (outcome !== "ready" && outcome !== "policy-delayed") {
-      coldInput.value = "Keep every image";
-      coldInput.dispatchEvent(new Event("input", { bubbles: true }));
+      setInputValue(coldInput, "Keep every image");
     }
     // PNGs enter asynchronous resize preparation; use a non-resizable image
     // to exercise synchronous admission rejection and partial-batch custody.
-    const candidate =
-      outcome === "oversized" || outcome === "partial"
-        ? new File(["image"], "oversized.gif", { type: "image/gif" })
-        : image();
+    const candidate = limited
+      ? new File(["image"], "oversized.gif", { type: "image/gif" })
+      : image();
     const files =
       outcome === "partial"
         ? [new File(["ok"], "small.png", { type: "image/png" }), candidate]
@@ -355,14 +333,10 @@ describe("command palette paste-only images", () => {
       await context.agents.refreshList();
       publish();
     }
-    if (outcome === "oversized" || outcome === "partial") {
+    if (limited) {
       // A valid text/remaining-image prompt could be sent explicitly, but the
       // cold submit must not silently drop a rejected clipboard image.
-      await vi.waitFor(() =>
-        expect(palette.querySelector<HTMLButtonElement>(".cmd-palette__create")?.disabled).toBe(
-          false,
-        ),
-      );
+      await vi.waitFor(() => expect(start().disabled).toBe(false));
       expect(palette.querySelectorAll(".chat-attachment-thumb")).toHaveLength(
         outcome === "partial" ? 2 : 1,
       );
@@ -371,22 +345,13 @@ describe("command palette paste-only images", () => {
       );
     }
     if (outcome === "ready" || delayedPolicy) {
+      const submitted = { message: textOnly ? "Keep every image" : "" };
+      if (!textOnly) {
+        Object.assign(submitted, { attachments: [expect.objectContaining(imageFields)] });
+      }
       await vi.waitFor(() =>
         expect(context.sessions.createResult).toHaveBeenCalledExactlyOnceWith(
-          expect.objectContaining({
-            message: outcome === "text-policy-delayed" ? "Keep every image" : "",
-            ...(outcome === "text-policy-delayed"
-              ? {}
-              : {
-                  attachments: [
-                    expect.objectContaining({
-                      fileName: "pasted.png",
-                      mimeType: "image/png",
-                      content: "aW1hZ2U=",
-                    }),
-                  ],
-                }),
-          }),
+          expect.objectContaining(submitted),
           { reconciliation: "background" },
         ),
       );
