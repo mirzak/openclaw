@@ -10,7 +10,6 @@ import {
   ChatPendingInputsPageSchema,
 } from "../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import { replaceSessionEntrySync } from "../../config/sessions/session-accessor.js";
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { createSessionVisibilityChecker } from "../../plugin-sdk/session-visibility.js";
 import { deleteTestEnvValue, setTestEnvValue } from "../../test-utils/env.js";
 import { describeSessionLinkRule } from "../tool-description-presets.js";
@@ -51,24 +50,107 @@ function writeSessionStore(
   return storePath;
 }
 
-function createHistoryToolWithMessage(content: unknown, sessionLinkBase?: string) {
-  return createSessionsHistoryTool({
+function historyFixture(
+  reply: Record<string, unknown> | ((request: CallGatewayRequest) => unknown),
+  options: Parameters<typeof createSessionsHistoryTool>[0] = {},
+) {
+  const requests: CallGatewayRequest[] = [];
+  const tool = createSessionsHistoryTool({
     config: {},
-    sessionLinkBase,
+    ...options,
     callGateway: async <T = Record<string, unknown>>(request: CallGatewayRequest): Promise<T> => {
-      if (request.method === "chat.history") {
-        return {
-          messages: [
-            {
-              role: "user",
-              content,
-            },
-          ],
-        } as T;
-      }
-      return {} as T;
+      requests.push(request);
+      return (typeof reply === "function" ? reply(request) : reply) as T;
     },
   });
+  return { tool, requests };
+}
+
+function createHistoryToolWithMessage(content: unknown, sessionLinkBase?: string) {
+  return historyFixture(
+    (request) =>
+      request.method === "chat.history" ? { messages: [{ role: "user", content }] } : {},
+    { sessionLinkBase },
+  ).tool;
+}
+
+function scopedHistoryFixture(name: string, mutate?: (storePath: string) => void) {
+  const requesterSessionKey = `agent:main:clickclack:${name}`;
+  const targetSessionKey = "agent:main:main";
+  const expectedSessionId = "main-incarnation";
+  const storePath = writeSessionStore(`${name}.json`, {
+    [targetSessionKey]: { sessionId: expectedSessionId, updatedAt: 1 },
+  });
+  let grantChecks = 0;
+  const unregister = createSessionVisibilityChecker.registerScopedAccessProvider((request) => {
+    if (
+      request.requesterSessionKey !== requesterSessionKey ||
+      request.targetSessionKey !== targetSessionKey
+    ) {
+      return undefined;
+    }
+    if (++grantChecks === 1) {
+      mutate?.(storePath);
+    }
+    return { expectedSessionId };
+  });
+  const fixture = historyFixture(
+    (request) =>
+      request.method === "sessions.resolve"
+        ? { key: targetSessionKey }
+        : { messages: mutate ? [] : [{ role: "assistant", content: "visible" }] },
+    {
+      agentSessionKey: requesterSessionKey,
+      sandboxed: true,
+      config: {
+        session: { store: storePath },
+        tools: { sessions: { visibility: "self" } },
+        agents: { defaults: { sandbox: { sessionToolsVisibility: "spawned" } } },
+      },
+    },
+  );
+  return { ...fixture, unregister, targetSessionKey };
+}
+
+function childHistoryFixture(name: string, replace = false) {
+  const requesterSessionKey = "agent:main:subagent:parent";
+  const targetSessionKey = `agent:main:subagent:${name}`;
+  const expectedSessionId = "old-child-session";
+  const storePath = writeSessionStore(`${name}.json`, {
+    [targetSessionKey]: { sessionId: expectedSessionId, updatedAt: 1 },
+  });
+  const fixture = historyFixture(
+    (request) => {
+      if (request.method === "sessions.resolve") {
+        const params = request.params as { spawnedBy?: unknown };
+        return "spawnedBy" in params ? {} : { key: targetSessionKey, agentId: "main" };
+      }
+      if (request.method === "sessions.describe") {
+        if (replace) {
+          replaceSessionEntrySync(
+            { storePath, sessionKey: targetSessionKey },
+            { sessionId: "replacement-session", updatedAt: 2 },
+          );
+        }
+        return {
+          session: {
+            key: targetSessionKey,
+            sessionId: expectedSessionId,
+            parentSessionKey: requesterSessionKey,
+          },
+        };
+      }
+      if (!replace && request.method === "chat.history") {
+        return { messages: [{ role: "assistant", content: "durable child history" }] };
+      }
+      throw new Error(`unexpected method: ${request.method}`);
+    },
+    {
+      agentSessionKey: requesterSessionKey,
+      config: { session: { store: storePath }, tools: { sessions: { visibility: "tree" } } },
+    },
+  );
+  return { ...fixture, targetSessionKey };
 }
 
 describe("sessions_history", () => {
@@ -133,18 +215,16 @@ describe("sessions_history", () => {
   });
 
   it("returns not-found for an unknown explicit key without reading history", async () => {
-    const requests: CallGatewayRequest[] = [];
     const sessionKey = "agent:main:missing";
-    const tool = createSessionsHistoryTool({
-      config: { tools: { sessions: { visibility: "all" } } },
-      callGateway: async <T = Record<string, unknown>>(request: CallGatewayRequest): Promise<T> => {
-        requests.push(request);
+    const { tool, requests } = historyFixture(
+      (request) => {
         if (request.method === "sessions.resolve") {
           throw new Error(`No session found: ${sessionKey}`);
         }
-        return { messages: [] } as T;
+        return { messages: [] };
       },
-    });
+      { config: { tools: { sessions: { visibility: "all" } } } },
+    );
 
     const result = await tool.execute("missing-explicit-key", { sessionKey });
 
@@ -156,15 +236,15 @@ describe("sessions_history", () => {
   });
 
   it("conceals missing explicit keys denied by session visibility", async () => {
-    const requests: CallGatewayRequest[] = [];
-    const tool = createSessionsHistoryTool({
-      agentSessionKey: "agent:main:main",
-      config: { tools: { sessions: { visibility: "self" } } },
-      callGateway: async <T = Record<string, unknown>>(request: CallGatewayRequest): Promise<T> => {
-        requests.push(request);
+    const { tool, requests } = historyFixture(
+      () => {
         throw new Error("No session found: agent:main:missing");
       },
-    });
+      {
+        agentSessionKey: "agent:main:main",
+        config: { tools: { sessions: { visibility: "self" } } },
+      },
+    );
 
     const result = await tool.execute("hidden-missing-key", {
       sessionKey: "agent:main:missing",
@@ -175,18 +255,11 @@ describe("sessions_history", () => {
   });
 
   it("returns an empty history for an existing explicit key", async () => {
-    const requests: CallGatewayRequest[] = [];
     const sessionKey = "agent:main:empty";
-    const tool = createSessionsHistoryTool({
-      config: { tools: { sessions: { visibility: "all" } } },
-      callGateway: async <T = Record<string, unknown>>(request: CallGatewayRequest): Promise<T> => {
-        requests.push(request);
-        if (request.method === "sessions.resolve") {
-          return { key: sessionKey } as T;
-        }
-        return { messages: [] } as T;
-      },
-    });
+    const { tool, requests } = historyFixture(
+      (request) => (request.method === "sessions.resolve" ? { key: sessionKey } : { messages: [] }),
+      { config: { tools: { sessions: { visibility: "all" } } } },
+    );
 
     const result = await tool.execute("existing-empty-key", { sessionKey });
 
@@ -216,7 +289,6 @@ describe("sessions_history", () => {
 
   it("keeps accepted inputs separate, bounded, and addressable by their own cursor", async () => {
     useLoggingConfig("pending-redaction-off.json", { redactSensitive: "off" });
-    const requests: CallGatewayRequest[] = [];
     const items = Array.from({ length: 20 }, (_, index) => ({
       id: `00000000-0000-0000-0000-${String(index).padStart(12, "0")}`,
       runId: "do-not-expose-correlation",
@@ -227,15 +299,9 @@ describe("sessions_history", () => {
         content: `OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789 ${"queued input ".repeat(1000)}`,
       },
     }));
-    const tool = createSessionsHistoryTool({
-      config: {},
-      callGateway: async <T = Record<string, unknown>>(request: CallGatewayRequest): Promise<T> => {
-        requests.push(request);
-        return {
-          messages: [{ role: "assistant", content: "Canonical reply" }],
-          pendingInputs: { items, total: 23, nextBefore: 4 },
-        } as T;
-      },
+    const { tool, requests } = historyFixture({
+      messages: [{ role: "assistant", content: "Canonical reply" }],
+      pendingInputs: { items, total: 23, nextBefore: 4 },
     });
     const result = await tool.execute("pending-cursor", { sessionKey: "main", pendingBefore: 24 });
     const details = result.details as {
@@ -282,14 +348,7 @@ describe("sessions_history", () => {
   });
 
   it.each(["1abc"])("rejects invalid offset value %s", async (offset) => {
-    const requests: CallGatewayRequest[] = [];
-    const tool = createSessionsHistoryTool({
-      config: {},
-      callGateway: async <T = Record<string, unknown>>(request: CallGatewayRequest): Promise<T> => {
-        requests.push(request);
-        return { messages: [] } as T;
-      },
-    });
+    const { tool, requests } = historyFixture({ messages: [] });
 
     await expect(tool.execute("call-1", { sessionKey: "main", offset })).rejects.toThrow(
       "offset must be a non-negative integer",
@@ -306,22 +365,15 @@ describe("sessions_history", () => {
   });
 
   it("requests explicit offset pages and returns continuation metadata", async () => {
-    const requests: CallGatewayRequest[] = [];
-    const tool = createSessionsHistoryTool({
-      config: {},
-      callGateway: async <T = Record<string, unknown>>(request: CallGatewayRequest): Promise<T> => {
-        requests.push(request);
-        return {
-          messages: [
-            { role: "user", content: "newer" },
-            { role: "assistant", content: "latest" },
-          ],
-          offset: 0,
-          nextOffset: 2,
-          hasMore: true,
-          totalMessages: 4,
-        } as T;
-      },
+    const { tool, requests } = historyFixture({
+      messages: [
+        { role: "user", content: "newer" },
+        { role: "assistant", content: "latest" },
+      ],
+      offset: 0,
+      nextOffset: 2,
+      hasMore: true,
+      totalMessages: 4,
     });
 
     const result = await tool.execute("call-1", { sessionKey: "main", limit: 2, offset: 0 });
@@ -339,19 +391,12 @@ describe("sessions_history", () => {
   });
 
   it("requests history around a search result message id", async () => {
-    const requests: CallGatewayRequest[] = [];
-    const tool = createSessionsHistoryTool({
-      config: {},
-      callGateway: async <T = Record<string, unknown>>(request: CallGatewayRequest): Promise<T> => {
-        requests.push(request);
-        return {
-          messages: [
-            { role: "user", content: "before" },
-            { role: "assistant", content: "matching message" },
-            { role: "user", content: "after" },
-          ],
-        } as T;
-      },
+    const { tool, requests } = historyFixture({
+      messages: [
+        { role: "user", content: "before" },
+        { role: "assistant", content: "matching message" },
+        { role: "user", content: "after" },
+      ],
     });
 
     const args = {
@@ -393,11 +438,7 @@ describe("sessions_history", () => {
       content: `message-${index + 1} ${"x".repeat(4_000)}`,
       __openclaw: { id: `message-${index + 1}`, seq: index + 1 },
     }));
-    const tool = createSessionsHistoryTool({
-      config: {},
-      callGateway: async <T = Record<string, unknown>>(): Promise<T> =>
-        ({ messages, offset: 0, totalMessages: messages.length }) as T,
-    });
+    const { tool } = historyFixture({ messages, offset: 0, totalMessages: messages.length });
 
     const result = await tool.execute("call-1", {
       sessionKey: "main",
@@ -451,10 +492,12 @@ describe("sessions_history", () => {
       },
       ...visibleMessages,
     ];
-    const tool = createSessionsHistoryTool({
-      config: {},
-      callGateway: async <T = Record<string, unknown>>(): Promise<T> =>
-        ({ messages, offset: 0, nextOffset: 7, hasMore: true, totalMessages: 10 }) as T,
+    const { tool } = historyFixture({
+      messages,
+      offset: 0,
+      nextOffset: 7,
+      hasMore: true,
+      totalMessages: 10,
     });
 
     for (const includeTools of [undefined, false]) {
@@ -482,19 +525,15 @@ describe("sessions_history", () => {
   });
 
   it("preserves the Gateway replay cursor for projected siblings from the same row", async () => {
-    const tool = createSessionsHistoryTool({
-      config: {},
-      callGateway: async <T = Record<string, unknown>>(): Promise<T> =>
-        ({
-          messages: [
-            { role: "assistant", content: "projected sibling", __openclaw: { seq: 8 } },
-            { role: "assistant", content: "latest", __openclaw: { seq: 9 } },
-          ],
-          offset: 0,
-          nextOffset: 2,
-          hasMore: true,
-          totalMessages: 10,
-        }) as T,
+    const { tool } = historyFixture({
+      messages: [
+        { role: "assistant", content: "projected sibling", __openclaw: { seq: 8 } },
+        { role: "assistant", content: "latest", __openclaw: { seq: 9 } },
+      ],
+      offset: 0,
+      nextOffset: 2,
+      hasMore: true,
+      totalMessages: 10,
     });
 
     const result = await tool.execute("projected-replay", { sessionKey: "main", offset: 0 });
@@ -508,16 +547,12 @@ describe("sessions_history", () => {
   });
 
   it("keeps history pagination advancing past an already-returned row", async () => {
-    const tool = createSessionsHistoryTool({
-      config: {},
-      callGateway: async <T = Record<string, unknown>>(): Promise<T> =>
-        ({
-          messages: [{ role: "assistant", content: "visible", __openclaw: { seq: 7 } }],
-          offset: 4,
-          nextOffset: 5,
-          hasMore: true,
-          totalMessages: 10,
-        }) as T,
+    const { tool } = historyFixture({
+      messages: [{ role: "assistant", content: "visible", __openclaw: { seq: 7 } }],
+      offset: 4,
+      nextOffset: 5,
+      hasMore: true,
+      totalMessages: 10,
     });
 
     const result = await tool.execute("cursor-progress", { sessionKey: "main", offset: 4 });
@@ -531,42 +566,7 @@ describe("sessions_history", () => {
   });
 
   it("reads an old child from its exact durable lineage row", async () => {
-    const requesterSessionKey = "agent:main:subagent:parent";
-    const targetSessionKey = "agent:main:subagent:old-child";
-    const expectedSessionId = "old-child-session";
-    const storePath = writeSessionStore("old-child.json", {
-      [targetSessionKey]: { sessionId: expectedSessionId, updatedAt: 1 },
-    });
-    const requests: CallGatewayRequest[] = [];
-    const tool = createSessionsHistoryTool({
-      agentSessionKey: requesterSessionKey,
-      config: {
-        session: { store: storePath },
-        tools: { sessions: { visibility: "tree" } },
-      } as OpenClawConfig,
-      callGateway: async <T = Record<string, unknown>>(request: CallGatewayRequest): Promise<T> => {
-        requests.push(request);
-        if (request.method === "sessions.resolve") {
-          const params = request.params as { spawnedBy?: unknown };
-          return ("spawnedBy" in params ? {} : { key: targetSessionKey, agentId: "main" }) as T;
-        }
-        if (request.method === "sessions.describe") {
-          return {
-            session: {
-              key: targetSessionKey,
-              sessionId: expectedSessionId,
-              parentSessionKey: requesterSessionKey,
-            },
-          } as T;
-        }
-        if (request.method === "chat.history") {
-          return {
-            messages: [{ role: "assistant", content: "durable child history" }],
-          } as T;
-        }
-        throw new Error(`unexpected method: ${request.method}`);
-      },
-    });
+    const { tool, requests, targetSessionKey } = childHistoryFixture("old-child");
 
     const result = await tool.execute("old-child-history", {
       sessionKey: targetSessionKey,
@@ -585,41 +585,7 @@ describe("sessions_history", () => {
   });
 
   it("rejects a durable history grant when the target incarnation changes", async () => {
-    const requesterSessionKey = "agent:main:subagent:parent";
-    const targetSessionKey = "agent:main:subagent:old-child-race";
-    const expectedSessionId = "old-child-session";
-    const storePath = writeSessionStore("old-child-race.json", {
-      [targetSessionKey]: { sessionId: expectedSessionId, updatedAt: 1 },
-    });
-    const requests: CallGatewayRequest[] = [];
-    const tool = createSessionsHistoryTool({
-      agentSessionKey: requesterSessionKey,
-      config: {
-        session: { store: storePath },
-        tools: { sessions: { visibility: "tree" } },
-      } as OpenClawConfig,
-      callGateway: async <T = Record<string, unknown>>(request: CallGatewayRequest): Promise<T> => {
-        requests.push(request);
-        if (request.method === "sessions.resolve") {
-          const params = request.params as { spawnedBy?: unknown };
-          return ("spawnedBy" in params ? {} : { key: targetSessionKey, agentId: "main" }) as T;
-        }
-        if (request.method === "sessions.describe") {
-          replaceSessionEntrySync(
-            { storePath, sessionKey: targetSessionKey },
-            { sessionId: "replacement-session", updatedAt: 2 },
-          );
-          return {
-            session: {
-              key: targetSessionKey,
-              sessionId: expectedSessionId,
-              parentSessionKey: requesterSessionKey,
-            },
-          } as T;
-        }
-        throw new Error(`unexpected method: ${request.method}`);
-      },
-    });
+    const { tool, requests, targetSessionKey } = childHistoryFixture("old-child-race", true);
 
     await expect(
       tool.execute("old-child-history-race", { sessionKey: targetSessionKey }),
@@ -628,39 +594,8 @@ describe("sessions_history", () => {
   });
 
   it("honors a scoped incarnation grant through the sandbox visibility clamp", async () => {
-    const requesterSessionKey = "agent:main:clickclack:discussion-proof";
-    const targetSessionKey = "agent:main:main";
-    const expectedSessionId = "main-session-incarnation";
-    const storePath = writeSessionStore("scoped-grant.json", {
-      [targetSessionKey]: { sessionId: expectedSessionId, updatedAt: 1 },
-    });
-    const requests: CallGatewayRequest[] = [];
-    const unregister = createSessionVisibilityChecker.registerScopedAccessProvider((request) =>
-      request.requesterSessionKey === requesterSessionKey &&
-      request.targetSessionKey === targetSessionKey
-        ? { expectedSessionId }
-        : undefined,
-    );
+    const { tool, requests, unregister, targetSessionKey } = scopedHistoryFixture("scoped-grant");
     try {
-      const tool = createSessionsHistoryTool({
-        agentSessionKey: requesterSessionKey,
-        sandboxed: true,
-        config: {
-          session: { store: storePath },
-          tools: { sessions: { visibility: "self" } },
-          agents: { defaults: { sandbox: { sessionToolsVisibility: "spawned" } } },
-        } as OpenClawConfig,
-        callGateway: async <T = Record<string, unknown>>(
-          request: CallGatewayRequest,
-        ): Promise<T> => {
-          requests.push(request);
-          if (request.method === "sessions.resolve") {
-            return { key: targetSessionKey } as T;
-          }
-          return { messages: [{ role: "assistant", content: "visible" }] } as T;
-        },
-      });
-
       const result = await tool.execute("scoped-grant", { sessionKey: targetSessionKey });
 
       expect(result.details).toMatchObject({
@@ -674,50 +609,16 @@ describe("sessions_history", () => {
   });
 
   it("rejects a scoped grant when the target incarnation changes before the read", async () => {
-    const requesterSessionKey = "agent:main:clickclack:discussion-race";
-    const targetSessionKey = "agent:main:main";
-    const expectedSessionId = "old-incarnation";
-    const storePath = writeSessionStore("scoped-grant-race.json", {
-      [targetSessionKey]: { sessionId: expectedSessionId, updatedAt: 1 },
-    });
-    let grantChecks = 0;
-    const requests: CallGatewayRequest[] = [];
-    const unregister = createSessionVisibilityChecker.registerScopedAccessProvider((request) => {
-      if (
-        request.requesterSessionKey !== requesterSessionKey ||
-        request.targetSessionKey !== targetSessionKey
-      ) {
-        return undefined;
-      }
-      grantChecks += 1;
-      if (grantChecks === 1) {
+    const { tool, requests, unregister, targetSessionKey } = scopedHistoryFixture(
+      "scoped-grant-race",
+      (storePath) => {
         replaceSessionEntrySync(
-          { storePath, sessionKey: targetSessionKey },
+          { storePath, sessionKey: "agent:main:main" },
           { sessionId: "replacement-incarnation", updatedAt: 2 },
         );
-      }
-      return { expectedSessionId };
-    });
+      },
+    );
     try {
-      const tool = createSessionsHistoryTool({
-        agentSessionKey: requesterSessionKey,
-        sandboxed: true,
-        config: {
-          session: { store: storePath },
-          tools: { sessions: { visibility: "self" } },
-          agents: { defaults: { sandbox: { sessionToolsVisibility: "spawned" } } },
-        } as OpenClawConfig,
-        callGateway: async <T = Record<string, unknown>>(
-          request: CallGatewayRequest,
-        ): Promise<T> => {
-          requests.push(request);
-          if (request.method === "sessions.resolve") {
-            return { key: targetSessionKey } as T;
-          }
-          return { messages: [] } as T;
-        },
-      });
-
       await expect(
         tool.execute("scoped-grant-race", { sessionKey: targetSessionKey }),
       ).rejects.toThrow(`Session "${targetSessionKey}" changed after access was granted.`);
@@ -728,47 +629,16 @@ describe("sessions_history", () => {
   });
 
   it("rejects a scoped grant when the target is archived before the read", async () => {
-    const requesterSessionKey = "agent:main:clickclack:discussion-archive-race";
-    const targetSessionKey = "agent:main:main";
-    const expectedSessionId = "main-incarnation";
-    const storePath = writeSessionStore("scoped-grant-archive-race.json", {
-      [targetSessionKey]: { sessionId: expectedSessionId, updatedAt: 1 },
-    });
-    let grantChecks = 0;
-    const requests: CallGatewayRequest[] = [];
-    const unregister = createSessionVisibilityChecker.registerScopedAccessProvider((request) => {
-      if (
-        request.requesterSessionKey !== requesterSessionKey ||
-        request.targetSessionKey !== targetSessionKey
-      ) {
-        return undefined;
-      }
-      grantChecks += 1;
-      if (grantChecks === 1) {
+    const { tool, requests, unregister, targetSessionKey } = scopedHistoryFixture(
+      "scoped-grant-archive-race",
+      (storePath) => {
         replaceSessionEntrySync(
-          { storePath, sessionKey: targetSessionKey },
-          { sessionId: expectedSessionId, updatedAt: 2, archivedAt: 2 },
+          { storePath, sessionKey: "agent:main:main" },
+          { sessionId: "main-incarnation", updatedAt: 2, archivedAt: 2 },
         );
-      }
-      return { expectedSessionId };
-    });
+      },
+    );
     try {
-      const tool = createSessionsHistoryTool({
-        agentSessionKey: requesterSessionKey,
-        sandboxed: true,
-        config: {
-          session: { store: storePath },
-          tools: { sessions: { visibility: "self" } },
-          agents: { defaults: { sandbox: { sessionToolsVisibility: "spawned" } } },
-        } as OpenClawConfig,
-        callGateway: async <T = Record<string, unknown>>(
-          request: CallGatewayRequest,
-        ): Promise<T> => {
-          requests.push(request);
-          return { messages: [] } as T;
-        },
-      });
-
       await expect(
         tool.execute("scoped-grant-archive-race", { sessionKey: targetSessionKey }),
       ).rejects.toThrow(`Session "${targetSessionKey}" changed after access was granted.`);
@@ -779,22 +649,20 @@ describe("sessions_history", () => {
   });
 
   it("carries the persisted fixed-store owner for a bare history key", async () => {
-    const requests: CallGatewayRequest[] = [];
-    const tool = createSessionsHistoryTool({
-      agentSessionKey: "global",
-      config: {
-        session: { store: path.join(tempDir!, "owned-shared.sqlite"), scope: "global" },
-        agents: {
-          ownership: "explicit",
-          defaults: { sessionStore: { agentId: "ops" } },
-          entries: { ops: {}, research: {} },
+    const { tool, requests } = historyFixture(
+      { messages: [] },
+      {
+        agentSessionKey: "global",
+        config: {
+          session: { store: path.join(tempDir!, "owned-shared.sqlite"), scope: "global" },
+          agents: {
+            ownership: "explicit",
+            defaults: { sessionStore: { agentId: "ops" } },
+            entries: { ops: {}, research: {} },
+          },
         },
       },
-      callGateway: async <T = Record<string, unknown>>(request: CallGatewayRequest): Promise<T> => {
-        requests.push(request);
-        return { messages: [] } as T;
-      },
-    });
+    );
 
     await tool.execute("owned-global", { sessionKey: "global" });
 
@@ -805,23 +673,21 @@ describe("sessions_history", () => {
   });
 
   it("resolves current history under the requester instead of the fixed-store owner", async () => {
-    const requests: CallGatewayRequest[] = [];
-    const tool = createSessionsHistoryTool({
-      agentSessionKey: "agent:research:main",
-      requesterAgentIdOverride: "research",
-      config: {
-        session: { store: path.join(tempDir!, "owned-current.sqlite"), scope: "global" },
-        agents: {
-          ownership: "explicit",
-          defaults: { sessionStore: { agentId: "ops" } },
-          entries: { ops: {}, research: {} },
+    const { tool, requests } = historyFixture(
+      { messages: [] },
+      {
+        agentSessionKey: "agent:research:main",
+        requesterAgentIdOverride: "research",
+        config: {
+          session: { store: path.join(tempDir!, "owned-current.sqlite"), scope: "global" },
+          agents: {
+            ownership: "explicit",
+            defaults: { sessionStore: { agentId: "ops" } },
+            entries: { ops: {}, research: {} },
+          },
         },
       },
-      callGateway: async <T = Record<string, unknown>>(request: CallGatewayRequest): Promise<T> => {
-        requests.push(request);
-        return { messages: [] } as T;
-      },
-    });
+    );
 
     await tool.execute("research-current-history", { sessionKey: "current" });
 

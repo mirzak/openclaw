@@ -53,13 +53,27 @@ afterEach(async () => {
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const AUDIT_REF_RE = /^hmac-sha256:v1:[a-f0-9]{32}:[a-f0-9]{64}$/u;
 
-function makeConfig(overrides: Partial<OpenClawConfig> = {}): OpenClawConfig {
-  return overrides;
+function allowAgents(allow: string[]) {
+  return createAgentToAgentPolicy({ tools: { agentToAgent: { enabled: true, allow } } });
+}
+
+function resolveAccess(overrides: Partial<Parameters<typeof resolveSessionToolAccess>[0]>) {
+  return resolveSessionToolAccess({
+    action: "history",
+    requesterAgentId: "main",
+    requesterSessionKey: "agent:main:main",
+    targetAgentId: "main",
+    targetSessionKey: "agent:main:subagent:worker",
+    requesterOwned: false,
+    visibility: "tree",
+    a2aPolicy: createAgentToAgentPolicy({}),
+    ...overrides,
+  });
 }
 
 describe("resolveSessionToolsVisibility", () => {
   it("defaults to all when unset or invalid", () => {
-    expect(resolveSessionToolsVisibility(makeConfig())).toBe("all");
+    expect(resolveSessionToolsVisibility({})).toBe("all");
     expect(
       resolveSessionToolsVisibility({
         tools: { sessions: { visibility: "invalid" } },
@@ -70,10 +84,10 @@ describe("resolveSessionToolsVisibility", () => {
 
 describe("sandbox session-tools context", () => {
   it("restricts non-subagent sandboxed sessions to spawned visibility", () => {
-    const cfg = makeConfig({
+    const cfg: OpenClawConfig = {
       tools: { sessions: { visibility: "all" } },
       agents: { defaults: { sandbox: { sessionToolsVisibility: "spawned" } } },
-    });
+    };
     const context = resolveSandboxedSessionToolContext({
       cfg,
       agentSessionKey: "agent:main:main",
@@ -106,16 +120,7 @@ describe("sandbox session-tools context", () => {
 
 describe("createAgentToAgentPolicy", () => {
   it("keeps exact allow patterns case-sensitive", () => {
-    const policy = createAgentToAgentPolicy(
-      makeConfig({
-        tools: {
-          agentToAgent: {
-            enabled: true,
-            allow: ["Ops"],
-          },
-        },
-      }),
-    );
+    const policy = allowAgents(["Ops"]);
 
     expect(policy.matchesAllow("Ops")).toBe(true);
     expect(policy.matchesAllow("ops")).toBe(false);
@@ -124,16 +129,7 @@ describe("createAgentToAgentPolicy", () => {
   it("handles multiple wildcards without polynomial backtracking", () => {
     // Allow patterns use segment matching rather than a greedy regex so
     // adversarial agent ids cannot cause slow policy checks.
-    const policy = createAgentToAgentPolicy(
-      makeConfig({
-        tools: {
-          agentToAgent: {
-            enabled: true,
-            allow: ["*a*b*c*d*e*"],
-          },
-        },
-      }),
-    );
+    const policy = allowAgents(["*a*b*c*d*e*"]);
 
     // Positive match
     expect(policy.matchesAllow("xaxbxcxdxe")).toBe(true);
@@ -149,16 +145,7 @@ describe("createAgentToAgentPolicy", () => {
   });
 
   it("treats regex syntax as literal text in wildcard patterns", () => {
-    const policy = createAgentToAgentPolicy(
-      makeConfig({
-        tools: {
-          agentToAgent: {
-            enabled: true,
-            allow: ["ops.[prod]*"],
-          },
-        },
-      }),
-    );
+    const policy = allowAgents(["ops.[prod]*"]);
 
     expect(policy.matchesAllow("OPS.[PROD]-worker")).toBe(true);
     expect(policy.matchesAllow("opsXprod-worker")).toBe(false);
@@ -171,11 +158,7 @@ describe("createSessionVisibilityGuard", () => {
       action: "list",
       requesterSessionKey: "agent:main:main",
       visibility: "agent",
-      a2aPolicy: createAgentToAgentPolicy(
-        makeConfig({
-          tools: { agentToAgent: { enabled: true, allow: ["main", "codex"] } },
-        }),
-      ),
+      a2aPolicy: allowAgents(["main", "codex"]),
     });
 
     expect(
@@ -199,15 +182,8 @@ describe("createSessionVisibilityGuard", () => {
       return {};
     });
 
-    const access = await resolveSessionToolAccess({
-      action: "history",
-      requesterAgentId: "main",
-      requesterSessionKey: "agent:main:main",
-      targetAgentId: "main",
+    const access = await resolveAccess({
       targetSessionKey: "agent:main:subagent:worker-999",
-      requesterOwned: false,
-      visibility: "tree",
-      a2aPolicy: createAgentToAgentPolicy(makeConfig()),
       callGateway: gateway as never,
     });
 
@@ -237,16 +213,11 @@ describe("createSessionVisibilityGuard", () => {
       return {};
     });
 
-    const access = await resolveSessionToolAccess({
+    const access = await resolveAccess({
       action,
       displayAction,
-      requesterAgentId: "main",
       requesterSessionKey,
-      targetAgentId: "main",
       targetSessionKey,
-      requesterOwned: false,
-      visibility: "tree",
-      a2aPolicy: createAgentToAgentPolicy(makeConfig()),
       callGateway: gateway as never,
     });
 
@@ -299,15 +270,9 @@ describe("createSessionVisibilityGuard", () => {
           receiptAuthority: () => true,
         },
         async () => {
-          const access = await resolveSessionToolAccess({
+          const access = await resolveAccess({
             action: "send",
-            requesterAgentId: "main",
-            requesterSessionKey: "agent:main:main",
-            targetAgentId: "main",
             targetSessionKey,
-            requesterOwned: false,
-            visibility: "tree",
-            a2aPolicy: createAgentToAgentPolicy(makeConfig()),
           });
           expect(access).toMatchObject({
             allowed: false,
@@ -370,15 +335,8 @@ describe("createSessionVisibilityGuard", () => {
           receiptAuthority: () => authorityActive,
         },
         async () =>
-          await resolveSessionToolAccess({
-            action: "history",
-            requesterAgentId: "main",
-            requesterSessionKey: "agent:main:main",
-            targetAgentId: "main",
+          await resolveAccess({
             targetSessionKey: "agent:main:dashboard:unowned",
-            requesterOwned: false,
-            visibility: "tree",
-            a2aPolicy: createAgentToAgentPolicy(makeConfig()),
           }),
       );
 
@@ -400,15 +358,7 @@ describe("createSessionVisibilityGuard", () => {
       return { sessions: [{ key: "agent:main:subagent:worker" }] };
     });
 
-    const access = await resolveSessionToolAccess({
-      action: "history",
-      requesterAgentId: "main",
-      requesterSessionKey: "agent:main:main",
-      targetAgentId: "main",
-      targetSessionKey: "agent:main:subagent:worker",
-      requesterOwned: false,
-      visibility: "tree",
-      a2aPolicy: createAgentToAgentPolicy(makeConfig()),
+    const access = await resolveAccess({
       callGateway: gateway as never,
     });
 
@@ -429,17 +379,12 @@ describe("createSessionVisibilityGuard", () => {
       });
     });
 
-    const access = await resolveSessionToolAccess({
+    const access = await resolveAccess({
       action: "send",
-      requesterAgentId: "main",
-      requesterSessionKey: "agent:main:main",
       targetAgentId: "ops",
       targetSessionKey: "agent:ops:main",
-      requesterOwned: false,
       visibility: "all",
-      a2aPolicy: createAgentToAgentPolicy(
-        makeConfig({ tools: { agentToAgent: { enabled: false } } }),
-      ),
+      a2aPolicy: createAgentToAgentPolicy({ tools: { agentToAgent: { enabled: false } } }),
       callGateway: gateway as never,
     });
 
@@ -467,16 +412,11 @@ describe("createSessionVisibilityGuard", () => {
     });
     try {
       const gateway = vi.fn();
-      const access = await resolveSessionToolAccess({
-        action: "history",
-        requesterAgentId: "main",
-        requesterSessionKey: "agent:main:main",
+      const access = await resolveAccess({
         authorizationTargetSessionKey: "agent:ops:shared",
         targetAgentId: "ops",
         targetSessionKey: "shared",
-        requesterOwned: false,
         visibility: "self",
-        a2aPolicy: createAgentToAgentPolicy(makeConfig()),
         callGateway: gateway as never,
       });
 
@@ -497,15 +437,10 @@ describe("createSessionVisibilityGuard", () => {
     );
     try {
       const gateway = vi.fn();
-      const access = await resolveSessionToolAccess({
-        action: "history",
-        requesterAgentId: "main",
-        requesterSessionKey: "agent:main:main",
-        targetAgentId: "main",
+      const access = await resolveAccess({
         targetSessionKey,
         requesterOwned: true,
         visibility: "all",
-        a2aPolicy: createAgentToAgentPolicy(makeConfig()),
         callGateway: gateway as never,
       });
 
@@ -541,15 +476,9 @@ describe("createSessionVisibilityGuard", () => {
       });
     });
 
-    const access = await resolveSessionToolAccess({
-      action: "history",
-      requesterAgentId: "main",
-      requesterSessionKey: "agent:main:main",
+    const access = await resolveAccess({
       targetAgentId: "codex",
       targetSessionKey: "agent:codex:acp:child-1",
-      requesterOwned: false,
-      visibility: "tree",
-      a2aPolicy: createAgentToAgentPolicy(makeConfig()),
       callGateway: gateway as never,
     });
 
@@ -578,7 +507,7 @@ describe("createSessionVisibilityGuard", () => {
       action: "history",
       requesterSessionKey: "agent:main:main",
       visibility: "tree",
-      a2aPolicy: createAgentToAgentPolicy(makeConfig()),
+      a2aPolicy: createAgentToAgentPolicy({}),
       callGateway: vi.fn(async () => {
         throw new GatewayClientRequestError({
           code: "UNAVAILABLE",
