@@ -23,34 +23,60 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+function serviceChild() {
+  const child = new ChildProcess();
+  let exitCode: number | null = null;
+  Object.defineProperties(child, {
+    pid: { value: 12345 },
+    exitCode: { get: () => exitCode },
+    stdout: { value: null },
+    stderr: { value: null },
+  });
+  const markExited = () => {
+    exitCode = 0;
+  };
+  return {
+    child,
+    markExited,
+    exit: () => {
+      markExited();
+      child.emit("exit", 0, null);
+    },
+  };
+}
+
+function readyService(providerId: string) {
+  vi.spyOn(globalThis, "fetch")
+    .mockRejectedValueOnce(new Error("not started"))
+    .mockImplementation(async () => new Response("ready"));
+  return ensureProviderLocalService({
+    providerId,
+    baseUrl: "http://127.0.0.1:1/v1",
+    service: { command: process.execPath },
+  });
+}
+
+function spawnService(child: ChildProcess) {
+  mocks.spawn.mockImplementation(() => {
+    queueMicrotask(() => child.emit("spawn"));
+    return child;
+  });
+}
+
 it.each(["child close", "tree signal completion", "already-exited child close"])(
   "keeps provider shutdown owned until %s after PID disappearance",
   async (heldFact) => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const child = new ChildProcess();
-    let exitCode: number | null = null;
-    Object.defineProperties(child, {
-      pid: { value: 12345 },
-      exitCode: { get: () => exitCode },
-      stdout: { value: null },
-      stderr: { value: null },
-    });
-    mocks.spawn.mockImplementation(() => {
-      queueMicrotask(() => child.emit("spawn"));
-      return child;
-    });
+    const { child, exit } = serviceChild();
+    spawnService(child);
     const alive = vi.spyOn(processTree, "isChildProcessTreeAlive").mockReturnValue(true);
-    vi.spyOn(globalThis, "fetch")
-      .mockRejectedValueOnce(new Error("not started"))
-      .mockImplementation(async () => new Response("ready"));
     const signaled = createDeferred();
     let completeSignal: (() => void) | undefined;
     vi.spyOn(processTree, "signalChildProcessTree").mockImplementation(
       (_child, _signal, onComplete) => {
         completeSignal = onComplete;
         alive.mockReturnValue(false);
-        exitCode = 0;
-        child.emit("exit", 0, null);
+        exit();
         if (heldFact === "child close") {
           onComplete?.();
         } else {
@@ -60,16 +86,11 @@ it.each(["child close", "tree signal completion", "already-exited child close"])
       },
     );
 
-    const lease = await ensureProviderLocalService({
-      providerId: "settlement-fixture",
-      baseUrl: "http://127.0.0.1:1/v1",
-      service: { command: process.execPath },
-    });
+    const lease = await readyService("settlement-fixture");
     expect(lease).toBeDefined();
     if (heldFact === "already-exited child close") {
       alive.mockReturnValue(false);
-      exitCode = 0;
-      child.emit("exit", 0, null);
+      exit();
       signaled.resolve();
     }
     let settled = false;
@@ -95,30 +116,13 @@ it.each(["child close", "tree signal completion", "already-exited child close"])
 it("does not regain Windows PID authority during shutdown retry before child exit", async () => {
   await withMockedPlatform("win32", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-    const child = new ChildProcess();
-    let exitCode: number | null = null;
-    Object.defineProperties(child, {
-      pid: { value: 12345 },
-      exitCode: { get: () => exitCode },
-      stdout: { value: null },
-      stderr: { value: null },
-    });
-    mocks.spawn.mockImplementation(() => {
-      queueMicrotask(() => child.emit("spawn"));
-      return child;
-    });
+    const { child, exit } = serviceChild();
+    spawnService(child);
     const alive = vi.spyOn(processTree, "isChildProcessTreeAlive").mockReturnValue(true);
     const signal = vi
       .spyOn(processTree, "signalChildProcessTree")
       .mockImplementation((_child, _signal, onComplete) => onComplete?.());
-    vi.spyOn(globalThis, "fetch")
-      .mockRejectedValueOnce(new Error("not started"))
-      .mockImplementation(async () => new Response("ready"));
-    const lease = await ensureProviderLocalService({
-      providerId: "windows-pid-authority-fixture",
-      baseUrl: "http://127.0.0.1:1/v1",
-      service: { command: process.execPath },
-    });
+    const lease = await readyService("windows-pid-authority-fixture");
     expect(lease).toBeDefined();
     alive.mockClear().mockReturnValueOnce(false).mockReturnValue(true);
     const stopped = stopManagedProviderLocalServices();
@@ -140,8 +144,7 @@ it("does not regain Windows PID authority during shutdown retry before child exi
       expect(hasManagedProviderLocalServices()).toBe(true);
     } finally {
       alive.mockReturnValue(false);
-      exitCode = 0;
-      child.emit("exit", 0, null);
+      exit();
       child.emit("close", 0, null);
       const cleanup = stopManagedProviderLocalServices();
       await vi.runAllTimersAsync();
@@ -159,14 +162,7 @@ it.each([
 ])("joins Windows shutdown until $completion", async ({ completion, forcedDurationMs }) => {
   await withMockedPlatform("win32", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-    const child = new ChildProcess();
-    let exitCode: number | null = null;
-    Object.defineProperties(child, {
-      pid: { value: 12345 },
-      exitCode: { get: () => exitCode },
-      stdout: { value: null },
-      stderr: { value: null },
-    });
+    const { child, exit, markExited } = serviceChild();
     let forcedHelper: ChildProcess | undefined;
     mocks.spawn.mockImplementation((command: string, args: string[]) => {
       if (command === process.execPath) {
@@ -180,8 +176,7 @@ it.each([
       if (args.includes("/F")) {
         forcedHelper = helper;
         queueMicrotask(() => {
-          exitCode = 0;
-          child.emit("exit", 0, null);
+          exit();
           child.emit("close", 0, null);
         });
       } else {
@@ -199,14 +194,7 @@ it.each([
       }
       return true;
     });
-    vi.spyOn(globalThis, "fetch")
-      .mockRejectedValueOnce(new Error("not started"))
-      .mockImplementation(async () => new Response("ready"));
-    const lease = await ensureProviderLocalService({
-      providerId: "windows-helper-settlement-fixture",
-      baseUrl: "http://127.0.0.1:1/v1",
-      service: { command: process.execPath },
-    });
+    const lease = await readyService("windows-helper-settlement-fixture");
     expect(lease).toBeDefined();
     let outcome: unknown = "pending";
     const stopped = stopActiveManagedProviderLocalServices().then(
@@ -236,7 +224,7 @@ it.each([
       await stopped;
       expect(hasManagedProviderLocalServices()).toBe(false);
     } finally {
-      exitCode = 0;
+      markExited();
       child.emit("close", 0, null);
       forcedHelper?.emit("close", 0);
       const cleanup = stopManagedProviderLocalServices();

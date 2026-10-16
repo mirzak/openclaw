@@ -35,6 +35,54 @@ import {
   waitForReadyOneShotHostExit,
 } from "./provider-local-service.test-support.js";
 import { hasManagedProviderLocalServices } from "./provider-runtime-lifecycle.js";
+import { makeProviderModelFixture } from "./test-helpers/provider-model-fixture.js";
+
+type LocalService = Parameters<typeof attachModelProviderLocalService>[1];
+function serviceModel(port: number, provider: string, service: LocalService) {
+  return attachModelProviderLocalService(
+    makeProviderModelFixture<"openai-completions">({
+      id: "demo",
+      provider,
+      api: "openai-completions",
+      baseUrl: `http://127.0.0.1:${port}/v1`,
+    }),
+    service,
+  );
+}
+
+function configuredAcquirer(providerId: string, baseUrl: string, localService: LocalService) {
+  return createConfiguredProviderLocalServiceAcquirer(() => ({
+    models: { providers: { [providerId]: { baseUrl, models: [], localService } } },
+  }));
+}
+
+async function listen(server: net.Server): Promise<number> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("missing test server port");
+  }
+  return address.port;
+}
+
+function spawnOneShotHost(moduleUrl: URL, script: string) {
+  const parent = spawn(
+    process.execPath,
+    [...resolveRuntimeWorkerArgv(moduleUrl).slice(0, -1), "--input-type=module", "-e", script],
+    { cwd: process.cwd(), stdio: ["ignore", "ignore", "pipe", "ipc"] },
+  );
+  let stderr = "";
+  parent.stderr?.on("data", (chunk: Buffer | string) => {
+    stderr += chunk.toString();
+  });
+  return { parent, stderr: () => stderr };
+}
 
 // The one-shot host's exit handler sends SIGKILL but cannot join its service's
 // extinction. That foreign child has no retained exit handle in this process.
@@ -240,26 +288,16 @@ describe("provider local service", () => {
   it("allows a default loopback endpoint when provider baseUrl is empty", async () => {
     const port = await fixture.claimPort();
     const healthUrl = `http://127.0.0.1:${port}/v1/models`;
-    const acquire = createConfiguredProviderLocalServiceAcquirer(() => ({
-      models: {
-        providers: {
-          "gpu-default": {
-            baseUrl: "",
-            models: [],
-            localService: {
-              command: process.execPath,
-              args: [
-                "-e",
-                `const http=require("http");http.createServer((req,res)=>{res.writeHead(200);res.end("ok");}).listen(${port},"127.0.0.1");`,
-              ],
-              healthUrl,
-              readyTimeoutMs: 5_000,
-              idleStopMs: 1,
-            },
-          },
-        },
-      },
-    }));
+    const acquire = configuredAcquirer("gpu-default", "", {
+      command: process.execPath,
+      args: [
+        "-e",
+        `const http=require("http");http.createServer((req,res)=>{res.writeHead(200);res.end("ok");}).listen(${port},"127.0.0.1");`,
+      ],
+      healthUrl,
+      readyTimeoutMs: 5_000,
+      idleStopMs: 1,
+    });
 
     const lease = await withSpawnReadyHealthProbe(() =>
       acquire({
@@ -274,20 +312,10 @@ describe("provider local service", () => {
   });
 
   it("rejects plugin-selected local service probe hosts", async () => {
-    const acquire = createConfiguredProviderLocalServiceAcquirer(() => ({
-      models: {
-        providers: {
-          "gpu-spark": {
-            baseUrl: "http://127.0.0.1:11434/v1",
-            models: [],
-            localService: {
-              command: process.execPath,
-              args: ["--version"],
-            },
-          },
-        },
-      },
-    }));
+    const acquire = configuredAcquirer("gpu-spark", "http://127.0.0.1:11434/v1", {
+      command: process.execPath,
+      args: ["--version"],
+    });
 
     await expect(
       acquire({
@@ -298,20 +326,10 @@ describe("provider local service", () => {
   });
 
   it("rejects a remote endpoint when provider baseUrl is empty", async () => {
-    const acquire = createConfiguredProviderLocalServiceAcquirer(() => ({
-      models: {
-        providers: {
-          "gpu-default": {
-            baseUrl: "",
-            models: [],
-            localService: {
-              command: process.execPath,
-              args: ["--version"],
-            },
-          },
-        },
-      },
-    }));
+    const acquire = configuredAcquirer("gpu-default", "", {
+      command: process.execPath,
+      args: ["--version"],
+    });
 
     await expect(
       acquire({
@@ -325,24 +343,16 @@ describe("provider local service", () => {
     const setTimeoutSpy = vi.spyOn(globalThis, "setTimeout");
     const port = await fixture.claimPort();
     const healthUrl = `http://127.0.0.1:${port}/v1/models`;
-    const model = attachModelProviderLocalService(
-      {
-        id: "demo",
-        provider: "local-huge-idle",
-        api: "openai-completions",
-        baseUrl: `http://127.0.0.1:${port}/v1`,
-      } as unknown as Model<"openai-completions">,
-      {
-        command: process.execPath,
-        args: [
-          "-e",
-          `const http=require("http");const server=http.createServer((req,res)=>{res.writeHead(200,{"content-type":"application/json"});res.end('{"ok":true}');});server.listen(${port},"127.0.0.1");process.on("SIGTERM",()=>server.close(()=>process.exit(0)));`,
-        ],
-        healthUrl,
-        readyTimeoutMs: 5_000,
-        idleStopMs: Number.MAX_SAFE_INTEGER,
-      },
-    );
+    const model = serviceModel(port, "local-huge-idle", {
+      command: process.execPath,
+      args: [
+        "-e",
+        `const http=require("http");const server=http.createServer((req,res)=>{res.writeHead(200,{"content-type":"application/json"});res.end('{"ok":true}');});server.listen(${port},"127.0.0.1");process.on("SIGTERM",()=>server.close(()=>process.exit(0)));`,
+      ],
+      healthUrl,
+      readyTimeoutMs: 5_000,
+      idleStopMs: Number.MAX_SAFE_INTEGER,
+    });
 
     try {
       const lease = await withSpawnReadyHealthProbe(() => ensureModelProviderLocalService(model));
@@ -361,23 +371,15 @@ describe("provider local service", () => {
   it("sends provider request headers on local service health probes", async () => {
     const port = await fixture.claimPort();
     const healthUrl = `http://127.0.0.1:${port}/v1/models`;
-    const model = attachModelProviderLocalService(
-      {
-        id: "demo",
-        provider: "local-auth",
-        api: "openai-completions",
-        baseUrl: `http://127.0.0.1:${port}/v1`,
-      } as unknown as Model<"openai-completions">,
-      {
-        command: process.execPath,
-        args: [
-          "-e",
-          `const http=require("http");http.createServer((req,res)=>{if(req.headers.authorization!=="Bearer health-secret"||req.headers["x-tenant"]!=="acme"){res.writeHead(401);res.end("unauthorized");return;}res.writeHead(200,{"content-type":"application/json"});res.end('{"ok":true}');}).listen(${port},"127.0.0.1");`,
-        ],
-        readyTimeoutMs: 5_000,
-        idleStopMs: 1,
-      },
-    );
+    const model = serviceModel(port, "local-auth", {
+      command: process.execPath,
+      args: [
+        "-e",
+        `const http=require("http");http.createServer((req,res)=>{if(req.headers.authorization!=="Bearer health-secret"||req.headers["x-tenant"]!=="acme"){res.writeHead(401);res.end("unauthorized");return;}res.writeHead(200,{"content-type":"application/json"});res.end('{"ok":true}');}).listen(${port},"127.0.0.1");`,
+      ],
+      readyTimeoutMs: 5_000,
+      idleStopMs: 1,
+    });
 
     const sentinel = mintSecretSentinel("health-secret", { label: "local-health-probe" });
     const lease = await withSpawnReadyHealthProbe(() =>
@@ -405,19 +407,11 @@ describe("provider local service", () => {
   it("rejects unknown sentinels before starting a local service", async () => {
     const port = await fixture.claimPort();
     const unknown = "oc-sent-v2.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.end";
-    const model = attachModelProviderLocalService(
-      {
-        id: "demo",
-        provider: "local-unknown-auth",
-        api: "openai-completions",
-        baseUrl: `http://127.0.0.1:${port}/v1`,
-      } as unknown as Model<"openai-completions">,
-      {
-        command: process.execPath,
-        args: ["--version"],
-        readyTimeoutMs: 1_000,
-      },
-    );
+    const model = serviceModel(port, "local-unknown-auth", {
+      command: process.execPath,
+      args: ["--version"],
+      readyTimeoutMs: 1_000,
+    });
 
     await expect(
       ensureModelProviderLocalService(model, { Authorization: `Bearer ${unknown}` }),
@@ -442,28 +436,18 @@ describe("provider local service", () => {
         ["HTTP/1.1 200 OK", "Content-Type: application/json", "", '{"ok":true}'].join("\r\n"),
       );
     });
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => {
-        server.off("error", reject);
-        resolve();
-      });
-    });
-    const address = server.address();
-    if (!address || typeof address === "string") {
-      throw new Error("missing test server port");
-    }
+    const port = await listen(server);
     const reconcile = vi.fn(async () => undefined);
     const model = attachModelProviderRuntimePluginHandle(
       attachModelProviderLocalService(
         {
           provider: "local-body-cleanup",
-          baseUrl: `http://127.0.0.1:${address.port}/v1`,
+          baseUrl: `http://127.0.0.1:${port}/v1`,
         } as unknown as Model<"openai-completions">,
         {
           command: process.execPath,
           args: ["--version"],
-          healthUrl: `http://127.0.0.1:${address.port}/v1/models`,
+          healthUrl: `http://127.0.0.1:${port}/v1/models`,
           readyTimeoutMs: 1_000,
           idleStopMs: 1,
         },
@@ -504,15 +488,7 @@ describe("provider local service", () => {
       readyTimeoutMs: 5_000,
       idleStopMs: 1,
     };
-    const model = attachModelProviderLocalService(
-      {
-        id: "demo",
-        provider: "local-concurrent",
-        api: "openai-completions",
-        baseUrl: `http://127.0.0.1:${port}/v1`,
-      } as unknown as Model<"openai-completions">,
-      service,
-    );
+    const model = serviceModel(port, "local-concurrent", service);
 
     try {
       const [chatLease, embeddingLease] = await withSpawnReadyHealthProbe(() =>
@@ -606,32 +582,24 @@ describe("provider local service", () => {
     const statusPath = path.join(tempDir, "status.txt");
     const forkedPidPath = path.join(tempDir, "forked.pid");
     let firstForkedPid: number | undefined;
-    const model = attachModelProviderLocalService(
-      {
-        id: "demo",
-        provider: "local-restart",
-        api: "openai-completions",
-        baseUrl: `http://127.0.0.1:${port}/v1`,
-      } as unknown as Model<"openai-completions">,
-      {
-        command: process.execPath,
-        args: [
-          "-e",
-          `const fs=require("node:fs");const http=require("node:http");const {spawn}=require("node:child_process");const fork=spawn(process.execPath,["-e","setInterval(() => {}, 1000)"],{stdio:"ignore"});fs.writeFileSync(${JSON.stringify(
-            forkedPidPath,
-          )},String(fork.pid));fs.appendFileSync(${JSON.stringify(
-            startsPath,
-          )},"start\\n");fs.writeFileSync(${JSON.stringify(
-            statusPath,
-          )},"ok");const server=http.createServer((req,res)=>{const status=fs.readFileSync(${JSON.stringify(
-            statusPath,
-          )},"utf8");if(status.trim()!=="ok"){res.writeHead(503);res.end("not ready");return;}res.writeHead(200,{"content-type":"application/json"});res.end('{"ok":true}');});server.listen(${port},"127.0.0.1");process.on("SIGTERM",()=>server.close(()=>process.exit(0)));`,
-        ],
-        healthUrl,
-        readyTimeoutMs: 5_000,
-        idleStopMs: 0,
-      },
-    );
+    const model = serviceModel(port, "local-restart", {
+      command: process.execPath,
+      args: [
+        "-e",
+        `const fs=require("node:fs");const http=require("node:http");const {spawn}=require("node:child_process");const fork=spawn(process.execPath,["-e","setInterval(() => {}, 1000)"],{stdio:"ignore"});fs.writeFileSync(${JSON.stringify(
+          forkedPidPath,
+        )},String(fork.pid));fs.appendFileSync(${JSON.stringify(
+          startsPath,
+        )},"start\\n");fs.writeFileSync(${JSON.stringify(
+          statusPath,
+        )},"ok");const server=http.createServer((req,res)=>{const status=fs.readFileSync(${JSON.stringify(
+          statusPath,
+        )},"utf8");if(status.trim()!=="ok"){res.writeHead(503);res.end("not ready");return;}res.writeHead(200,{"content-type":"application/json"});res.end('{"ok":true}');});server.listen(${port},"127.0.0.1");process.on("SIGTERM",()=>server.close(()=>process.exit(0)));`,
+      ],
+      healthUrl,
+      readyTimeoutMs: 5_000,
+      idleStopMs: 0,
+    });
 
     try {
       const firstLease = await withSpawnReadyHealthProbe(() =>
@@ -706,19 +674,11 @@ describe("provider local service", () => {
 
   it("reports a local service startup signal exit without waiting for readiness timeout", async () => {
     const port = await fixture.claimPort();
-    const model = attachModelProviderLocalService(
-      {
-        id: "demo",
-        provider: "local-signal-exit",
-        api: "openai-completions",
-        baseUrl: `http://127.0.0.1:${port}/v1`,
-      } as unknown as Model<"openai-completions">,
-      {
-        command: process.execPath,
-        args: ["-e", "process.kill(process.pid, 'SIGTERM')"],
-        readyTimeoutMs: 60_000,
-      },
-    );
+    const model = serviceModel(port, "local-signal-exit", {
+      command: process.execPath,
+      args: ["-e", "process.kill(process.pid, 'SIGTERM')"],
+      readyTimeoutMs: 60_000,
+    });
 
     const startedAt = Date.now();
     await expect(ensureModelProviderLocalService(model)).rejects.toThrow(
@@ -755,26 +715,12 @@ describe("provider local service", () => {
       `lease?.release();`,
       `process.send({ kind: ${JSON.stringify(ONE_SHOT_HOST_READY_KIND)} });`,
     ].join("\n");
-    const parent = spawn(
-      process.execPath,
-      [...resolveRuntimeWorkerArgv(moduleUrl).slice(0, -1), "--input-type=module", "-e", script],
-      {
-        cwd: process.cwd(),
-        stdio: ["ignore", "ignore", "pipe", "ipc"],
-      },
-    );
-    let stderr = "";
-    parent.stderr?.on("data", (chunk: Buffer | string) => {
-      stderr += chunk.toString();
-    });
+    const { parent, stderr } = spawnOneShotHost(moduleUrl, script);
     let servicePid: number | undefined;
 
     try {
-      const result = await withinTest(
-        waitForReadyOneShotHostExit(parent, () => stderr),
-        signal,
-      );
-      expect(result, stderr).toEqual({ code: 0, signal: null });
+      const result = await withinTest(waitForReadyOneShotHostExit(parent, stderr), signal);
+      expect(result, stderr()).toEqual({ code: 0, signal: null });
       servicePid = await readPidFile(servicePidPath);
       await waitForServiceExit(servicePid, signal);
       expect(isPidAlive(servicePid)).toBe(false);
@@ -836,23 +782,12 @@ describe("provider local service", () => {
       `if (clockOffsetMs === 0) throw new Error("test clock did not advance");`,
       `process.send({ kind: ${JSON.stringify(ONE_SHOT_HOST_READY_KIND)} });`,
     ].join("\n");
-    const parent = spawn(
-      process.execPath,
-      [...resolveRuntimeWorkerArgv(moduleUrl).slice(0, -1), "--input-type=module", "-e", script],
-      {
-        cwd: process.cwd(),
-        stdio: ["ignore", "ignore", "pipe", "ipc"],
-      },
-    );
-    let stderr = "";
-    parent.stderr?.on("data", (chunk: Buffer | string) => {
-      stderr += chunk.toString();
-    });
+    const { parent, stderr } = spawnOneShotHost(moduleUrl, script);
     let servicePid: number | undefined;
 
     try {
-      const result = await waitForReadyOneShotHostExit(parent, () => stderr);
-      expect(result, stderr).toEqual({ code: 0, signal: null });
+      const result = await waitForReadyOneShotHostExit(parent, stderr);
+      expect(result, stderr()).toEqual({ code: 0, signal: null });
       servicePid = await readPidFile(servicePidPath);
     } finally {
       killPidIfAlive(parent.pid);
@@ -952,36 +887,17 @@ describe("provider local service", () => {
       response.writeHead(503, { "content-type": "text/plain" });
       response.end("not ready");
     });
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => {
-        server.off("error", reject);
-        resolve();
-      });
-    });
-    const address = server.address();
-    if (!address || typeof address === "string") {
-      throw new Error("missing test server port");
-    }
-    const port = address.port;
+    const port = await listen(server);
     const healthUrl = `http://127.0.0.1:${port}/v1/models`;
-    const model = attachModelProviderLocalService(
-      {
-        id: "demo",
-        provider: "local-abort-before-spawn",
-        api: "openai-completions",
-        baseUrl: `http://127.0.0.1:${port}/v1`,
-      } as unknown as Model<"openai-completions">,
-      {
-        command: process.execPath,
-        args: [
-          "-e",
-          `require("node:fs").writeFileSync(${JSON.stringify(pidPath)},String(process.pid));setInterval(()=>{},1000);`,
-        ],
-        healthUrl,
-        readyTimeoutMs: 60_000,
-      },
-    );
+    const model = serviceModel(port, "local-abort-before-spawn", {
+      command: process.execPath,
+      args: [
+        "-e",
+        `require("node:fs").writeFileSync(${JSON.stringify(pidPath)},String(process.pid));setInterval(()=>{},1000);`,
+      ],
+      healthUrl,
+      readyTimeoutMs: 60_000,
+    });
     const realFetch = globalThis.fetch;
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (...args) => {
       const response = await realFetch(...args);
