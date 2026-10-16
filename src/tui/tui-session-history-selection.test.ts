@@ -10,8 +10,6 @@ import {
 import { createEditorSubmitHandler, createSubmitBurstCoalescer } from "./tui-submit.js";
 
 const key = "agent:research:global";
-const stateFor = (overrides: Parameters<typeof createBaseState>[0] = {}) =>
-  createBaseState({ currentAgentId: "research", currentSessionKey: key, ...overrides });
 const select = (raw = "global", agentId = "research") => ({ key: raw, agentId });
 const selectedHistory = (sessionKey: string, sessionId: string) => ({
   messages: [],
@@ -44,7 +42,7 @@ function selectionHarness(
     applySessionInfoFromPatch: vi.fn((result) => actions.applySessionInfoFromPatch(result)),
     ...commandOptions,
   });
-  const state = Object.assign(commands.state, stateFor(commands.state));
+  const state = Object.assign(commands.state, createBaseState(commands.state));
   const sessionClient = makeTuiBackend(backend);
   const actions = createTestSessionActions({
     state,
@@ -55,47 +53,33 @@ function selectionHarness(
 }
 
 it.each([
-  { previous: "global", next: key },
-  { previous: key, next: "global" },
-])(
-  "rejects an old setting result while changing $previous to $next",
-  async ({ previous, next }) => {
-    const reply = {
-      ok: true,
-      path: "test",
-      key: previous,
-      entry: { verboseLevel: "full" },
-    } as const;
-    const patch = heldCall<typeof reply>();
-    const history = heldCall();
-    const commands = selectionHarness(
-      {
-        currentSessionKey: previous,
-        currentSessionId: null,
-        patchSession: patch.call,
-      },
-      { loadHistory: history.call },
-    );
-    const { state, actions } = commands;
-    const pending = commands.handleCommand("/verbose full");
-    await patch.entered;
-    const selecting = actions.setSession(next);
-    await history.entered;
-    try {
-      patch.resolve(reply);
-      await pending;
-      expect(state.currentSessionKey).toBe(next);
-      expect(state.sessionInfo.verboseLevel).not.toBe("full");
-      expect(commands.addSystem).not.toHaveBeenCalled();
-    } finally {
-      patch.resolve(reply);
-      history.resolve(selectedHistory(next, "selected-row"));
-      await Promise.all([pending, selecting]);
-    }
-    expect(state).toMatchObject({ currentSessionKey: next, currentSessionId: "selected-row" });
-    expect(history.call).toHaveBeenCalledOnce();
-  },
-);
+  ["global", key],
+  [key, "global"],
+])("rejects old setting results during %s → %s selection", async (previous, next) => {
+  const reply = { key: previous, entry: { verboseLevel: "full" } } as const;
+  const patch = heldCall<typeof reply>();
+  const history = heldCall();
+  const { state, actions, handleCommand, addSystem } = selectionHarness(
+    { currentSessionKey: previous, patchSession: patch.call },
+    { loadHistory: history.call },
+  );
+  const pending = handleCommand("/verbose full");
+  await patch.entered;
+  const selecting = actions.setSession(next);
+  await history.entered;
+  try {
+    patch.resolve(reply);
+    await pending;
+    expect(state.currentSessionKey).toBe(next);
+    expect(state.sessionInfo.verboseLevel).not.toBe("full");
+    expect(addSystem).not.toHaveBeenCalled();
+  } finally {
+    history.resolve(selectedHistory(next, "selected-row"));
+    await Promise.all([pending, selecting]);
+  }
+  expect(state).toMatchObject({ currentSessionKey: next, currentSessionId: "selected-row" });
+  expect(history.call).toHaveBeenCalledOnce();
+});
 
 it.each(["agent:research:main", "global"])(
   "resolves the missing qualified-global alias to Home %s",
@@ -126,10 +110,7 @@ it.each([
   ["empty existing row", { messages: [], sessionId: "literal-row" }],
   ["nested existing identity", { messages: [], sessionInfo: { sessionId: "literal-row" } }],
   ["archived row", { messages: [], sessionId: "literal-row", sessionInfo: { archived: true } }],
-  [
-    "identity-free nonempty history",
-    { messages: [{ role: "assistant", content: "Retained history" }] },
-  ],
+  ["identity-free nonempty history", { messages: [{ role: "assistant", content: "x" }] }],
   ["partial reply", {}],
   ["malformed metadata", { messages: [], sessionInfo: "incomplete" }],
 ] as const)("does not reinterpret %s as a missing qualified row", async (_name, history) => {
@@ -142,15 +123,13 @@ it.each([
 
 it("does not adopt Home after another session is selected during the legacy lookup", async () => {
   const held = heldCall();
-  const loadHistory = vi.fn(async ({ sessionKey }: { sessionKey: string }) => {
-    if (sessionKey === key) {
-      return { messages: [] };
-    }
-    if (sessionKey === "global") {
-      return held.call();
-    }
-    return { messages: [], sessionId: "new-choice", sessionInfo: { key: sessionKey } };
-  });
+  const loadHistory = vi.fn(async ({ sessionKey }: { sessionKey: string }) =>
+    sessionKey === key
+      ? { messages: [] }
+      : sessionKey === "global"
+        ? held.call()
+        : { messages: [], sessionId: "new-choice", sessionInfo: { key: sessionKey } },
+  );
   const { state, actions } = selectionHarness({ historyLoaded: false }, { loadHistory });
   const pending = actions.loadHistory();
   try {
@@ -166,29 +145,26 @@ it("does not adopt Home after another session is selected during the legacy look
   });
 });
 
-it.each(
-  ["global", key].flatMap((storedKey) => [
-    { storedKey, coalesced: false },
-    { storedKey, coalesced: true },
-  ]),
-)(
-  "keeps a submit editable until selection resolves to $storedKey (coalesced=$coalesced)",
-  async ({ storedKey, coalesced }) => {
+it.each([
+  ["global", false],
+  ["global", true],
+  [key, false],
+  [key, true],
+] as const)(
+  "keeps a submit editable until selection resolves to %s (coalesced=%s)",
+  async (storedKey, coalesced) => {
     const exact = heldCall();
+    const sessionId = "selected-conversation";
     const pending: Promise<void>[] = [];
-    const sendChat = vi.fn(async (_params: Parameters<TuiBackend["sendChat"]>[0]) => ({
+    const sendChat = vi.fn<TuiBackend["sendChat"]>(async () => ({
       runId: "submitted",
       status: "accepted",
     }));
     const commands = selectionHarness(
       { currentSessionKey: "agent:research:notes", sendChat },
       {
-        loadHistory: async ({ sessionKey }) => {
-          if (sessionKey === key) {
-            return exact.call();
-          }
-          return selectedHistory("global", "selected-conversation");
-        },
+        loadHistory: async ({ sessionKey }) =>
+          sessionKey === key ? exact.call() : selectedHistory("global", sessionId),
       },
     );
     let editorText = "";
@@ -214,9 +190,7 @@ it.each(
       onBlockedMessageSubmit: commands.reportBlockedMessageSubmit,
     });
     const releaseExact = () =>
-      exact.resolve(
-        storedKey === key ? selectedHistory(key, "selected-conversation") : { messages: [] },
-      );
+      exact.resolve(storedKey === key ? selectedHistory(key, sessionId) : { messages: [] });
     if (coalesced) {
       vi.useFakeTimers();
     }
@@ -248,7 +222,7 @@ it.each(
       expect(sendChat).toHaveBeenCalledOnce();
       expect(sendChat.mock.calls[0]?.[0]).toMatchObject({
         sessionKey: storedKey,
-        sessionId: "selected-conversation",
+        sessionId,
         message: "Immediate message",
         ...(storedKey === "global" ? { agentId: "research" } : {}),
       });

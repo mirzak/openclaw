@@ -56,25 +56,8 @@ const secretStore = {
 
 function textQuestion(overrides: Partial<Question> = {}): QuestionRecord {
   return questionRecord({
-    questions: [
-      {
-        questionId: "value",
-        header: "Value",
-        question: "Enter a value",
-        options: [],
-        ...overrides,
-      },
-    ],
+    questions: [question({ questionId: "value", options: [], ...overrides })],
   });
-}
-
-function expectAnswers(
-  harness: ReturnType<typeof createHarness>,
-  answers: Record<string, string[]>,
-) {
-  expect(harness.resolveQuestion).toHaveBeenCalledWith(
-    expect.objectContaining({ answers: { answers } }),
-  );
 }
 
 function expectNoLeak(harness: ReturnType<typeof createHarness>, value: string) {
@@ -95,9 +78,6 @@ function createHarness(initialRecord?: QuestionRecord) {
   let shown: Component | undefined;
   const addSystem = vi.fn<(line: string) => void>();
   const onPendingChange = vi.fn<(text: string) => void>();
-  const closeOverlay = vi.fn(() => {
-    shown = undefined;
-  });
   const openOverlay = vi.fn((component: Component) => {
     shown = component;
     return {
@@ -126,7 +106,9 @@ function createHarness(initialRecord?: QuestionRecord) {
     getAgentId: () => agentId,
     getSessionKey: () => sessionKey,
     openOverlay,
-    closeOverlay,
+    closeOverlay: () => {
+      shown = undefined;
+    },
     onPendingChange,
     requestRender: vi.fn(),
   });
@@ -143,6 +125,16 @@ function createHarness(initialRecord?: QuestionRecord) {
       listQuestions.mockResolvedValue({ questions: [record] });
       getQuestion.mockResolvedValue({ question: record });
       controller.handleEvent("question.requested", record);
+    },
+    resolved(
+      status: "answered" | "cancelled" | "expired",
+      answers: NonNullable<QuestionRecord["answers"]> = answered.answers,
+    ) {
+      controller.handleEvent("question.resolved", {
+        id: "request-1",
+        status,
+        ...(status === "answered" ? { answers } : {}),
+      });
     },
     selectSession(agent: string, session: string) {
       agentId = agent;
@@ -174,6 +166,11 @@ function createHarness(initialRecord?: QuestionRecord) {
     },
     expectSystemOnce(line: string) {
       expect(addSystem.mock.calls.filter(([message]) => message === line)).toHaveLength(1);
+    },
+    expectAnswers(answers: Record<string, string[]>) {
+      expect(resolveQuestion).toHaveBeenCalledWith(
+        expect.objectContaining({ answers: { answers } }),
+      );
     },
     rawRender(width = 100) {
       return shown?.render(width).join("\n") ?? "";
@@ -229,8 +226,7 @@ describe("TUI questions", () => {
   });
 
   it("advances three questions and submits Other text with the selected answers", async () => {
-    const harness = createHarness();
-    harness.request(
+    const harness = createHarness(
       questionRecord({
         questions: [
           question(),
@@ -245,7 +241,7 @@ describe("TUI questions", () => {
     expect(harness.render()).toContain("Question 3/3 · Timing");
     expect(harness.resolveQuestion).not.toHaveBeenCalled();
     await harness.answer();
-    expectAnswers(harness, {
+    harness.expectAnswers({
       target: ["Production"],
       region: ["A custom region"],
       timing: ["Staging"],
@@ -259,7 +255,7 @@ describe("TUI questions", () => {
     expect(harness.render()).toContain("[x] 2. Production");
     expect(harness.resolveQuestion).not.toHaveBeenCalled();
     await harness.answer("3", "Custom", TAB);
-    expectAnswers(harness, { target: ["Staging", "Production", "Custom"] });
+    harness.expectAnswers({ target: ["Staging", "Production", "Custom"] });
   });
 
   it("cancels the whole request with Skip without submitting partial answers", async () => {
@@ -299,7 +295,7 @@ describe("TUI questions", () => {
         expect(harness.rawRender(80).split("\n").length).toBeLessThanOrEqual(24);
       }
       await harness.answer();
-      expectAnswers(harness, { credential: [secret] });
+      harness.expectAnswers({ credential: [secret] });
       expectNoLeak(harness, secret);
     },
   );
@@ -332,13 +328,13 @@ describe("TUI questions", () => {
     expect(harness.render()).toContain(PASTE_ERROR);
     expect(harness.render()).not.toContain("bad");
     await harness.answer("\x15", "\x1b[200~prefix\tsuffix\x1b[201~");
-    expectAnswers(harness, { value: ["prefix\tsuffix"] });
+    harness.expectAnswers({ value: ["prefix\tsuffix"] });
   });
 
   it("preserves whitespace-only secret values", async () => {
     const harness = createHarness(textQuestion({ isSecret: true }));
     await harness.answer("   ");
-    expectAnswers(harness, { value: ["   "] });
+    harness.expectAnswers({ value: ["   "] });
   });
 
   it("collapses without resolving, preserves the draft, and reopens with /question", async () => {
@@ -350,7 +346,7 @@ describe("TUI questions", () => {
     await harness.controller.reopen();
     expect(harness.render()).toContain("Draft answer");
     await harness.answer();
-    expectAnswers(harness, { target: ["Draft answer"] });
+    harness.expectAnswers({ target: ["Draft answer"] });
   });
 
   it("returns to the composer on Esc even with multiple pending requests", () => {
@@ -363,17 +359,11 @@ describe("TUI questions", () => {
   });
 
   it("sanitizes terminal controls and bidirectional overrides in authored text", () => {
-    const harness = createHarness();
-    harness.request(
-      questionRecord({
-        questions: [
-          {
-            questionId: "target",
-            header: "Target",
-            question: "Question\u001b]52;c;YWJj\u0007\u202e",
-            options: [{ label: "Choice\u001b[2J\u2066", description: "Description\u0000" }],
-          },
-        ],
+    const harness = createHarness(
+      textQuestion({
+        questionId: "target",
+        question: "Question\u001b]52;c;YWJj\u0007\u202e",
+        options: [{ label: "Choice\u001b[2J\u2066", description: "Description\u0000" }],
       }),
     );
     const rendered = harness.rawRender();
@@ -412,13 +402,7 @@ describe("TUI questions", () => {
     "dismisses questions %s elsewhere without showing answer values",
     (status) => {
       const harness = createHarness(questionRecord());
-      harness.controller.handleEvent("question.resolved", {
-        id: "request-1",
-        status,
-        ...(status === "answered"
-          ? { answers: { answers: { target: ["synthetic-private-answer"] } } }
-          : {}),
-      });
+      harness.resolved(status, { answers: { target: ["synthetic-private-answer"] } });
       harness.expectDismissed();
       expectNoLeak(harness, "synthetic-private-answer");
       expect(harness.resolveQuestion).not.toHaveBeenCalled();
@@ -431,7 +415,7 @@ describe("TUI questions", () => {
     harness.listQuestions.mockReturnValueOnce(listing.promise);
     const refresh = harness.controller.refresh();
     harness.controller.handleEvent("question.requested", questionRecord({ id: "newer" }));
-    harness.controller.handleEvent("question.resolved", { id: "request-1", status: "cancelled" });
+    harness.resolved("cancelled");
     listing.resolve({ questions: [questionRecord()] });
     await refresh;
     await harness.answer();
@@ -443,10 +427,7 @@ describe("TUI questions", () => {
     const { harness, submission } = startSubmission();
     await harness.controller.refresh();
     expect(harness.openOverlay).toHaveBeenCalledTimes(1);
-    harness.controller.handleEvent("question.resolved", {
-      id: "request-1",
-      ...answered,
-    });
+    harness.resolved("answered");
     submission.resolve(answered);
     await settle();
     harness.expectOutcome("answered");
@@ -487,12 +468,7 @@ describe("TUI questions", () => {
       const harness = createHarness(questionRecord());
       harness.resolveQuestion.mockRejectedValueOnce(new Error("connection closed"));
       harness.getQuestion.mockResolvedValue({
-        question: questionRecord({
-          status,
-          ...(status === "answered"
-            ? { answers: { answers: { target: ["private answer"] } } }
-            : {}),
-        }),
+        question: questionRecord({ status, ...(status === "answered" ? answered : {}) }),
       });
       await harness.answer();
       expect(harness.getQuestion).toHaveBeenCalledWith("request-1");
@@ -510,11 +486,7 @@ describe("TUI questions", () => {
         secret,
       );
       if (eventFirst) {
-        harness.controller.handleEvent("question.resolved", {
-          id: "request-1",
-          status: "answered",
-          answers: { answers: { key: ["stored"] } },
-        });
+        harness.resolved("answered", { answers: { key: ["stored"] } });
       }
       submission.reject(
         new GatewayClientRequestError({
