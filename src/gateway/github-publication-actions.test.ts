@@ -36,6 +36,7 @@ import {
 } from "./worker-environments/local-workspace-projection.js";
 import * as workspaceStore from "./worker-environments/local-workspace-store.js";
 import { isLocalWorkspaceBaseRefreshRef } from "./worker-environments/workspace-result-inventory.js";
+import { workerWorkspaceResultStaging } from "./worker-environments/workspace-result-staging.js";
 
 const mocks = githubPublicationTestMocks();
 const checkpoint = vi.hoisted(() => vi.fn());
@@ -536,8 +537,68 @@ describe("session PR actions through the agent tool and registered Gateway metho
     ).rejects.toThrow("read-only");
     expect(await local.git("rev-parse", "HEAD")).toBe(beforeAdmission);
     expect(await fs.readFile(path.join(local.cwd, "artifact.txt"), "utf8")).toBe("accepted\n");
-    // Fail after the real canonical receipt, before projection application; retry uses its retained payload.
+    const stage = workerWorkspaceResultStaging.stageWorkerWorkspaceResult;
+    let stagedRefresh = "";
+    const stageInterruption = vi
+      .spyOn(workerWorkspaceResultStaging, "stageWorkerWorkspaceResult")
+      .mockImplementation(async (params) => {
+        const result = await stage(params);
+        if (isLocalWorkspaceBaseRefreshRef(params.stagedResultRef)) {
+          stagedRefresh = params.stagedResultRef;
+          throw new Error("interrupted before refresh reservation");
+        }
+        return result;
+      });
+    await expect(invoke({ action: "refresh_base" })).rejects.toThrow(
+      "interrupted before refresh reservation",
+    );
+    stageInterruption.mockRestore();
+    expect(stagedRefresh).not.toBe("");
+    const stagedHead = await local.git("rev-parse", "HEAD");
+    const stagedBaseline = await workspaceStore.withLocalWorkspaceStore(
+      { worktreeId: owner.worktree.id },
+      async (store) => store.get(),
+    );
+    expect(stagedBaseline?.pending_ref).toBeNull();
+    await fs.appendFile(path.join(projection, ".guest-cache"), "saved after interruption\n");
+    await fs.mkdir(path.join(projection, "later-empty-guest-directory"));
+    await withLocalWorkspaceProjection(owner, (state) => state.synchronize("canonical"));
+    const advancedBaseline = await workspaceStore.withLocalWorkspaceStore(
+      { worktreeId: owner.worktree.id },
+      async (store) => store.get(),
+    );
+    expect(advancedBaseline?.baseline_ref).not.toBe(stagedBaseline?.baseline_ref);
+    expect(await local.git("rev-parse", "HEAD")).toBe(stagedHead);
     const withStore = workspaceStore.withLocalWorkspaceStore;
+    const reservationInterruption = vi
+      .spyOn(workspaceStore, "withLocalWorkspaceStore")
+      .mockImplementation((params, operation) =>
+        withStore(params, (store) =>
+          operation({
+            ...store,
+            update: async (row, patch, authority) => {
+              if (
+                patch.pending_target === "canonical" &&
+                isLocalWorkspaceBaseRefreshRef(patch.pending_ref ?? null)
+              ) {
+                throw new Error("interrupted before refresh reservation");
+              }
+              return await store.update(row, patch, authority);
+            },
+          }),
+        ),
+      );
+    await expect(invoke({ action: "refresh_base" })).rejects.toThrow(
+      "interrupted before refresh reservation",
+    );
+    reservationInterruption.mockRestore();
+    expect(await local.git("rev-parse", "MERGE_HEAD")).toBe(baseCommit);
+    await fs.writeFile(
+      path.join(projection, "artifact.txt"),
+      "guest saved change after native preparation\n",
+    );
+    await withLocalWorkspaceProjection(owner, (state) => state.synchronize("canonical"));
+    // Fail after the real canonical receipt, before projection application; retry uses its retained payload.
     let interrupted = false;
     const interruption = vi
       .spyOn(workspaceStore, "withLocalWorkspaceStore")
@@ -577,7 +638,9 @@ describe("session PR actions through the agent tool and registered Gateway metho
       baseCommit,
       conflictPaths: ["artifact.txt"],
     });
-    expect(await fs.readFile(path.join(projection, "artifact.txt"), "utf8")).toContain("<<<<<<<");
+    const conflictedSource = await fs.readFile(path.join(projection, "artifact.txt"), "utf8");
+    expect(conflictedSource).toContain("<<<<<<<");
+    expect(conflictedSource).toContain("guest saved change after native preparation");
     expect(await fs.readFile(path.join(projection, "upstream.txt"), "utf8")).toBe(
       "unrelated upstream file\n",
     );
@@ -585,11 +648,21 @@ describe("session PR actions through the agent tool and registered Gateway metho
       "saved independent work\n",
     );
     expect(await fs.readFile(path.join(projection, ".guest-cache"), "utf8")).toBe(
-      "saved ignored guest work\n",
+      "saved ignored guest work\nsaved after interruption\n",
     );
     expect((await fs.stat(path.join(projection, "empty-guest-directory"))).isDirectory()).toBe(
       true,
     );
+    expect(
+      (await fs.stat(path.join(projection, "later-empty-guest-directory"))).isDirectory(),
+    ).toBe(true);
+    expect(
+      await local.git(
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/openclaw/workspace-base-refresh",
+      ),
+    ).toBe("");
     await expect(fs.stat(path.join(projection, ".env.local"))).rejects.toMatchObject({
       code: "ENOENT",
     });
@@ -613,7 +686,7 @@ describe("session PR actions through the agent tool and registered Gateway metho
     ).rejects.toThrow("Conflict markers");
     await fs.writeFile(
       path.join(projection, "artifact.txt"),
-      "upstream change\nguest saved change\n",
+      "upstream change\nguest saved change after native preparation\n",
     );
     expect(
       await invoke({ action: "refresh_base", conflictsResolved: true, baseCommit }),
@@ -632,6 +705,9 @@ describe("session PR actions through the agent tool and registered Gateway metho
     expect(f.publishedTitles).toEqual(["first-draft"]);
     await local.git("merge-base", "--is-ancestor", baseCommit, "HEAD");
     expect(await local.git("show", "HEAD:upstream.txt")).toBe("unrelated upstream file");
+    expect(await local.git("show", "HEAD:artifact.txt")).toBe(
+      "upstream change\nguest saved change after native preparation",
+    );
     expect(await fs.readFile(path.join(local.cwd, ".env.local"), "utf8")).toBe(
       "host-private-fixture",
     );

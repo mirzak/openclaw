@@ -33,7 +33,7 @@ import {
 } from "./worker-environments/workspace-manifest.js";
 import { localWorkspaceBaseRefreshRef } from "./worker-environments/workspace-result-inventory.js";
 import {
-  hasWorkerWorkspaceResultRef,
+  deleteStagedWorkerWorkspaceResult,
   workerWorkspaceResultStaging,
 } from "./worker-environments/workspace-result-staging.js";
 
@@ -108,11 +108,27 @@ export async function refreshManagedWorkspaceBase(params: {
           const git = (args: string[], input?: string) =>
             policy.require(cwd, args, { env, input, beforeRun: check });
           const probe = (args: string[]) => policy.run(cwd, args, { env, beforeRun: check });
+          const stagedRef = localWorkspaceBaseRefreshRef(
+            createHash("sha256").update(owner.worktree.id).digest("hex"),
+          );
+          // Settlement above finishes reserved transfers. The lease owns this one
+          // remaining, unreserved slot; its payload must use the current baseline.
+          await deleteStagedWorkerWorkspaceResult({
+            root: cwd,
+            stagedResultRef: stagedRef,
+            assertCurrent: check,
+          });
           const pending = await probe(["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]);
           if (pending.code !== 0 && pending.code !== 1) {
             throw new Error("Workspace base integration state is unavailable.");
           }
           let baseCommit = pending.code === 0 ? pending.stdout.trim() : undefined;
+          if (baseCommit && state.current().base_commit !== baseCommit) {
+            // Settlement above finishes reserved transfers. Native-only preparation has
+            // applied no source bytes; restart it so later guest edits enter the snapshot.
+            await git(["merge", "--quit"]);
+            baseCommit = undefined;
+          }
           if (params.conflictsResolved && (!baseCommit || params.baseCommit !== baseCommit)) {
             throw new Error(
               "The pending base integration changed; call refresh_base again and resolve its returned baseCommit.",
@@ -225,70 +241,59 @@ export async function refreshManagedWorkspaceBase(params: {
           )
             .split("\0")
             .filter(Boolean);
-          const stagedRef = localWorkspaceBaseRefreshRef(
-            createHash("sha256")
-              .update(`${owner.worktree.id}\0${sourceHead}\0${baseCommit}`)
-              .digest("hex"),
-          );
           if (state.current().base_commit !== baseCommit) {
-            if (!(await hasWorkerWorkspaceResultRef({ root: cwd, stagedResultRef: stagedRef }))) {
-              const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-base-refresh-"));
-              try {
-                const mergedCommit = await git(
-                  ["commit-tree", "--no-gpg-sign", tree, "-p", sourceHead],
-                  "Prepare selected base integration\n",
-                );
-                const snapshots = [];
-                for (const [name, commit] of [
-                  ["before", sourceHead],
-                  ["after", mergedCommit],
-                ]) {
-                  const destination = path.join(temporary, name!);
-                  await prepareLocalWorkspaceCheckout({
-                    source: cwd,
-                    destination,
-                    temporaryRoot: temporary,
-                    baseCommit: commit!,
-                    branch: "refresh",
-                    signal: new AbortController().signal,
-                    assertCurrent: check,
-                  });
-                  snapshots.push(await captureWorkspaceSnapshot({ root: destination, baseCommit }));
-                }
-                const accepted = parseWorkerWorkspaceManifest(
-                  state.current().baseline_json!,
-                  state.current().baseline_ref!,
-                );
-                const before = snapshots[0]!.manifest;
-                const current = applyWorkspaceSourceOverlay(
-                  before,
-                  accepted,
-                  snapshots[1]!.manifest,
-                );
-                const priorNodes = manifestNodes(before);
-                const currentNodes = manifestNodes(current);
-                for (const [file, entry] of manifestNodes(accepted)) {
-                  if (!priorNodes.has(file) && !sameEntry(entry, currentNodes.get(file))) {
-                    throw new Error(
-                      `The selected base conflicts with saved workspace data at ${file}; move that saved file before retrying refresh_base.`,
-                    );
-                  }
-                }
-                const currentRaw = serializeWorkerWorkspaceManifest(current);
-                await workerWorkspaceResultStaging.stageWorkerWorkspaceResult({
-                  root: cwd,
-                  stagingRoot: path.join(temporary, "after"),
-                  stagedResultRef: stagedRef,
-                  baseManifestRef: state.current().baseline_ref!,
-                  baseManifestRaw: state.current().baseline_json!,
-                  currentManifestRef:
-                    "sha256:" + createHash("sha256").update(currentRaw).digest("hex"),
-                  currentManifestRaw: currentRaw,
+            const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-base-refresh-"));
+            try {
+              const mergedCommit = await git(
+                ["commit-tree", "--no-gpg-sign", tree, "-p", sourceHead],
+                "Prepare selected base integration\n",
+              );
+              const snapshots = [];
+              for (const [name, commit] of [
+                ["before", sourceHead],
+                ["after", mergedCommit],
+              ]) {
+                const destination = path.join(temporary, name!);
+                await prepareLocalWorkspaceCheckout({
+                  source: cwd,
+                  destination,
+                  temporaryRoot: temporary,
+                  baseCommit: commit!,
+                  branch: "refresh",
+                  signal: new AbortController().signal,
                   assertCurrent: check,
                 });
-              } finally {
-                await fs.rm(temporary, { recursive: true, force: true });
+                snapshots.push(await captureWorkspaceSnapshot({ root: destination, baseCommit }));
               }
+              const accepted = parseWorkerWorkspaceManifest(
+                state.current().baseline_json!,
+                state.current().baseline_ref!,
+              );
+              const before = snapshots[0]!.manifest;
+              const current = applyWorkspaceSourceOverlay(before, accepted, snapshots[1]!.manifest);
+              const priorNodes = manifestNodes(before);
+              const currentNodes = manifestNodes(current);
+              for (const [file, entry] of manifestNodes(accepted)) {
+                if (!priorNodes.has(file) && !sameEntry(entry, currentNodes.get(file))) {
+                  throw new Error(
+                    `The selected base conflicts with saved workspace data at ${file}; move that saved file before retrying refresh_base.`,
+                  );
+                }
+              }
+              const currentRaw = serializeWorkerWorkspaceManifest(current);
+              await workerWorkspaceResultStaging.stageWorkerWorkspaceResult({
+                root: cwd,
+                stagingRoot: path.join(temporary, "after"),
+                stagedResultRef: stagedRef,
+                baseManifestRef: state.current().baseline_ref!,
+                baseManifestRaw: state.current().baseline_json!,
+                currentManifestRef:
+                  "sha256:" + createHash("sha256").update(currentRaw).digest("hex"),
+                currentManifestRaw: currentRaw,
+                assertCurrent: check,
+              });
+            } finally {
+              await fs.rm(temporary, { recursive: true, force: true });
             }
             // The retained source payload precedes native merge state and all file effects.
             if (!baseCommit || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(baseCommit)) {
