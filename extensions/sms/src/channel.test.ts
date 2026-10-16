@@ -4,20 +4,23 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveSmsAccount } from "./accounts.js";
 import { smsPlugin } from "./channel.js";
 import type { SmsDeliveryRecord } from "./delivery-observations.js";
+import { createPartialSmsSend } from "./partial-send.test-support.js";
 import type { probeSmsAccount as probeSmsAccountType } from "./status.js";
 import type { sendSmsViaTwilio as sendSmsViaTwilioType } from "./twilio.js";
 import type { SmsChannelConfig } from "./types.js";
 import { createSmsTestAccount } from "./webhook.test-support.js";
 
+const TO = "+15551234567";
+const FROM = "+15557654321";
+
 const sendSmsViaTwilio = vi.hoisted(() => vi.fn<typeof sendSmsViaTwilioType>());
 const hostedMediaMocks = vi.hoisted(() => {
   const cleanup = vi.fn(async () => undefined);
+  const url = "https://gateway.example.com/webhooks/sms/media/abc?token=token";
   return {
     cleanup,
-    prepare: vi.fn(async () => ({
-      url: "https://gateway.example.com/webhooks/sms/media/abc?token=token",
-      cleanup,
-    })),
+    url,
+    prepare: vi.fn(async () => ({ url, cleanup })),
   };
 });
 const listRecentSmsDeliveryRecords = vi.hoisted(() =>
@@ -54,18 +57,15 @@ beforeEach(() => {
   sendSmsViaTwilio.mockReset();
   sendSmsViaTwilio.mockImplementation(async ({ to, onPlatformSendDispatch }) => {
     await onPlatformSendDispatch?.();
-    return { sid: "SM-default", to, from: "+15557654321", status: "queued" };
+    return { sid: "SM-default", to, from: FROM, status: "queued" };
   });
-  hostedMediaMocks.cleanup.mockReset();
-  hostedMediaMocks.cleanup.mockResolvedValue(undefined);
-  hostedMediaMocks.prepare.mockReset();
-  hostedMediaMocks.prepare.mockResolvedValue({
-    url: "https://gateway.example.com/webhooks/sms/media/abc?token=token",
+  hostedMediaMocks.cleanup.mockReset().mockResolvedValue(undefined);
+  hostedMediaMocks.prepare.mockReset().mockResolvedValue({
+    url: hostedMediaMocks.url,
     cleanup: hostedMediaMocks.cleanup,
   });
   listRecentSmsDeliveryRecords.mockClear();
-  recordInitialSmsDeliveryResult.mockReset();
-  recordInitialSmsDeliveryResult.mockResolvedValue(null);
+  recordInitialSmsDeliveryResult.mockReset().mockResolvedValue(null);
   probeSmsAccount.mockClear();
 });
 
@@ -76,7 +76,7 @@ afterEach(() => {
 function createConfig(overrides: SmsChannelConfig = {}) {
   return {
     channels: {
-      sms: { accountSid: "AC123", authToken: "secret", fromNumber: "+15557654321", ...overrides },
+      sms: { accountSid: "AC123", authToken: "secret", fromNumber: FROM, ...overrides },
     },
   };
 }
@@ -93,7 +93,7 @@ function mediaContext({
 } = {}) {
   return {
     cfg: createConfig({ publicWebhookUrl: "https://gateway.example.com/webhooks/sms", ...config }),
-    to: "+15551234567",
+    to: TO,
     text: "caption",
     kind: "media" as const,
     mediaUrl: "/tmp/photo.jpg",
@@ -105,11 +105,7 @@ describe("smsPlugin status", () => {
   it("projects lifecycle from the runtime status record", async () => {
     const snapshot = await smsPlugin.status?.buildAccountSnapshot?.({
       cfg: {},
-      account: createSmsTestAccount({
-        accountId: "support",
-        accountSid: "AC123",
-        publicWebhookUrl: "https://gateway.example.com/webhooks/sms",
-      }),
+      account: createSmsTestAccount({ accountId: "support" }),
       runtime: { accountId: "support", lifecycle: "blocked", terminalDisconnect: true },
     });
 
@@ -121,7 +117,6 @@ describe("smsPlugin status", () => {
     const account = createSmsTestAccount({
       accountId: "support",
       accountSid: "AC-support",
-      publicWebhookUrl: "https://gateway.example.com/webhooks/sms",
     });
     listRecentSmsDeliveryRecords.mockImplementationOnce(
       async () =>
@@ -181,46 +176,41 @@ describe("smsPlugin outbound", () => {
 
   it("uses defaultTo for targetless sends and preserves Twilio receipt metadata", async () => {
     const result = await smsPlugin.outbound?.sendText?.({
-      cfg: createConfig({ defaultTo: "+15551234567" }),
+      cfg: createConfig({ defaultTo: TO }),
       to: "",
       text: "hello",
     });
 
     expect(sendSmsViaTwilio).toHaveBeenCalledWith(
-      expect.objectContaining({ to: "+15551234567", text: "hello" }),
+      expect.objectContaining({ to: TO, text: "hello" }),
     );
     expect(result?.messageId).toBe("SM-default");
     expect(result?.receipt?.raw?.[0]).toMatchObject({
       messageId: "SM-default",
-      chatId: "+15551234567",
-      toJid: "+15551234567",
-      meta: { from: "+15557654321", status: "queued" },
+      chatId: TO,
+      toJid: TO,
+      meta: { from: FROM, status: "queued" },
     });
   });
 
   it("resolves the configured default SMS target for outbound delivery", () => {
     expect(
       smsPlugin.outbound?.resolveTarget?.({
-        cfg: createConfig({ defaultTo: "+15551234567" }),
+        cfg: createConfig({ defaultTo: TO }),
         to: "",
       }),
-    ).toEqual({ ok: true, to: "+15551234567" });
+    ).toEqual({ ok: true, to: TO });
   });
 
   it("hosts and sends outbound media as MMS with an ordered multipart receipt", async () => {
-    sendSmsViaTwilio
-      .mockResolvedValueOnce({
-        sid: "MM-first",
-        to: "+15551234567",
-        from: "+15557654321",
-        status: "queued",
-      })
-      .mockResolvedValueOnce({
-        sid: "SM-second",
-        to: "+15551234567",
-        from: "+15557654321",
+    for (const sid of ["MM-first", "SM-second"]) {
+      sendSmsViaTwilio.mockResolvedValueOnce({
+        sid,
+        to: TO,
+        from: FROM,
         status: "queued",
       });
+    }
     const ctx = mediaContext({
       config: { textChunkLimit: 5 },
       text: "alpha beta",
@@ -236,14 +226,14 @@ describe("smsPlugin outbound", () => {
     expect(sendSmsViaTwilio).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
-        to: "+15551234567",
+        to: TO,
         text: "alpha",
-        mediaUrls: ["https://gateway.example.com/webhooks/sms/media/abc?token=token"],
+        mediaUrls: [hostedMediaMocks.url],
       }),
     );
     expect(sendSmsViaTwilio).toHaveBeenNthCalledWith(
       2,
-      expect.objectContaining({ to: "+15551234567", text: " beta" }),
+      expect.objectContaining({ to: TO, text: " beta" }),
     );
     expect(sendSmsViaTwilio.mock.calls[1]?.[0]).not.toHaveProperty("mediaUrls");
     expect(result?.messageId).toBe("MM-first");
@@ -253,7 +243,7 @@ describe("smsPlugin outbound", () => {
     for (const [index, sid] of ["MM-first", "SM-second"].entries()) {
       expect(recordInitialSmsDeliveryResult).toHaveBeenNthCalledWith(index + 1, {
         account: resolveSmsAccount(ctx.cfg),
-        result: { sid, to: ctx.to, from: "+15557654321", status: "queued" },
+        result: { sid, to: ctx.to, from: FROM, status: "queued" },
       });
     }
   });
@@ -263,7 +253,7 @@ describe("smsPlugin outbound", () => {
     hostedMediaMocks.prepare.mockImplementationOnce(async () => {
       events.push("prepare");
       return {
-        url: "https://gateway.example.com/webhooks/sms/media/abc?token=token",
+        url: hostedMediaMocks.url,
         cleanup: hostedMediaMocks.cleanup,
       };
     });
@@ -337,105 +327,59 @@ describe("smsPlugin outbound", () => {
     expect(sendSmsViaTwilio).not.toHaveBeenCalled();
   });
 
-  it("retains staged MMS media after an ambiguous Twilio failure", async () => {
-    const failure = new Error("Twilio response was lost");
-    sendSmsViaTwilio.mockImplementationOnce(async ({ onPlatformSendDispatch }) => {
-      await onPlatformSendDispatch?.();
-      throw failure;
-    });
-    const ctx = mediaContext({ onPlatformSendDispatch: async () => undefined });
-    const lifecycle = smsPlugin.message?.send?.lifecycle;
-    const attemptToken = await lifecycle?.beforeSendAttempt?.(ctx);
-    const observed = await smsPlugin.message?.send?.media?.(ctx).catch((error: unknown) => error);
-
-    expect(observed).toBe(failure);
-    await lifecycle?.afterSendFailure?.({ ...ctx, error: observed, attemptToken });
-
-    expect(hostedMediaMocks.cleanup).not.toHaveBeenCalled();
-  });
-
-  it("retains staged MMS media after a partial delivery", async () => {
-    sendSmsViaTwilio
-      .mockImplementationOnce(async ({ to, onPlatformSendDispatch }) => {
+  it.each([false, true])(
+    "retains staged MMS media after dispatch (partial: %s)",
+    async (partial) => {
+      const failure = new Error("Twilio response was lost");
+      if (partial) {
+        sendSmsViaTwilio.mockImplementationOnce(async ({ to, onPlatformSendDispatch }) => {
+          await onPlatformSendDispatch?.();
+          return { sid: "MM-first", to };
+        });
+      }
+      sendSmsViaTwilio.mockImplementationOnce(async ({ onPlatformSendDispatch }) => {
+        if (partial) {
+          throw new PlatformMessageNotDispatchedError("second chunk rejected before dispatch", {
+            cause: new Error("provider rejected chunk"),
+          });
+        }
         await onPlatformSendDispatch?.();
-        return { sid: "MM-first", to };
-      })
-      .mockRejectedValueOnce(
-        new PlatformMessageNotDispatchedError("second chunk rejected before dispatch", {
-          cause: new Error("provider rejected chunk"),
-        }),
-      );
-    const ctx = mediaContext({
-      config: { textChunkLimit: 5 },
-      text: "alpha beta",
-      onPlatformSendDispatch: async () => undefined,
-    });
-    const lifecycle = smsPlugin.message?.send?.lifecycle;
-    const attemptToken = await lifecycle?.beforeSendAttempt?.(ctx);
-    const observed = await smsPlugin.message?.send?.media?.(ctx).catch((error: unknown) => error);
-
-    expect(isChannelPartialDeliveryError(observed)).toBe(true);
-    await lifecycle?.afterSendFailure?.({ ...ctx, error: observed, attemptToken });
-
-    expect(hostedMediaMocks.cleanup).not.toHaveBeenCalled();
-  });
-
-  it("reports an accepted text chunk before a later durable send fails", async () => {
-    const failure = new Error("second text chunk failed");
-    const events: string[] = [];
-    sendSmsViaTwilio
-      .mockImplementationOnce(async ({ onPlatformSendDispatch }) => {
-        await onPlatformSendDispatch?.();
-        events.push("send:first");
-        return { sid: "SM-first", to: "+15551234567" };
-      })
-      .mockImplementationOnce(async ({ onPlatformSendDispatch }) => {
-        await onPlatformSendDispatch?.();
-        events.push("send:second");
         throw failure;
       });
-    const onDeliveryResult = vi.fn(async (result) => {
-      events.push(`delivery:${result.messageId}`);
-    });
-    const onPlatformSendDispatch = vi.fn(async () => {
-      events.push("dispatch");
-    });
+      const ctx = mediaContext({
+        config: partial ? { textChunkLimit: 5 } : {},
+        text: partial ? "alpha beta" : "caption",
+        onPlatformSendDispatch: async () => undefined,
+      });
+      const lifecycle = smsPlugin.message?.send?.lifecycle;
+      const attemptToken = await lifecycle?.beforeSendAttempt?.(ctx);
+      const observed = await smsPlugin.message?.send?.media?.(ctx).catch((error: unknown) => error);
+
+      if (partial) {
+        expect(isChannelPartialDeliveryError(observed)).toBe(true);
+      } else {
+        expect(observed).toBe(failure);
+      }
+      await lifecycle?.afterSendFailure?.({ ...ctx, error: observed, attemptToken });
+
+      expect(hostedMediaMocks.cleanup).not.toHaveBeenCalled();
+    },
+  );
+
+  it("reports an accepted text chunk before a later durable send fails", async () => {
+    const fixture = createPartialSmsSend(sendSmsViaTwilio, "SM-first", "text");
+    const { onPlatformSendDispatch, onDeliveryResult } = fixture;
 
     const observed = await smsPlugin.message?.send
       ?.text?.({
         cfg: createConfig({ textChunkLimit: 5 }),
-        to: "+15551234567",
+        to: TO,
         text: "alpha beta",
         onPlatformSendDispatch,
         onDeliveryResult,
       })
       .catch((error: unknown) => error);
 
-    expect(isChannelPartialDeliveryError(observed)).toBe(true);
-    if (!isChannelPartialDeliveryError(observed)) {
-      throw observed;
-    }
-    expect(observed.deliveryResult).toMatchObject({
-      messageIds: ["SM-first"],
-      visibleReplySent: true,
-      receipt: { parts: [{ platformMessageId: "SM-first", kind: "text" }] },
-    });
-    expect(onDeliveryResult).toHaveBeenCalledExactlyOnceWith({
-      channel: "sms",
-      messageId: "SM-first",
-      chatId: "+15551234567",
-      receipt: expect.objectContaining({
-        platformMessageIds: ["SM-first"],
-        parts: [expect.objectContaining({ platformMessageId: "SM-first", kind: "text" })],
-      }),
-    });
-    expect(onPlatformSendDispatch).toHaveBeenCalledTimes(2);
-    expect(events).toEqual([
-      "dispatch",
-      "send:first",
-      "delivery:SM-first",
-      "dispatch",
-      "send:second",
-    ]);
+    fixture.expectPartial(observed);
   });
 });

@@ -1,18 +1,13 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { inspectSmsAccount, listSmsAccountIds, resolveSmsAccount } from "./accounts.js";
 import { SmsChannelConfigSchema } from "./config-schema.js";
 import type { SmsChannelConfig } from "./types.js";
 
-const smsRuntimeConfigSchema = (() => {
-  const schema = SmsChannelConfigSchema.runtime;
-  if (!schema) {
-    throw new Error("expected SMS runtime config schema");
-  }
-  return schema;
-})();
-
 function parseSmsConfig(value: unknown): SmsChannelConfig {
-  const parsed = smsRuntimeConfigSchema.safeParse(value);
+  const parsed = expectDefined(SmsChannelConfigSchema.runtime, "SMS config schema").safeParse(
+    value,
+  );
   if (!parsed.success) {
     throw new Error(parsed.issues.map((issue) => issue.message).join("; "));
   }
@@ -23,24 +18,7 @@ function config(sms: SmsChannelConfig) {
   return { channels: { sms } };
 }
 
-const ENV_KEYS = [
-  "TWILIO_ACCOUNT_SID",
-  "TWILIO_AUTH_TOKEN",
-  "TWILIO_PHONE_NUMBER",
-  "TWILIO_SMS_FROM",
-  "TWILIO_MESSAGING_SERVICE_SID",
-  "SMS_PUBLIC_WEBHOOK_URL",
-  "SMS_WEBHOOK_PATH",
-  "SMS_ALLOWED_USERS",
-  "SMS_DANGEROUSLY_DISABLE_SIGNATURE_VALIDATION",
-  "SMS_TEXT_CHUNK_LIMIT",
-] as const;
-
-afterEach(() => {
-  for (const key of ENV_KEYS) {
-    delete process.env[key];
-  }
-});
+afterEach(() => vi.unstubAllEnvs());
 
 describe("SMS account config", () => {
   it("reports an invalid public webhook URL without unconfiguring SMS credentials", () => {
@@ -63,7 +41,7 @@ describe("SMS account config", () => {
   });
 
   it("inspects unavailable account credentials without using environment fallbacks or hiding healthy siblings", () => {
-    process.env.TWILIO_AUTH_TOKEN = "lower-precedence-token";
+    vi.stubEnv("TWILIO_AUTH_TOKEN", "lower-precedence-token");
     const unresolvedToken = {
       source: "env",
       provider: "default",
@@ -113,12 +91,7 @@ describe("SMS account config", () => {
     const cfg = config({
       enabled: false,
       accounts: {
-        support: {
-          enabled: true,
-          accountSid: "AC-support",
-          authToken: "support-token",
-          fromNumber: "+15551112222",
-        },
+        support: { enabled: true },
       },
     });
 
@@ -129,15 +102,15 @@ describe("SMS account config", () => {
   });
 
   it("uses env fallbacks for the default account only", () => {
-    process.env.TWILIO_ACCOUNT_SID = "AC-env";
-    process.env.TWILIO_AUTH_TOKEN = "env-token";
-    process.env.TWILIO_PHONE_NUMBER = "+15550001111";
-    process.env.TWILIO_MESSAGING_SERVICE_SID = "MG-env";
-    process.env.SMS_WEBHOOK_PATH = "/webhooks/sms/env";
-    process.env.SMS_PUBLIC_WEBHOOK_URL = "https://sms.example.com/webhook";
-    process.env.SMS_ALLOWED_USERS = "sms:+15552223333,+15554445555";
-    process.env.SMS_DANGEROUSLY_DISABLE_SIGNATURE_VALIDATION = "true";
-    process.env.SMS_TEXT_CHUNK_LIMIT = "800";
+    vi.stubEnv("TWILIO_ACCOUNT_SID", "AC-env");
+    vi.stubEnv("TWILIO_AUTH_TOKEN", "env-token");
+    vi.stubEnv("TWILIO_PHONE_NUMBER", "+15550001111");
+    vi.stubEnv("TWILIO_MESSAGING_SERVICE_SID", "MG-env");
+    vi.stubEnv("SMS_WEBHOOK_PATH", "/webhooks/sms/env");
+    vi.stubEnv("SMS_PUBLIC_WEBHOOK_URL", "https://sms.example.com/webhook");
+    vi.stubEnv("SMS_ALLOWED_USERS", "sms:+15552223333,+15554445555");
+    vi.stubEnv("SMS_DANGEROUSLY_DISABLE_SIGNATURE_VALIDATION", "true");
+    vi.stubEnv("SMS_TEXT_CHUNK_LIMIT", "800");
 
     const cfg = config({ accounts: { support: { enabled: true } } });
 
@@ -167,11 +140,8 @@ describe("SMS account config", () => {
     });
   });
 
-  it.each(["0"])("keeps the default text chunk limit when SMS_TEXT_CHUNK_LIMIT is %j", (raw) => {
-    process.env.TWILIO_ACCOUNT_SID = "AC-env";
-    process.env.TWILIO_AUTH_TOKEN = "env-token";
-    process.env.TWILIO_PHONE_NUMBER = "+15550001111";
-    process.env.SMS_TEXT_CHUNK_LIMIT = raw;
+  it("keeps the default text chunk limit when SMS_TEXT_CHUNK_LIMIT is zero", () => {
+    vi.stubEnv("SMS_TEXT_CHUNK_LIMIT", "0");
 
     expect(resolveSmsAccount({}).textChunkLimit).toBe(1500);
   });
