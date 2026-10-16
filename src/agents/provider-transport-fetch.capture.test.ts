@@ -92,13 +92,12 @@ it.each([
         },
         async (baseUrl) => {
           const localModel = { ...model, baseUrl: `${baseUrl}/v1` };
-          const request = { model: model.id, stream: true as const, input: "fixture" };
           const response = await buildGuardedModelFetch(localModel, 20_000)(
             `${localModel.baseUrl}/responses`,
             {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify(request),
+              body: JSON.stringify({ model: model.id, stream: true, input: "fixture" }),
               signal: controller.signal,
             },
           );
@@ -109,7 +108,11 @@ it.each([
                 baseURL: localModel.baseUrl,
                 fetch: async () => response,
               }),
-              request,
+              request: {
+                model: model.id,
+                stream: true,
+                input: [{ role: "user", content: "fixture" }],
+              },
               requestOptions: { signal: controller.signal },
               model: localModel,
             });
