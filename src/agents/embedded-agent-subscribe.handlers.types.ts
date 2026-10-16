@@ -14,7 +14,6 @@ import type { AgentItemEventData } from "../infra/agent-activity-events.js";
 import type { AssistantMessage, ThinkingContent } from "../llm/types.js";
 import type { HookRunner } from "../plugins/hooks.js";
 import type { AssistantPhase } from "../shared/chat-message-content.js";
-import type { StreamDirectiveCodePrefix } from "../utils/directive-tags.js";
 import type { AcceptedSessionSpawn } from "./accepted-session-spawn.js";
 import type { BlockChunkMetadata, EmbeddedBlockChunker } from "./embedded-agent-block-chunker.js";
 import type { LiveEditDiffProgressState } from "./embedded-agent-live-edit-diff.js";
@@ -26,6 +25,7 @@ import type { BlockReplyPayload } from "./embedded-agent-payloads.js";
 import type { EmbeddedRunReplayState } from "./embedded-agent-runner/replay-state.js";
 import type { EmbeddedRunAttemptResult } from "./embedded-agent-runner/run/types.js";
 import type { EmbeddedRunLivenessState } from "./embedded-agent-runner/types.js";
+import type { createStreamingReplyResolver } from "./embedded-agent-subscribe.handlers.messages.stream.js";
 import type {
   BlockReplyChunking,
   SubscribeEmbeddedAgentSessionParams,
@@ -162,6 +162,7 @@ export type EmbeddedAgentSubscribeState = {
    * would publish reasoning/commentary bytes as assistant text.
    */
   deltaBufferIsCommentary: boolean;
+  nextCommentaryAt?: number;
   /** Whether timeout settlement committed visible text for this message. */
   hasFlushedPartialText: boolean;
   partialBlockState: StreamBlockState & { inlineCode: InlineCodeState };
@@ -173,7 +174,7 @@ export type EmbeddedAgentSubscribeState = {
     projection?: {
       kind: "raw" | "delivery" | "final";
       projector: ReturnType<typeof createAssistantVisibleStreamText>;
-      directiveCodePrefix?: StreamDirectiveCodePrefix;
+      resolveReply: ReturnType<typeof createStreamingReplyResolver>;
     };
   };
   lastStreamedReasoning?: string;
