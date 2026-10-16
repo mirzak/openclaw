@@ -83,7 +83,7 @@ vi.mock("./doctor-health-contribution-runners.config.js", async (importOriginal)
 afterEach(() => vi.restoreAllMocks());
 
 it.each(["rehearsal", "partial-markers"])(
-  "defers only pure advisory contributions during %s and records their IDs",
+  "defers only pure advisory contributions (%s)",
   async (mode) => {
     const env = {
       ...buildUpdateRehearsalPathEnv("/synthetic/rehearsal"),
@@ -115,68 +115,60 @@ it.each(["rehearsal", "partial-markers"])(
       mode === "rehearsal" ? retainedIds : new Set([...retainedIds, ...advisoryIds]),
     );
     if (mode === "rehearsal") {
-      for (const id of advisoryIds) {
+      for (const id of [...advisoryIds, "copied-state rehearsal"]) {
         expect(ctx.runtime.log).toHaveBeenCalledWith(expect.stringContaining(id));
       }
-      expect(ctx.runtime.log).toHaveBeenCalledWith(
-        expect.stringContaining("copied-state rehearsal"),
-      );
     }
     expect(ctx.updateWarnings).toEqual([...priorWarnings, "Final repair warning"]);
   },
 );
 
-it.each([true, false])(
-  "defers lint-backed advisory inspections from an updater that runs them after restart (budget=%s)",
-  async (hasBudget) => {
-    const deferredIds = doctorIds("runtime-tool-schemas provider-catalog-projection hooks-model");
-    // Security gates readiness; ingress dead letters has no equivalent post-restart lint.
-    const retainedIds = new Set([
-      ...repairIds,
-      ...doctorIds("session-snapshots workspace-status security channel-ingress-dead-letters"),
-    ]);
-    const { contributions, executed } = recordContributions([deferredIds, retainedIds]);
-    const ctx = createDoctorHealthFlowContext({
-      env: {
-        ...updateEnv,
-        OPENCLAW_UPDATE_PARENT_RUNS_POST_ACTIVATION_INSPECTIONS: "reported-checks",
-      },
+it.each([true, false])("defers post-restart lint inspections (budget=%s)", async (hasBudget) => {
+  const deferredIds = doctorIds("runtime-tool-schemas provider-catalog-projection hooks-model");
+  // Security gates readiness; ingress dead letters has no equivalent post-restart lint.
+  const retainedIds = new Set([
+    ...repairIds,
+    ...doctorIds("session-snapshots workspace-status security channel-ingress-dead-letters"),
+  ]);
+  const { contributions, executed } = recordContributions([deferredIds, retainedIds]);
+  const ctx = createDoctorHealthFlowContext({
+    env: {
+      ...updateEnv,
+      OPENCLAW_UPDATE_PARENT_RUNS_POST_ACTIVATION_INSPECTIONS: "reported-checks",
+    },
+    updateBudget: hasBudget ? updateBudget() : undefined,
+  });
+  await captureUpdateDoctorConfigWrites(ctx.configPath, async (capture) => {
+    await runDoctorHealthContributionList(ctx, contributions);
+    expect(capture.deferredInspectionCheckIds).toEqual(deferredChecks);
+  });
+  expect(new Set(executed)).toEqual(retainedIds);
+  expect(ctx.updateWarnings ?? []).toEqual([]);
+  expect(ctx.runtime.log).toHaveBeenCalledWith(
+    expect.stringContaining(
+      `Deferred advisory inspections until the restarted Gateway is ready: ${deferredChecks.join(", ")}.`,
+    ),
+  );
+  for (const marker of [undefined, "1", "reported-checks"]) {
+    executed.length = 0;
+    const inline = createDoctorHealthFlowContext({
+      env: { ...updateEnv, OPENCLAW_UPDATE_PARENT_RUNS_POST_ACTIVATION_INSPECTIONS: marker },
       updateBudget: hasBudget ? updateBudget() : undefined,
     });
-    await captureUpdateDoctorConfigWrites(ctx.configPath, async (capture) => {
-      await runDoctorHealthContributionList(ctx, contributions);
-      expect(capture.deferredInspectionCheckIds).toEqual(deferredChecks);
-    });
-
-    expect(new Set(executed)).toEqual(retainedIds);
-    expect(ctx.updateWarnings ?? []).toEqual([]);
-    expect(ctx.runtime.log).toHaveBeenCalledWith(
-      expect.stringContaining(
-        `Deferred advisory inspections until the restarted Gateway is ready: ${deferredChecks.join(", ")}.`,
-      ),
-    );
-
-    for (const marker of [undefined, "1", "reported-checks"]) {
-      executed.length = 0;
-      const inline = createDoctorHealthFlowContext({
-        env: { ...updateEnv, OPENCLAW_UPDATE_PARENT_RUNS_POST_ACTIVATION_INSPECTIONS: marker },
-        updateBudget: hasBudget ? updateBudget() : undefined,
-      });
-      if (marker === "reported-checks") {
+    if (marker === "reported-checks") {
+      await runDoctorHealthContributionList(inline, contributions);
+    } else {
+      await captureUpdateDoctorConfigWrites(inline.configPath, async (capture) => {
         await runDoctorHealthContributionList(inline, contributions);
-      } else {
-        await captureUpdateDoctorConfigWrites(inline.configPath, async (capture) => {
-          await runDoctorHealthContributionList(inline, contributions);
-          expect(capture.deferredInspectionCheckIds).toBeUndefined();
-        });
-      }
-      // Older parents, and markers without a result owner, keep every inspection inline.
-      expect(new Set(executed), marker).toEqual(new Set([...retainedIds, ...deferredIds]));
+        expect(capture.deferredInspectionCheckIds).toBeUndefined();
+      });
     }
-  },
-);
+    // Older parents, and markers without a result owner, keep every inspection inline.
+    expect(new Set(executed), marker).toEqual(new Set([...retainedIds, ...deferredIds]));
+  }
+});
 
-it("records only inspections actually skipped before a required Doctor failure", async () => {
+it("records only skips preceding a required failure", async () => {
   const executed: string[] = [];
   const inspection = (id: string) =>
     createDoctorHealthContribution(id, id, {
@@ -218,84 +210,81 @@ it("records only inspections actually skipped before a required Doctor failure",
 it.each([
   { agentCount: 480, phase: "validation" },
   { agentCount: 3, phase: "activation" },
-])(
-  "completes required repairs and reports deferred inspection for $agentCount agents during $phase",
-  async ({ agentCount, phase }) => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      const cfg: OpenClawConfig = {
-        agents: {
-          ownership: "explicit",
-          entries: Object.fromEntries(
-            Array.from({ length: agentCount }, (_, index) => [`fleet-${index}`, {}]),
-          ),
-        },
-      };
-      const env = {
-        ...state.env,
-        ...(phase === "validation"
-          ? buildUpdateRehearsalPathEnv(state.stateDir)
-          : { OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH: state.path("doctor-result.json") }),
-        ...updateEnv,
-        OPENCLAW_SERVICE_REPAIR_POLICY: "external",
-      };
-      const startedAt = Date.now();
-      const run = createUpdateRun(
-        { trigger: "cli", target: { kind: "package" }, before: { version: "2026.9.4" } },
-        { env },
-      );
-      recordUpdateRunPhase(run.runId, "validating", {}, { env });
-      closeOpenClawStateDatabaseForTest();
-      // Activation has a fresh inspection window even when validation was long ago.
-      const doctorStartedAt = startedAt + (phase === "validation" ? 20_000 : 600_000);
-      observed.now = doctorStartedAt;
-      observed.events = [];
-      vi.spyOn(Date, "now").mockImplementation(() => observed.now);
-      const selected = selectContributions(
-        doctorIds("auth-profiles session-transcripts write-config final-config-validation"),
-      );
-      const priorWarnings = Array.from(
-        { length: agentCount === 480 ? 32 : 0 },
-        (_, index) => `Prior Doctor warning ${index}`,
-      );
-      const ctx = createDoctorHealthFlowContext({
-        cfg,
-        updateWarnings: priorWarnings,
-        env,
-        preparedAgentCount: agentCount,
-        options: { repair: true, nonInteractive: true },
-      });
-      await runDoctorHealthContributionList(ctx, selected);
-
-      expect(observed.now - doctorStartedAt).toBeLessThan(298_000);
-      expect(observed.events).toEqual([
-        "required-session-repair",
-        ...(agentCount === 3 ? ["auth-inspection"] : []),
-        "config-write",
-        "final-readiness",
-      ]);
-      if (agentCount === 3) {
-        expect(ctx.updateWarnings ?? []).toEqual([]);
-      } else {
-        expect(ctx.updateWarnings).toHaveLength(32);
-        expect(ctx.updateWarnings).toContain("Prior Doctor warning 0");
-        expect(ctx.updateWarnings).toContainEqual(
-          expect.stringContaining("core/doctor/auth-profiles [update-inspection-deferred]"),
-        );
-        expect([...(ctx.updateBudget?.deferred.values() ?? [])]).toEqual([
-          expect.objectContaining({
-            checkId: "core/doctor/auth-profiles",
-            severity: "warning",
-            errorCode: "update-inspection-deferred",
-            requirement: "update-validation-budget",
-          }),
-        ]);
-        observed.events = [];
-        await runDoctorHealthContributionList(
-          createDoctorHealthFlowContext({ cfg, env: {} }),
-          selected,
-        );
-        expect(observed.events).toContain("auth-inspection");
-      }
+])("repairs $agentCount agents during $phase", async ({ agentCount, phase }) => {
+  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    const cfg: OpenClawConfig = {
+      agents: {
+        ownership: "explicit",
+        entries: Object.fromEntries(
+          Array.from({ length: agentCount }, (_, index) => [`fleet-${index}`, {}]),
+        ),
+      },
+    };
+    const env = {
+      ...state.env,
+      ...(phase === "validation"
+        ? buildUpdateRehearsalPathEnv(state.stateDir)
+        : { OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH: state.path("doctor-result.json") }),
+      ...updateEnv,
+      OPENCLAW_SERVICE_REPAIR_POLICY: "external",
+    };
+    const startedAt = Date.now();
+    const run = createUpdateRun(
+      { trigger: "cli", target: { kind: "package" }, before: { version: "2026.9.4" } },
+      { env },
+    );
+    recordUpdateRunPhase(run.runId, "validating", {}, { env });
+    closeOpenClawStateDatabaseForTest();
+    // Activation has a fresh inspection window even when validation was long ago.
+    const doctorStartedAt = startedAt + (phase === "validation" ? 20_000 : 600_000);
+    observed.now = doctorStartedAt;
+    observed.events = [];
+    vi.spyOn(Date, "now").mockImplementation(() => observed.now);
+    const selected = selectContributions(
+      doctorIds("auth-profiles session-transcripts write-config final-config-validation"),
+    );
+    const priorWarnings = Array.from(
+      { length: agentCount === 480 ? 32 : 0 },
+      (_, index) => `Prior Doctor warning ${index}`,
+    );
+    const ctx = createDoctorHealthFlowContext({
+      cfg,
+      updateWarnings: priorWarnings,
+      env,
+      preparedAgentCount: agentCount,
+      options: { repair: true, nonInteractive: true },
     });
-  },
-);
+    await runDoctorHealthContributionList(ctx, selected);
+
+    expect(observed.now - doctorStartedAt).toBeLessThan(298_000);
+    expect(observed.events).toEqual([
+      "required-session-repair",
+      ...(agentCount === 3 ? ["auth-inspection"] : []),
+      "config-write",
+      "final-readiness",
+    ]);
+    if (agentCount === 3) {
+      expect(ctx.updateWarnings ?? []).toEqual([]);
+    } else {
+      expect(ctx.updateWarnings).toHaveLength(32);
+      expect(ctx.updateWarnings).toContain("Prior Doctor warning 0");
+      expect(ctx.updateWarnings).toContainEqual(
+        expect.stringContaining("core/doctor/auth-profiles [update-inspection-deferred]"),
+      );
+      expect([...(ctx.updateBudget?.deferred.values() ?? [])]).toEqual([
+        expect.objectContaining({
+          checkId: "core/doctor/auth-profiles",
+          severity: "warning",
+          errorCode: "update-inspection-deferred",
+          requirement: "update-validation-budget",
+        }),
+      ]);
+      observed.events = [];
+      await runDoctorHealthContributionList(
+        createDoctorHealthFlowContext({ cfg, env: {} }),
+        selected,
+      );
+      expect(observed.events).toContain("auth-inspection");
+    }
+  });
+});
