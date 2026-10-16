@@ -1,7 +1,6 @@
 import { expectDefined } from "@openclaw/normalization-core";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { WebSocket } from "ws";
 import { GATEWAY_CLIENT_CAPS } from "../../../packages/gateway-protocol/src/client-info.js";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -18,6 +17,79 @@ import { openTerminalSession } from "./terminal.js";
 
 beforeEach(() => setActivePluginRegistry(createEmptyPluginRegistry()));
 afterEach(() => resetPluginRuntimeStateForTest());
+
+function terminalFixture(
+  registry: NodeRegistry,
+  commands: [string, ...string[]],
+  trusted = false,
+  clientId?: string,
+) {
+  const frames: string[] = [];
+  const node = registerNodeSession(
+    registry,
+    makeClient("conn-node", "node-1", frames, { commands, clientId }),
+    { pairingGeneration: "generation-a" },
+  );
+  const runtime: { config: OpenClawConfig } = {
+    config: {
+      agents: { entries: { main: {} } },
+      gateway: {
+        terminal: { enabled: true },
+        uploads: { enabled: true },
+        nodes: { commands: { allow: commands } },
+      },
+    },
+  };
+  const policy = createTerminalLaunchPolicy(runtime.config);
+  const manager = new TerminalSessionManager({ emit: vi.fn() });
+  const isConnectionActive = vi.fn(() => true);
+  const context = createDirectChatContext({
+    getRuntimeConfig: () => runtime.config,
+    getCommittedRuntimeConfig: () => runtime.config,
+    resolveTerminalLaunchPolicy: policy.resolve,
+    isTerminalEnabled: policy.isEnabled,
+    nodeRegistry: registry,
+    terminalSessions: manager,
+    isConnectionActive,
+  });
+  const client: GatewayClient = {
+    connId: "conn-1",
+    connect: {
+      minProtocol: 1,
+      maxProtocol: 1,
+      client: { id: "test", version: "1", platform: "test", mode: "test" },
+      caps: [GATEWAY_CLIENT_CAPS.TERMINAL_UPLOAD_PATH_STYLE],
+    },
+    internal: trusted ? { syntheticClient: true } : undefined,
+  };
+  const options = (method: string, respond = vi.fn(), params = {}) => ({
+    req: { type: "req" as const, id: method, method, params },
+    params,
+    client,
+    context,
+    respond,
+    isWebchatConnect: () => false,
+  });
+  const open = (respond: ReturnType<typeof vi.fn>, requireCliAgents = false) =>
+    openTerminalSession(options("terminal.open", respond), {
+      agentId: "main",
+      cols: 80,
+      rows: 24,
+      requireCliAgents,
+      resolveCatalogPlan: async () => ({
+        kind: "node",
+        nodeId: "node-1",
+        command: commands[0],
+        cwd: "/node/worktree",
+        paramsJSON: JSON.stringify({ cwd: "/node/worktree" }),
+      }),
+    });
+  const dispose = () => {
+    manager.disposeAll();
+    registry.unregister("conn-node");
+  };
+  return { frames, node, runtime, policy, manager, isConnectionActive, options, open, dispose };
+}
 
 describe.each([
   "codex.terminal.start.v1",
@@ -36,63 +108,12 @@ describe.each([
     const pairing = createDeferred<{ identity: string; generation: string }>();
     const resolveCurrentPairingState = vi.fn(() => pairing.promise);
     const registry = new NodeRegistry({ resolveCurrentPairingState });
-    const frames: string[] = [];
-    const node = registry.register(
-      {
-        connId: "conn-node",
-        usesSharedGatewayAuth: false,
-        socket: {
-          readyState: WebSocket.OPEN,
-          send(frame: string) {
-            frames.push(frame);
-          },
-        },
-        connect: {
-          client: { id: "openclaw-node-host", mode: "node" },
-          device: { id: "node-1" },
-          commands: [command],
-        },
-      } as never,
-      { pairingIdentity: "identity-a", pairingGeneration: "generation-a" },
-    );
-    const config: OpenClawConfig = {
-      agents: { entries: { main: {} } },
-      gateway: {
-        terminal: { enabled: true },
-        nodes: { commands: { allow: [command] } },
-      },
-    };
-    const policy = createTerminalLaunchPolicy(config);
-    const manager = new TerminalSessionManager({ emit: vi.fn() });
+    const { frames, node, runtime, policy, manager, isConnectionActive, open, dispose } =
+      terminalFixture(registry, [command], false, "openclaw-node-host");
+    const config = runtime.config;
     const respond = vi.fn();
-    const isConnectionActive = vi.fn(() => true);
-    const opts = {
-      client: { connId: "conn-1", connect: {} },
-      respond,
-      context: {
-        getRuntimeConfig: () => config,
-        resolveTerminalLaunchPolicy: policy.resolve,
-        isTerminalEnabled: policy.isEnabled,
-        nodeRegistry: registry,
-        terminalSessions: manager,
-        isConnectionActive,
-        logGateway: { info: vi.fn() },
-      },
-    } as unknown as Parameters<typeof openTerminalSession>[0];
     const requireCliAgents = command.includes(".start.");
-    const opening = openTerminalSession(opts, {
-      agentId: "main",
-      cols: 80,
-      rows: 24,
-      requireCliAgents,
-      resolveCatalogPlan: async () => ({
-        kind: "node",
-        nodeId: "node-1",
-        command,
-        cwd: "/node/worktree",
-        paramsJSON: JSON.stringify({ cwd: "/node/worktree" }),
-      }),
-    });
+    const opening = open(respond, requireCliAgents);
     try {
       await vi.waitFor(() => expect(resolveCurrentPairingState).toHaveBeenCalledOnce(), {
         interval: 1,
@@ -132,8 +153,7 @@ describe.each([
     } finally {
       pairing.resolve({ identity: "identity-a", generation: "generation-a" });
       await opening;
-      manager.disposeAll();
-      registry.unregister("conn-node");
+      dispose();
     }
   });
 });
@@ -159,43 +179,11 @@ it.each([
         return { identity: "identity-a", generation: "generation-a" };
       },
     });
-    const frames: string[] = [];
-    registerNodeSession(
+    const { frames, runtime, options, open, dispose } = terminalFixture(
       registry,
-      makeClient("conn-node", "node-1", frames, {
-        commands: [command, uploadCommand],
-      }),
-      { pairingGeneration: "generation-a" },
+      [command, uploadCommand],
+      trusted,
     );
-    let config: OpenClawConfig = {
-      agents: { entries: { main: {} } },
-      gateway: {
-        terminal: { enabled: true },
-        uploads: { enabled: true },
-        nodes: { commands: { allow: [command, uploadCommand] } },
-      },
-    };
-    const policy = createTerminalLaunchPolicy(config);
-    const manager = new TerminalSessionManager({ emit: vi.fn() });
-    const context = createDirectChatContext({
-      getRuntimeConfig: () => config,
-      getCommittedRuntimeConfig: () => config,
-      resolveTerminalLaunchPolicy: policy.resolve,
-      isTerminalEnabled: policy.isEnabled,
-      nodeRegistry: registry,
-      terminalSessions: manager,
-      isConnectionActive: () => true,
-    });
-    const client: GatewayClient = {
-      connId: "conn-1",
-      connect: {
-        minProtocol: 1,
-        maxProtocol: 1,
-        client: { id: "test", version: "1", platform: "test", mode: "test" },
-        caps: [GATEWAY_CLIENT_CAPS.TERMINAL_UPLOAD_PATH_STYLE],
-      },
-      internal: trusted ? { syntheticClient: true } : undefined,
-    };
     const openRespond = vi.fn();
     let uploading: Promise<void> | undefined;
     const uploadFrames = () =>
@@ -218,28 +206,7 @@ it.each([
       return count;
     });
     try {
-      await openTerminalSession(
-        {
-          req: { type: "req", id: "open", method: "terminal.open" },
-          params: {},
-          client,
-          context,
-          respond: openRespond,
-          isWebchatConnect: () => false,
-        },
-        {
-          agentId: "main",
-          cols: 80,
-          rows: 24,
-          resolveCatalogPlan: async () => ({
-            kind: "node",
-            nodeId: "node-1",
-            command,
-            cwd: "/node/worktree",
-            paramsJSON: "{}",
-          }),
-        },
-      );
+      await open(openRespond);
       const opened: unknown = openRespond.mock.calls.at(-1)?.[1];
       if (!isRecord(opened) || typeof opened.sessionId !== "string") {
         throw new Error("Expected admitted node terminal");
@@ -251,14 +218,7 @@ it.each([
         expectDefined(
           terminalUploadHandlers["terminal.upload"],
           "terminal upload handler",
-        )({
-          req: { type: "req", id: "upload", method: "terminal.upload", params },
-          params,
-          client,
-          context,
-          respond,
-          isWebchatConnect: () => false,
-        }),
+        )(options("terminal.upload", respond, params)),
       );
       await Promise.race([
         entered.promise,
@@ -266,7 +226,11 @@ it.each([
           throw new Error("Upload did not reach pairing preparation");
         }),
       ]);
-      config = { ...config, gateway: { ...config.gateway, uploads: { enabled: !disabled } } };
+      const config = runtime.config;
+      runtime.config = {
+        ...config,
+        gateway: { ...config.gateway, uploads: { enabled: !disabled } },
+      };
       pairing.resolve({ identity: "identity-a", generation: "generation-a" });
       await Promise.race([dispatched.promise, uploading]);
       const frame = uploadFrames()[0];
@@ -298,8 +262,7 @@ it.each([
     } finally {
       frameWrites.mockRestore();
       pairing.resolve({ identity: "identity-a", generation: "generation-a" });
-      manager.disposeAll();
-      registry.unregister("conn-node");
+      dispose();
       await uploading;
     }
   },

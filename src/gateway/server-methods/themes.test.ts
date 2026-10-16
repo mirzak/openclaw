@@ -127,6 +127,24 @@ async function invoke(
   return expectDefined(result, "theme RPC response");
 }
 
+function seedPreferences(entries: Record<string, unknown>, profileId = requesterProfileId) {
+  expect(setUserPreferences(profileId, entries).ok).toBe(true);
+}
+
+function preferences(entries: Record<string, unknown> = {}, profileId = requesterProfileId) {
+  expect(getUserPreferences(profileId)).toEqual(entries);
+}
+
+function themePreferences(id: string, mode = "dark") {
+  return { "ui.theme": id, "ui.themeMode": mode };
+}
+
+const daylight = () => ({
+  name: "Daylight",
+  description: "Light-only replacement",
+  light: createThemePaletteFixture(),
+});
+
 function beforeWorkerCommit(checkpoint: () => void) {
   probe.admission(workerAdmission, (request, grant, admit) => {
     if (request.stage === "commit") {
@@ -136,17 +154,23 @@ function beforeWorkerCommit(checkpoint: () => void) {
   });
 }
 
-function changePreferencesAfterSnapshot(entries: Record<string, unknown>) {
+function afterSnapshot(checkpoint: () => void | Promise<void>) {
   const readPreferences = userPreferences.getCanonicalUserPreferences;
   vi.spyOn(userPreferences, "getCanonicalUserPreferences").mockImplementationOnce(
     async (...args) => {
       const snapshot = await readPreferences(...args);
-      expect(
-        await userPreferences.setCanonicalUserPreferences(requesterProfileId, entries),
-      ).toMatchObject({ ok: true });
+      await checkpoint();
       return snapshot;
     },
   );
+}
+
+function changePreferencesAfterSnapshot(entries: Record<string, unknown>) {
+  afterSnapshot(async () => {
+    expect(
+      await userPreferences.setCanonicalUserPreferences(requesterProfileId, entries),
+    ).toMatchObject({ ok: true });
+  });
 }
 
 async function withConcurrentPreferenceSnapshots<T>(count: number, run: () => Promise<T>) {
@@ -193,7 +217,7 @@ describe("theme RPC", () => {
     };
     pluginThemes.push(entry);
     const { definition, ...descriptor } = entry;
-    expect(await invoke("themes.list")).toMatchObject({
+    expect(await invoke("themes.list", {})).toMatchObject({
       ok: true,
       payload: {
         current: { id: "claw", mode: "system", scope: "profile", overrides: {} },
@@ -211,12 +235,7 @@ describe("theme RPC", () => {
   });
 
   it("imports and applies in one durable profile mutation, preserving other preferences and notifying only that profile", async () => {
-    expect(
-      setUserPreferences(requesterProfileId, {
-        "ui.accent": "#aabbcc",
-        "ui.fontFamily": "serif",
-      }).ok,
-    ).toBe(true);
+    seedPreferences({ "ui.accent": "#aabbcc", "ui.fontFamily": "serif" });
     const requester = client(requesterProfileId);
     const other = { ...client(otherProfileId), connId: "other-browser" };
     const broadcastToConnIds = vi.fn();
@@ -252,11 +271,7 @@ describe("theme RPC", () => {
       ok: true,
       payload: {
         current: { id: "user/xenovessel", mode: "dark", scope: "profile" },
-        theme: {
-          id: "user/xenovessel",
-          source: "user",
-          ...branding,
-        },
+        theme: { id: "user/xenovessel", source: "user", ...branding },
         definition,
         application: "saved",
       },
@@ -270,29 +285,23 @@ describe("theme RPC", () => {
       new Set(["requester-browser"]),
     );
     await closeOpenClawStateDatabaseAsync();
-    expect(getUserPreferences(requesterProfileId)).toEqual({
+    preferences({
       "ui.accent": "#aabbcc",
       "ui.fontFamily": "serif",
       "ui.themeDefinition.xenovessel": definition,
       "ui.theme": "user/xenovessel",
       "ui.themeMode": "dark",
     });
-    expect(getUserPreferences(otherProfileId)).toEqual({});
+    preferences({}, otherProfileId);
     expect(await invoke("themes.get", { id: "user/xenovessel" })).toMatchObject({
       ok: true,
-      payload: {
-        theme: branding,
-        definition,
-      },
+      payload: { theme: branding, definition },
     });
-    expect(await invoke("themes.list")).toMatchObject({
+    expect(await invoke("themes.list", {})).toMatchObject({
       ok: true,
       payload: {
         themes: expect.arrayContaining([
-          expect.objectContaining({
-            id: "user/xenovessel",
-            ...branding,
-          }),
+          expect.objectContaining({ id: "user/xenovessel", ...branding }),
         ]),
       },
     });
@@ -301,14 +310,13 @@ describe("theme RPC", () => {
   it("validates and persists theme selection with accompanying appearance changes as one batch", async () => {
     pluginThemes.push(pluginTheme());
     const original = {
-      "ui.theme": "claw",
-      "ui.themeMode": "light",
+      ...themePreferences("claw", "light"),
       "ui.accent": "#aabbcc",
       "ui.fontUi": "geist",
       "ui.fontChat": "lora",
       "chat.showThinking": true,
     };
-    expect(setUserPreferences(requesterProfileId, original).ok).toBe(true);
+    seedPreferences(original);
     const params = {
       id: "space-pack/xenovessel",
       appearance: { accent: "#A1B2C3", fontUi: "jetbrains-mono", fontChat: null },
@@ -317,15 +325,13 @@ describe("theme RPC", () => {
       ok: false,
       error: { message: expect.stringContaining("does not provide light mode") },
     });
-    expect(getUserPreferences(requesterProfileId)).toEqual(original);
-
+    preferences(original);
     expect(await invoke("themes.set", { ...params, mode: "dark" })).toMatchObject({
       ok: true,
       payload: { current: { id: params.id, mode: "dark" }, application: "saved" },
     });
-    expect(getUserPreferences(requesterProfileId)).toEqual({
-      "ui.theme": params.id,
-      "ui.themeMode": "dark",
+    preferences({
+      ...themePreferences(params.id),
       "ui.accent": "#a1b2c3",
       "ui.fontUi": "jetbrains-mono",
       "chat.showThinking": true,
@@ -342,10 +348,8 @@ describe("theme RPC", () => {
       definition.dark = { ...definition.dark!, ...palette };
       expect(
         await invoke("themes.import", { id: "unsafe", definition, apply: true }),
-      ).toMatchObject({
-        ok: false,
-      });
-      expect(getUserPreferences(requesterProfileId)).toEqual({});
+      ).toMatchObject({ ok: false });
+      preferences();
     },
   );
 
@@ -368,59 +372,45 @@ describe("theme RPC", () => {
       ok: true,
       payload: { current: { id: "claw", mode: "dark", overrides: {} } },
     });
-    expect(getUserPreferences(requesterProfileId)).toEqual({
-      "ui.themeDefinition.dark": definition,
-    });
+    preferences({ "ui.themeDefinition.dark": definition });
   });
 
-  it.each(["import"])(
-    "selects a dark-only %s theme in one call and refuses explicit incompatible modes without writes",
-    async (source) => {
-      pluginThemes.push(pluginTheme());
-      const definition = createThemeDefinitionFixture();
-      const original = { "ui.theme": "claw", "ui.themeMode": "light" };
-      expect(setUserPreferences(requesterProfileId, original).ok).toBe(true);
-      const method = source === "plugin" ? "themes.set" : "themes.import";
-      const params =
-        source === "plugin"
-          ? { id: "space-pack/xenovessel" }
-          : { id: "xenovessel", definition, apply: true };
-
-      expect(await invoke(method, { ...params, mode: "light" })).toMatchObject({
-        ok: false,
-        error: { message: expect.stringContaining("does not provide light mode") },
-      });
-      expect(getUserPreferences(requesterProfileId)).toEqual(original);
-
-      const selectedId = source === "plugin" ? "space-pack/xenovessel" : "user/xenovessel";
-      expect(await invoke(method, params)).toMatchObject({
-        ok: true,
-        payload: { current: { id: selectedId, mode: "dark" }, application: "saved" },
-      });
-      const saved = {
-        "ui.theme": selectedId,
-        "ui.themeMode": "dark",
-        ...(source === "import" ? { "ui.themeDefinition.xenovessel": definition } : {}),
-      };
-      expect(getUserPreferences(requesterProfileId)).toEqual(saved);
-
-      for (const mode of ["light", null]) {
-        expect(
-          await invoke(
-            "themes.set",
-            { mode },
-            {
-              context: { getRuntimeConfig: () => ({ ui: { prefs: { themeMode: "light" } } }) },
-            },
-          ),
-        ).toMatchObject({
-          ok: false,
-          error: { message: expect.stringContaining("does not provide light mode") },
-        });
-        expect(getUserPreferences(requesterProfileId)).toEqual(saved);
-      }
-    },
-  );
+  it("selects a dark-only imported theme in one call and refuses explicit incompatible modes without writes", async () => {
+    const definition = createThemeDefinitionFixture();
+    const original = themePreferences("claw", "light");
+    seedPreferences(original);
+    const params = { id: "xenovessel", definition, apply: true };
+    const incompatible = { message: expect.stringContaining("does not provide light mode") };
+    expect(await invoke("themes.import", { ...params, mode: "light" })).toMatchObject({
+      ok: false,
+      error: incompatible,
+    });
+    preferences(original);
+    expect(await invoke("themes.import", params)).toMatchObject({
+      ok: true,
+      payload: {
+        current: { id: "user/xenovessel", mode: "dark" },
+        application: "saved",
+      },
+    });
+    const saved = {
+      ...themePreferences("user/xenovessel"),
+      "ui.themeDefinition.xenovessel": definition,
+    };
+    preferences(saved);
+    for (const mode of ["light", null]) {
+      expect(
+        await invoke(
+          "themes.set",
+          { mode },
+          {
+            context: { getRuntimeConfig: () => ({ ui: { prefs: { themeMode: "light" } } }) },
+          },
+        ),
+      ).toMatchObject({ ok: false, error: incompatible });
+      preferences(saved);
+    }
+  });
 
   it("does not change another client's new selection when reimporting a previously selected theme", async () => {
     const original = createThemeDefinitionFixture();
@@ -432,21 +422,13 @@ describe("theme RPC", () => {
         mode: "dark",
       }),
     ).toMatchObject({ ok: true });
-    changePreferencesAfterSnapshot({ "ui.theme": "claw", "ui.themeMode": "dark" });
-    const replacement = {
-      name: "Daylight",
-      description: "Light-only replacement",
-      light: createThemePaletteFixture(),
-    };
+    changePreferencesAfterSnapshot(themePreferences("claw"));
+    const replacement = daylight();
     expect(
       await invoke("themes.import", { id: "adaptive", definition: replacement }),
-    ).toMatchObject({
-      ok: false,
-      error: { code: "INVALID_REQUEST" },
-    });
-    expect(getUserPreferences(requesterProfileId)).toEqual({
-      "ui.theme": "claw",
-      "ui.themeMode": "dark",
+    ).toMatchObject({ ok: false, error: { code: "INVALID_REQUEST" } });
+    preferences({
+      ...themePreferences("claw"),
       "ui.themeDefinition.adaptive": original,
     });
   });
@@ -458,32 +440,21 @@ describe("theme RPC", () => {
         definition: createThemeDefinitionFixture(),
       }),
     ).toMatchObject({ ok: true });
-    const replacement = {
-      name: "Daylight",
-      description: "Light-only replacement",
-      light: createThemePaletteFixture(),
-    };
+    const replacement = daylight();
     changePreferencesAfterSnapshot({ "ui.themeDefinition.adaptive": replacement });
     expect(await invoke("themes.set", { id: "user/adaptive", mode: "dark" })).toMatchObject({
       ok: false,
       error: { code: "INVALID_REQUEST" },
     });
-    expect(getUserPreferences(requesterProfileId)).toEqual({
-      "ui.themeDefinition.adaptive": replacement,
-    });
+    preferences({ "ui.themeDefinition.adaptive": replacement });
   });
 
   it("preserves independent concurrent imports and atomically settles competing selections", async () => {
     const expected: Record<string, unknown> = { "chat.showThinking": true };
-    expect(setUserPreferences(requesterProfileId, expected).ok).toBe(true);
+    seedPreferences(expected);
     for (let round = 0; round < 4; round += 1) {
-      Object.assign(expected, { "ui.theme": "claw", "ui.themeMode": "system" });
-      expect(
-        setUserPreferences(requesterProfileId, {
-          "ui.theme": "claw",
-          "ui.themeMode": "system",
-        }).ok,
-      ).toBe(true);
+      Object.assign(expected, themePreferences("claw", "system"));
+      seedPreferences(themePreferences("claw", "system"));
       const ids = Array.from({ length: 4 }, (_, index) => `independent-${round}-${index}`);
       const definitions = ids.map((name) => createThemeDefinitionFixture({ name }));
       const imports = await withConcurrentPreferenceSnapshots(ids.length, () =>
@@ -495,7 +466,7 @@ describe("theme RPC", () => {
         expect(result).toMatchObject({ ok: true, payload: { application: "saved" } });
         expected[`ui.themeDefinition.${ids[index]}`] = definitions[index];
       }
-      expect(getUserPreferences(requesterProfileId)).toEqual(expected);
+      preferences(expected);
 
       const choices = [
         ...[0, 1].map((index) => ({
@@ -537,9 +508,9 @@ describe("theme RPC", () => {
             : { ok: false, error: { message: expect.stringContaining("Appearance changed") } },
         );
       }
-      expect(getUserPreferences(requesterProfileId)).toEqual(expected);
-      expect(getUserPreferences(otherProfileId)).toEqual({});
-      expect(await invoke("themes.list")).toMatchObject({
+      preferences(expected);
+      preferences({}, otherProfileId);
+      expect(await invoke("themes.list", {})).toMatchObject({
         ok: true,
         payload: {
           current: { id: winner.selectedId, mode: "dark" },
@@ -548,7 +519,7 @@ describe("theme RPC", () => {
           ),
         },
       });
-      expect(await invoke("themes.get")).toMatchObject({
+      expect(await invoke("themes.get", {})).toMatchObject({
         ok: true,
         payload: {
           current: { id: winner.selectedId, mode: "dark" },
@@ -591,13 +562,15 @@ describe("theme RPC", () => {
       ok: true,
       payload: { current: { id: "user/merged" }, application: "saved" },
     });
-    expect(getUserPreferences(requesterProfileId)).toEqual({});
-    expect(getUserPreferences(otherProfileId)).toEqual({
-      "ui.themeDefinition.merged": definition,
-      "ui.theme": "user/merged",
-      "ui.themeMode": "dark",
-    });
-    expect(getUserPreferences(unrelatedId)).toEqual({});
+    preferences();
+    preferences(
+      {
+        "ui.themeDefinition.merged": definition,
+        ...themePreferences("user/merged"),
+      },
+      otherProfileId,
+    );
+    preferences({}, unrelatedId);
     for (const profileId of [requesterProfileId, otherProfileId]) {
       expect(await invoke("themes.get", {}, { client: client(profileId) })).toMatchObject({
         ok: true,
@@ -615,17 +588,12 @@ describe("theme RPC", () => {
   });
 
   it("does not redirect a prepared import when its profile merges before the write", async () => {
-    expect(setUserPreferences(requesterProfileId, { "ui.theme": "claw" }).ok).toBe(true);
-    const targetPreferences = { "ui.theme": "tide", "ui.themeMode": "light" };
-    expect(setUserPreferences(otherProfileId, targetPreferences).ok).toBe(true);
-    const readPreferences = userPreferences.getCanonicalUserPreferences;
-    vi.spyOn(userPreferences, "getCanonicalUserPreferences").mockImplementationOnce(
-      async (...args) => {
-        const snapshot = await readPreferences(...args);
-        linkEmail("requester@example.test", otherProfileId);
-        return snapshot;
-      },
-    );
+    seedPreferences({ "ui.theme": "claw" });
+    const targetPreferences = themePreferences("tide", "light");
+    seedPreferences(targetPreferences, otherProfileId);
+    afterSnapshot(() => {
+      linkEmail("requester@example.test", otherProfileId);
+    });
     const broadcastToConnIds = vi.fn();
     expect(
       await invoke(
@@ -636,8 +604,8 @@ describe("theme RPC", () => {
         },
       ),
     ).toMatchObject({ ok: false, error: { message: expect.stringContaining("profile changed") } });
-    expect(getUserPreferences(requesterProfileId)).toEqual({});
-    expect(getUserPreferences(otherProfileId)).toEqual(targetPreferences);
+    preferences();
+    preferences(targetPreferences, otherProfileId);
     expect(broadcastToConnIds).not.toHaveBeenCalled();
   });
 
@@ -646,17 +614,11 @@ describe("theme RPC", () => {
       ...Object.fromEntries(
         Array.from({ length: 125 }, (_, index) => [`retained-${index}`, index]),
       ),
-      "ui.theme": "claw",
-      "ui.themeMode": "dark",
+      ...themePreferences("claw"),
     };
     const entries = Object.entries(expected);
     for (let offset = 0; offset < entries.length; offset += 32) {
-      expect(
-        setUserPreferences(
-          requesterProfileId,
-          Object.fromEntries(entries.slice(offset, offset + 32)),
-        ).ok,
-      ).toBe(true);
+      seedPreferences(Object.fromEntries(entries.slice(offset, offset + 32)));
     }
     const broadcastToConnIds = vi.fn();
     const options = {
@@ -668,22 +630,22 @@ describe("theme RPC", () => {
     ).toMatchObject({ ok: true });
     Object.assign(expected, { "ui.themeDefinition.last": definition, "ui.theme": "user/last" });
     expect(Object.keys(getUserPreferences(requesterProfileId))).toHaveLength(128);
-    expect(getUserPreferences(requesterProfileId)).toEqual(expected);
+    preferences(expected);
     expect(
       await invoke("themes.import", { id: "overflow", definition, apply: true }, options),
     ).toMatchObject({
       ok: false,
       error: { message: expect.stringContaining("profile-key-limit") },
     });
-    expect(getUserPreferences(requesterProfileId)).toEqual(expected);
+    preferences(expected);
     expect(broadcastToConnIds).toHaveBeenCalledTimes(1);
     const replacement = createThemeDefinitionFixture({ name: "Updated at capacity" });
     expect(
       await invoke("themes.import", { id: "last", definition: replacement, apply: true }, options),
     ).toMatchObject({ ok: true });
     expected["ui.themeDefinition.last"] = replacement;
-    expect(getUserPreferences(requesterProfileId)).toEqual(expected);
-    expect(getUserPreferences(otherProfileId)).toEqual({});
+    preferences(expected);
+    preferences({}, otherProfileId);
     expect(broadcastToConnIds).toHaveBeenCalledTimes(2);
   });
 
@@ -693,7 +655,7 @@ describe("theme RPC", () => {
       { ok: true },
     );
     pluginThemes.length = 0;
-    expect(await invoke("themes.get")).toMatchObject({
+    expect(await invoke("themes.get", {})).toMatchObject({
       ok: true,
       payload: {
         current: {
@@ -705,7 +667,7 @@ describe("theme RPC", () => {
     });
     expect(getUserPreferences(requesterProfileId)["ui.theme"]).toBe("space-pack/xenovessel");
     pluginThemes.push(pluginTheme());
-    expect(await invoke("themes.get")).toMatchObject({
+    expect(await invoke("themes.get", {})).toMatchObject({
       ok: true,
       payload: { current: { id: "space-pack/xenovessel" } },
     });
@@ -748,8 +710,8 @@ describe("theme RPC", () => {
         ok: true,
         payload: { current: { mode: "dark", scope: "profile" } },
       });
-      expect(getUserPreferences(requesterProfileId)).toEqual({ "ui.themeMode": "dark" });
-      expect(getUserPreferences(otherProfileId)).toEqual({});
+      preferences({ "ui.themeMode": "dark" });
+      preferences({}, otherProfileId);
     },
   );
 
@@ -778,16 +740,11 @@ describe("theme RPC", () => {
       for (const action of actions) {
         await expect(execute(action, steerer.profileId)).rejects.toThrow();
       }
-      expect(getUserPreferences(otherProfileId)).toEqual({});
+      preferences({}, otherProfileId);
 
-      const readPreferences = userPreferences.getCanonicalUserPreferences;
-      vi.spyOn(userPreferences, "getCanonicalUserPreferences").mockImplementationOnce(
-        async (...args) => {
-          const snapshot = await readPreferences(...args);
-          expect(await turn.steer(steerer)).toMatchObject({ status: "accepted" });
-          return snapshot;
-        },
-      );
+      afterSnapshot(async () => {
+        expect(await turn.steer(steerer)).toMatchObject({ status: "accepted" });
+      });
       await expect(execute({ action: "set", id: "tide" })).rejects.toThrow(
         `Alice (user: ${owner.profileId})`,
       );
@@ -807,8 +764,8 @@ describe("theme RPC", () => {
           "User is not a participant",
         );
       }
-      expect(getUserPreferences(requesterProfileId)).toEqual({ "ui.themeMode": "dark" });
-      expect(getUserPreferences(otherProfileId)).toEqual({});
+      preferences({ "ui.themeMode": "dark" });
+      preferences({}, otherProfileId);
 
       for (const { person, id, mode } of [
         { person: steerer, id: "tide", mode: "light" },
@@ -819,10 +776,7 @@ describe("theme RPC", () => {
             await execute({ action, ...(action === "set" ? { id, mode } : {}) }, person.profileId),
           ).toMatchObject({ current: { id, mode } });
         }
-        expect(getUserPreferences(person.profileId)).toEqual({
-          "ui.theme": id,
-          "ui.themeMode": mode,
-        });
+        preferences(themePreferences(id, mode), person.profileId);
       }
       const imported = expectDefined(actions[3], "import action");
       expect(await execute(imported, steerer.profileId)).toMatchObject({
@@ -843,7 +797,7 @@ describe("theme RPC", () => {
         "Bob's access changed; ask them again",
       );
       expect(revokeBeforeCommit).toHaveBeenCalled();
-      expect(getUserPreferences(otherProfileId)).toEqual(saved);
+      preferences(saved, otherProfileId);
       for (const action of actions) {
         await expect(execute(action, steerer.profileId)).rejects.toThrow(
           "Bob's access changed; ask them again",
@@ -869,7 +823,7 @@ describe("theme RPC", () => {
       expect(await invoke("themes.set", { mode: "dark" }, { client: synthetic })).toMatchObject({
         ok: false,
       });
-      expect(getUserPreferences(requesterProfileId)).toEqual({});
+      preferences();
     },
   );
 
@@ -884,8 +838,8 @@ describe("theme RPC", () => {
         error: { code: "INVALID_REQUEST" },
       });
     }
-    expect(getUserPreferences(requesterProfileId)).toEqual({});
-    expect(getUserPreferences(otherProfileId)).toEqual({});
+    preferences();
+    preferences({}, otherProfileId);
   });
 
   it("rolls back both import and selection when the live run retires at the commit boundary", async () => {
@@ -909,6 +863,6 @@ describe("theme RPC", () => {
       ),
     ).toMatchObject({ ok: false, error: { message: expect.stringContaining("no longer active") } });
     expect(reachedCommit).toBe(true);
-    expect(getUserPreferences(requesterProfileId)).toEqual({});
+    preferences();
   });
 });

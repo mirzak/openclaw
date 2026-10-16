@@ -39,37 +39,13 @@ vi.mock("../../agents/agent-scope.js", async (importOriginal) => ({
   resolveDefaultAgentId: vi.fn(() => "main"),
 }));
 
+const agentScope = { scope: "agent", agentId: "main" } as const;
+const systemScope = { scope: "system", agentId: "main" } as const;
+// Status is an opaque owner result here; identity resolution has its own suite.
 const status = {
   agentId: "main",
   selectedScope: "agent",
-  selected: {
-    scope: "agent",
-    configured: true,
-    identity: {
-      source: "agent-override",
-      credentialKind: "managed-pat",
-      credentialState: "available",
-      account: { login: "managed-user" },
-      gitAuthor: { name: "Managed Author", email: null },
-      evidence: "github-api",
-      accessExpiresAtMs: null,
-      refreshState: "not_applicable",
-      oauthScopes: [],
-      repositoryGrants: "unknown",
-    },
-  },
-  effective: {
-    source: "agent-override",
-    credentialKind: "managed-pat",
-    credentialState: "available",
-    account: { login: "managed-user" },
-    gitAuthor: { name: "Managed Author", email: null },
-    evidence: "github-api",
-    accessExpiresAtMs: null,
-    refreshState: "not_applicable",
-    oauthScopes: [],
-    repositoryGrants: "unknown",
-  },
+  effective: { account: { login: "managed-user" } },
 } as const;
 
 async function invoke(
@@ -96,17 +72,31 @@ async function invoke(
   return respond;
 }
 
+function configure(secretDigit: string, params: Record<string, unknown> = {}) {
+  return invoke("tools.github.configure", {
+    ...systemScope,
+    mode: "managed",
+    secretName: `github-setup-${secretDigit.repeat(32)}`,
+    ...params,
+  });
+}
+
+function expectPrivateFieldsAbsent(respond: ReturnType<typeof vi.fn>) {
+  const output = JSON.stringify(respond.mock.calls);
+  expect(output).not.toContain("device_code");
+  expect(output).not.toContain("access_token");
+}
+
 describe("tools.github handlers", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     github.configured.mockReturnValue(undefined);
     github.status.mockResolvedValue(status);
     github.updateConfig.mockResolvedValue({ next: true });
-    oauth.startAuthorization.mockReset();
-    oauth.pollAuthorization.mockReset();
-    oauth.cancelAuthorizationAsync.mockReset();
-    oauth.refreshEffectiveIdentity.mockReset().mockResolvedValue(undefined);
-    oauth.retireProfileAsync.mockReset();
+    for (const mock of Object.values(oauth)) {
+      mock.mockReset();
+    }
+    oauth.refreshEffectiveIdentity.mockResolvedValue(undefined);
   });
 
   it("returns selected-scope plus effective status without refreshing credentials", async () => {
@@ -161,17 +151,13 @@ describe("tools.github handlers", () => {
       },
     );
 
-    const respond = await invoke("tools.github.configure", {
-      scope: "agent",
-      agentId: "main",
-      mode: "managed",
-      secretName: "github-setup-11111111111111111111111111111111",
+    const respond = await configure("1", {
+      ...agentScope,
       gitAuthor: { name: "  Managed Author  ", email: "  managed@example.test  " },
     });
 
     expect(github.updateConfig).toHaveBeenCalledWith({
-      scope: "agent",
-      agentId: "main",
+      ...agentScope,
       identity: {
         profileId: "ghp_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
         gitAuthor: { name: "Managed Author", email: "managed@example.test" },
@@ -220,11 +206,8 @@ describe("tools.github handlers", () => {
   });
 
   it("rejects blank author data without consuming the setup handoff", async () => {
-    const respond = await invoke("tools.github.configure", {
-      scope: "agent",
-      agentId: "main",
-      mode: "managed",
-      secretName: "github-setup-44444444444444444444444444444444",
+    const respond = await configure("4", {
+      ...agentScope,
       gitAuthor: { name: "  \t" },
     });
 
@@ -256,14 +239,12 @@ describe("tools.github handlers", () => {
     github.configured.mockReturnValue({ profileId, kind: "oauth" });
 
     await invoke("tools.github.configure", {
-      scope: "system",
-      agentId: "main",
+      ...systemScope,
       mode: "inherit",
     });
 
     expect(github.updateConfig).toHaveBeenCalledWith({
-      scope: "system",
-      agentId: "main",
+      ...systemScope,
       expectedIdentity: { profileId, kind: "oauth" },
     });
     expect(oauth.retireProfileAsync).toHaveBeenCalledWith(profileId);
@@ -271,37 +252,28 @@ describe("tools.github handlers", () => {
 
   it("delegates device start, poll, and cancel without exposing private authorization fields", async () => {
     const requestId = `github-device-${"1".repeat(32)}`;
-    oauth.startAuthorization.mockResolvedValue({
+    const authorization = {
       requestId,
       userCode: "ABCD-EFGH",
       verificationUri: "https://github.com/login/device",
       expiresInMs: 900_000,
       pollAfterMs: 5_000,
-    });
+    };
+    oauth.startAuthorization.mockResolvedValue(authorization);
     oauth.pollAuthorization.mockResolvedValue({ status: "pending", retryAfterMs: 10_000 });
     oauth.cancelAuthorizationAsync.mockReturnValue(true);
 
-    const start = await invoke("tools.github.authorize.start", {
-      scope: "agent",
-      agentId: "main",
-    });
+    const start = await invoke("tools.github.authorize.start", agentScope);
     const poll = await invoke("tools.github.authorize.poll", { requestId });
     const cancel = await invoke("tools.github.authorize.cancel", { requestId });
 
-    expect(oauth.startAuthorization).toHaveBeenCalledWith({ scope: "agent", agentId: "main" });
+    expect(oauth.startAuthorization).toHaveBeenCalledWith(agentScope);
     expect(oauth.pollAuthorization).toHaveBeenCalledWith(requestId);
     expect(oauth.cancelAuthorizationAsync).toHaveBeenCalledWith(requestId);
-    expect(start.mock.calls[0]?.[1]).toEqual({
-      requestId,
-      userCode: "ABCD-EFGH",
-      verificationUri: "https://github.com/login/device",
-      expiresInMs: 900_000,
-      pollAfterMs: 5_000,
-    });
+    expect(start.mock.calls[0]?.[1]).toEqual(authorization);
     expect(poll).toHaveBeenCalledWith(true, { status: "pending", retryAfterMs: 10_000 });
     expect(cancel).toHaveBeenCalledWith(true, { cancelled: true });
-    expect(JSON.stringify(start.mock.calls)).not.toContain("device_code");
-    expect(JSON.stringify(start.mock.calls)).not.toContain("access_token");
+    expectPrivateFieldsAbsent(start);
   });
 
   it("returns bounded authorization failures without forwarding diagnostics", async () => {
@@ -314,17 +286,13 @@ describe("tools.github handlers", () => {
 
     expect(respond.mock.calls[0]?.[0]).toBe(false);
     expect(JSON.stringify(respond.mock.calls)).toContain("GitHub authorization polling failed");
-    expect(JSON.stringify(respond.mock.calls)).not.toContain("device_code");
-    expect(JSON.stringify(respond.mock.calls)).not.toContain("access_token");
+    expectPrivateFieldsAbsent(respond);
   });
 
   it("returns installation guidance when the Gateway host has no GitHub CLI", async () => {
     oauth.startAuthorization.mockRejectedValue(new GitHubCliUnavailableError());
 
-    const respond = await invoke("tools.github.authorize.start", {
-      scope: "system",
-      agentId: "main",
-    });
+    const respond = await invoke("tools.github.authorize.start", systemScope);
 
     expect(respond.mock.calls[0]?.[0]).toBe(false);
     expect(JSON.stringify(respond.mock.calls)).toContain(
@@ -335,12 +303,7 @@ describe("tools.github handlers", () => {
 
   it("fails closed when the secrets owner rejects the handoff", async () => {
     secrets.consumeHandoff.mockReturnValue(undefined);
-    const respond = await invoke("tools.github.configure", {
-      scope: "system",
-      agentId: "main",
-      mode: "managed",
-      secretName: "github-setup-22222222222222222222222222222222",
-    });
+    const respond = await configure("2");
 
     expect(github.install).not.toHaveBeenCalled();
     expect(respond.mock.calls[0]?.[0]).toBe(false);
@@ -350,12 +313,7 @@ describe("tools.github handlers", () => {
     secrets.consumeHandoff.mockReturnValue("invalid-test-token");
     github.install.mockRejectedValue(new Error("GitHub CLI rejected the managed credential."));
 
-    const respond = await invoke("tools.github.configure", {
-      scope: "system",
-      agentId: "main",
-      mode: "managed",
-      secretName: "github-setup-33333333333333333333333333333333",
-    });
+    const respond = await configure("3");
 
     expect(secrets.consumeHandoff.mock.invocationCallOrder[0]).toBeLessThan(
       github.install.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,

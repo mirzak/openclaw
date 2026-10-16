@@ -98,10 +98,7 @@ async function request(
     respond,
     client: caller,
     isWebchatConnect: () => false,
-    context: {
-      getRuntimeConfig: () => cfg,
-      logGateway,
-    } as unknown as GatewayRequestContext,
+    context: { getRuntimeConfig: () => cfg, logGateway } as unknown as GatewayRequestContext,
   });
   expect(respond).toHaveBeenCalledTimes(1);
   return respond.mock.calls[0]!;
@@ -123,28 +120,13 @@ describe("transcript Gateway read authorization and errors", () => {
   it("requires write scope and archive visibility to generate notes", async () => {
     await withOpenClawTestState(profileState, async ({ stateDir }) => {
       const { selector, store, session } = await seed(stateDir);
-      expect((await request("transcripts.summarize", { selector }))[0]).toBe(false);
-      expect(
-        (
-          await request(
-            "transcripts.summarize",
-            { selector },
-            roles("none"),
-            client(undefined, ["operator.write"]),
-          )
-        )[0],
-      ).toBe(false);
+      const summarize = (cfg: OpenClawConfig = {}, caller = client()) =>
+        request("transcripts.summarize", { selector }, cfg, caller);
+      const writer = client(undefined, ["operator.write"]);
+      expect((await summarize())[0]).toBe(false);
+      expect((await summarize(roles("none"), writer))[0]).toBe(false);
       expect((await store.readSummary(session)).summary).toBeUndefined();
-      expect(
-        (
-          await request(
-            "transcripts.summarize",
-            { selector },
-            {},
-            client(undefined, ["operator.write"]),
-          )
-        )[0],
-      ).toBe(true);
+      expect((await summarize({}, writer))[0]).toBe(true);
       expect((await store.readSummary(session)).summary).toBeDefined();
     });
   });
@@ -275,20 +257,16 @@ describe("transcript Gateway read authorization and errors", () => {
         sessions: [{ selector, agentId: "ops", utteranceCount: 1 }],
       });
       expect((await request("transcripts.get", { selector }, roles("view"), caller))[0]).toBe(true);
+      const exported = await request(
+        "transcripts.export",
+        { selector, format: "jsonl" },
+        roles("view"),
+        caller,
+      );
+      expect(exported[1]).toMatchObject({ encoding: "base64", selector });
+      const admin = client(profile.id, ["operator.admin"]);
       expect(
-        (
-          await request("transcripts.export", { selector, format: "jsonl" }, roles("view"), caller)
-        )[1],
-      ).toMatchObject({ encoding: "base64", selector });
-      expect(
-        (
-          await request(
-            "transcripts.list",
-            {},
-            roles("none", ["operator.admin"]),
-            client(profile.id, ["operator.admin"]),
-          )
-        )[0],
+        (await request("transcripts.list", {}, roles("none", ["operator.admin"]), admin))[0],
       ).toBe(true);
       expect(
         (await request("transcripts.get", { selector, agentId: "main" }, roles("view"), caller))[2],
@@ -315,12 +293,10 @@ describe("transcript Gateway read authorization and errors", () => {
           message: "unauthorized role: node",
         });
       }
-      expect(
-        (await request("transcripts.start", {}, {}, client(undefined, ["operator.admin"])))[0],
-      ).toBe(false);
-      expect(
-        (await request("transcripts.list", {}, {}, client(undefined, ["operator.write"])))[0],
-      ).toBe(true);
+      const admin = client(undefined, ["operator.admin"]);
+      const writer = client(undefined, ["operator.write"]);
+      expect((await request("transcripts.start", {}, {}, admin))[0]).toBe(false);
+      expect((await request("transcripts.list", {}, {}, writer))[0]).toBe(true);
     });
   });
 
@@ -474,11 +450,7 @@ describe("meeting transcript RPC", () => {
       context: { getRuntimeConfig: () => ({}) } as GatewayRequestContext,
     });
     expect(respond).toHaveBeenCalledOnce();
-    const response = respond.mock.calls[0];
-    if (!response) {
-      throw new Error(`missing response: ${method}`);
-    }
-    return response;
+    return respond.mock.calls[0]!;
   }
 
   let state: OpenClawTestState;
