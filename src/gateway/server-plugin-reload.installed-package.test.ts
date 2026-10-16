@@ -40,7 +40,11 @@ import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js
 import { withEnvAsync } from "../test-utils/env.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import type { GatewayRequestHandlerOptions } from "./server-methods/types.js";
-import { heldWork, pluginInstance } from "./server-plugin-reload.fixture-tools.test-support.js";
+import {
+  reloadFailure,
+  heldWork,
+  pluginInstance,
+} from "./server-plugin-reload.fixture-tools.test-support.js";
 import { reloadGatewayPlugins } from "./server-plugin-reload.js";
 import { observeRetainedWork } from "./server-plugin-reload.recovery.test-support.js";
 import { createGatewayPluginRuntimeGeneration } from "./server-plugin-runtime-generation.js";
@@ -330,9 +334,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         undefined,
         undefined,
       );
-      const response = respond.mock.calls[0];
-      assert.ok(response);
-      return response[1];
+      return respond.mock.calls[0]?.[1];
     };
     const workspacePlugin = hasWorkspacePlugin ? await probe("workspace-probe") : undefined;
     const sibling = await probe("sibling");
@@ -507,9 +509,9 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
         "installed-probe": { enabled: true, config: { failStart: true } },
         healthy: { enabled: true, config: { candidate: true } },
       });
-      await expect(reload(mixedConfig, ["installed-probe", "healthy"])).rejects.toMatchObject({
-        details: { phase: "activate", committed: false },
-      });
+      await expect(reload(mixedConfig, ["installed-probe", "healthy"])).rejects.toMatchObject(
+        reloadFailure("activate"),
+      );
       const recoveredHealthy = await probe("healthy");
       expect(recoveredHealthy).toEqual({ ...healthy, instance: expect.any(String) });
       expect(recoveredHealthy.instance).not.toBe(healthy.instance);
@@ -756,7 +758,6 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
     expect(second.instance).not.toBe(updated.instance);
     expect(secondReceipt.runtime.pluginIds).toEqual(["installed-probe"]);
     expect(secondReceipt.runtime.sourceDigests).toEqual(changedReceipt.application.sourceDigests);
-    assert.ok(firstReceipt.runtime && secondReceipt.runtime);
     expect(secondReceipt.runtime.generation).toBeGreaterThan(firstReceipt.runtime.generation);
     expect(firstReceipt.runtime.sourceDigests?.["installed-probe"]).toEqual(expect.any(String));
     expect(secondReceipt.runtime.sourceDigests?.["installed-probe"]).not.toBe(
@@ -800,9 +801,7 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
     expect(activationRecovery.instance).not.toBe(syntaxRecovery.instance);
     expect(await probe("sibling")).toEqual(sibling);
     const invalidSettings = withEntries({ sibling: { enabled: true, config: { mode: 42 } } });
-    await expect(reload(invalidSettings, [])).rejects.toMatchObject({
-      details: { phase: "prepare", committed: false },
-    });
+    await expect(reload(invalidSettings, [])).rejects.toMatchObject(reloadFailure("prepare"));
     expect(runtime.pluginRuntime.registry).toBe(activationRecoveryRegistry);
     expect(await probe("sibling")).toEqual(sibling);
     const changedSettings = withEntries({

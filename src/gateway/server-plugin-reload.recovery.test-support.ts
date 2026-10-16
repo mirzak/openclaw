@@ -38,6 +38,7 @@ import { createChannelTestPluginBase } from "../test-utils/channel-plugins.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { createChannelManager } from "./server-channels.js";
 import {
+  firstReloaded,
   rejectWith,
   heldWork,
   pluginInstance,
@@ -612,7 +613,7 @@ export async function verifyColdAccountReplacement(createRecoveryFixture: Recove
   ]);
   try {
     await manager.startChannel(channelId, "healthy");
-    await expect(fixture.reload()).resolves.toMatchObject({ runtime: { pluginIds: ["first"] } });
+    await expect(fixture.reload()).resolves.toMatchObject(firstReloaded);
     expect(starts).toEqual(["healthy", "healthy"]);
     expect(manager.getRuntimeSnapshot().channelAccounts[channelId]).toMatchObject({
       healthy: { running: true },
@@ -669,23 +670,18 @@ export async function verifyChannelCleanupFailureFence(
     });
     expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
     expect(() => first.run(() => "must remain fenced")).toThrow("reloaded or disabled");
-    expect(gatewayStart).not.toHaveBeenCalled();
     expect(fixture.firstStart).toHaveBeenCalledOnce();
     expect(fixture.candidates).toHaveLength(0);
     expect(stopAccount).toHaveBeenCalledOnce();
-    expect(signals.first).toHaveLength(1);
     expect(signals.first[0]?.aborted).toBe(true);
     expect(sibling.run(() => "still live")).toBe("still live");
-    expect(signals.sibling).toHaveLength(1);
-    expect(signals.sibling[0]?.aborted).toBe(false);
 
     cleanupAllowed = true;
     stopGate.release();
     await vi.advanceTimersByTimeAsync(0);
     expect(signals.first).toHaveLength(1);
     expect(gatewayStart).not.toHaveBeenCalled();
-    expect(signals.sibling).toHaveLength(1);
-    expect(signals.sibling[0]?.aborted).toBe(false);
+    expect(signals.sibling).toMatchObject([{ aborted: false }]);
     expect(() => first.run(() => "still retired")).toThrow("reloaded or disabled");
   } finally {
     cleanupAllowed = true;

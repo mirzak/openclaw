@@ -6,6 +6,11 @@ import { getPluginInstance } from "../plugins/plugin-instance-scope.js";
 import type { PluginRegistry } from "../plugins/registry.js";
 import { createDeferredCore } from "../shared/deferred.js";
 
+export const firstReloaded = { runtime: { pluginIds: ["first"] } };
+export const reloadFailure = (phase: "prepare" | "drain" | "activate", committed = false) => ({
+  details: { phase, committed },
+});
+
 export function pluginInstance(registry: PluginRegistry, id = "first") {
   const record = registry.plugins.find((entry) => entry.id === id);
   assert(record);

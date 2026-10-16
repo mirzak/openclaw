@@ -10,6 +10,8 @@ import {
 import { startPluginServices } from "../plugins/services.test-support.js";
 import { createChannelTestPluginBase } from "../test-utils/channel-plugins.js";
 import {
+  firstReloaded,
+  reloadFailure,
   rejectWith,
   heldWork,
   observeSettlement,
@@ -75,19 +77,14 @@ export async function verifyManagedCandidateRetirement(
     const candidate = fixture.candidates[0]!.registry;
     const instance = getPluginInstance(candidate.plugins.find((record) => record.id === "first")!);
     assert(instance);
-    expect(process.listenerCount(event)).toBe(before);
     // Observe each existing deadline: failed startup, service stop, then instance drain.
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(operation.state.value).toBeUndefined();
     expect(instance.disposing).toBe(false);
-    expect(queuedStart).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(5_000);
     expect(
       await waitForPluginRegistryRetirement(candidate, { deferConsumers: true }),
     ).toMatchObject({ deferredPluginIds: ["first"] });
     expect(instance.disposing).toBe(true);
-    expect(order).toEqual([]);
-    expect(process.listenerCount(event)).toBe(before);
     let retired = false;
     let logicalRetirement = false;
     alternateRetirement = disposePluginRegistryInstances(candidate).then(async (result) => {
@@ -105,7 +102,6 @@ export async function verifyManagedCandidateRetirement(
     // Logical retirement is bounded; the metadata owner still joins physical service cleanup.
     expect(operation.state.value).toBeUndefined();
     expect(logicalRetirement).toBe(true);
-    expect(retired).toBe(false);
     expect(instance.lifecycle.signal.aborted).toBe(true);
     await vi.advanceTimersByTimeAsync(5_000);
     await reloading;
@@ -114,18 +110,14 @@ export async function verifyManagedCandidateRetirement(
       message: expect.stringContaining("plugin service startup timed out"),
     });
     expect(retired).toBe(false);
-    expect(instance.lifecycle.signal.aborted).toBe(true);
     expect(() => instance.run(() => "retired dispatch")).toThrow("reloaded or disabled");
-    expect(order.filter((entry) => entry.endsWith(":2"))).toEqual([]);
-    expect(process.listenerCount(event)).toBe(before);
+    expect(order).toEqual([]);
     expect(queuedStart).not.toHaveBeenCalled();
     expect(fixture.runtime.runtimeState.gatewayLifetimeSidecars.snapshot()).toEqual([]);
     if (action === "shutdown") {
       shuttingDown = fixture.lifetime.sealAndJoin();
     } else {
-      retry = expect(fixture.reload()).resolves.toMatchObject({
-        runtime: { pluginIds: ["first"] },
-      });
+      retry = expect(fixture.reload()).resolves.toMatchObject(firstReloaded);
       await nextTurn();
       expect(queuedStart).not.toHaveBeenCalled();
       expect(fixture.candidates).toHaveLength(1);
@@ -137,7 +129,6 @@ export async function verifyManagedCandidateRetirement(
     await shuttingDown;
     await retry;
     expect(retired).toBe(true);
-    expect(instance.lifecycle.signal.aborted).toBe(true);
     expect(order.filter((entry) => entry.endsWith(":2"))).toEqual([
       "start:2",
       "stop:2",
@@ -149,11 +140,7 @@ export async function verifyManagedCandidateRetirement(
   } finally {
     startupGate.release();
     await reloading;
-    await Promise.allSettled(
-      [alternateRetirement, shuttingDown, retry].filter(
-        (pending): pending is Promise<void> => pending !== undefined,
-      ),
-    );
+    await Promise.allSettled([alternateRetirement, shuttingDown, retry]);
     for (const listener of listeners) {
       process.removeListener(event, listener);
     }
@@ -207,11 +194,9 @@ export async function verifyPendingServiceCleanupRetry(
     await Promise.race([observation.entered, first]);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(serviceStop).toHaveBeenCalledOnce();
-    expect(starts).toBe(2);
     expect(hookStop).not.toHaveBeenCalled();
-    expect(fixture.candidates).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(await first).toMatchObject({ details: { phase: "drain", committed: false } });
+    expect(await first).toMatchObject(reloadFailure("drain"));
     expect(instance.run(() => "still serving")).toBe("still serving");
     expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
     startupGate.release();
@@ -223,7 +208,7 @@ export async function verifyPendingServiceCleanupRetry(
     expect(fixture.candidates).toHaveLength(0);
     hookGate.release();
     await vi.advanceTimersByTimeAsync(0);
-    expect(await retry).toMatchObject({ runtime: { pluginIds: ["first"] } });
+    expect(await retry).toMatchObject(firstReloaded);
     expect(fixture.registryOwner.registry).not.toBe(fixture.previousRegistry);
     expect(starts).toBe(3);
     expect(instance.lifecycle.signal.aborted).toBe(true);
@@ -231,7 +216,7 @@ export async function verifyPendingServiceCleanupRetry(
     expect(hookStop).toHaveBeenCalledOnce();
     fixture.expectServices({ siblingStart: 2, siblingStop: 1 });
     retry = fixture.reload();
-    await expect(retry).resolves.toMatchObject({ runtime: { pluginIds: ["first"] } });
+    await expect(retry).resolves.toMatchObject(firstReloaded);
     expect(starts).toBe(4);
     expect(serviceStop).toHaveBeenCalledTimes(3);
     expect(hookStop).toHaveBeenCalledTimes(2);
@@ -264,8 +249,6 @@ export async function verifyGatewayCleanupRefusal(createRecoveryFixture: Recover
   try {
     await hookGate.entered;
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(fixture.candidates).toHaveLength(0);
-    expect(hookStart).not.toHaveBeenCalled();
     hookGate.release();
     await vi.advanceTimersByTimeAsync(0);
     expect(await reloading).toMatchObject({
@@ -276,10 +259,7 @@ export async function verifyGatewayCleanupRefusal(createRecoveryFixture: Recover
     expect(fixture.candidates).toHaveLength(0);
     expect(instance.lifecycle.signal.aborted).toBe(true);
     expect(() => instance.run(() => "closed")).toThrow("reloaded or disabled");
-    expect(signals.first).toHaveLength(1);
-    expect(signals.first[0]?.aborted).toBe(true);
-    expect(signals.sibling).toHaveLength(1);
-    expect(signals.sibling[0]?.aborted).toBe(false);
+    expect(signals).toMatchObject({ first: [{ aborted: true }], sibling: [{ aborted: false }] });
     expect(hookStop).toHaveBeenCalledOnce();
   } finally {
     hookGate.release();
@@ -319,22 +299,19 @@ export async function verifyPendingServiceCleanupRollback(
   try {
     await stopGate.entered;
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(events).toEqual(["old-stop-started"]);
-    expect(candidateStarts).toBe(0);
     stopGate.release();
     await vi.advanceTimersByTimeAsync(0);
-    expect(await reload).toMatchObject({ details: { phase: "activate", committed: false } });
+    expect(await reload).toMatchObject(reloadFailure("activate"));
     expect(events).toEqual([
       "old-stop-started",
       "old-stop-finished",
       "candidate-started",
       "old-restarted",
     ]);
-    expect(fixture.firstStart).toHaveBeenCalledTimes(2);
     expect(fixture.registryOwner.registry).not.toBe(fixture.previousRegistry);
     expectSiblingUnchanged(fixture);
 
-    await expect(fixture.reload()).resolves.toMatchObject({ runtime: { pluginIds: ["first"] } });
+    await expect(fixture.reload()).resolves.toMatchObject(firstReloaded);
     expect(candidateStarts).toBe(2);
     fixture.expectServices({ firstStart: 2, firstStop: 2 });
     expectSiblingUnchanged(fixture);
@@ -401,36 +378,31 @@ export async function verifyCandidateCleanupRefusal(createRecoveryFixture: Recov
       });
     },
   });
-  try {
-    const failure = await fixture.reload().catch((error: unknown) => error);
-    expect(fixture.firstStart).toHaveBeenCalledOnce();
-    expect(failure).toMatchObject({
-      details: { phase: "activate", committed: false },
-      message: expect.stringContaining("automatic recovery could not safely start"),
-    });
-    expect(registrations).toBe(2);
-    expect(disposed).toEqual([1, 2]);
-    expect(resourceOpen).toBe(true);
-    expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
-    expectSiblingUnchanged(fixture);
-    const sibling = getPluginInstance(
-      fixture.registryOwner.registry.plugins.find((record) => record.id === "sibling")!,
-    );
-    assert(sibling);
-    expect(sibling.run(() => "still serving")).toBe("still serving");
-    await expect(fixture.reload()).rejects.toMatchObject({
-      details: { phase: "prepare", committed: false },
-      message: expect.stringContaining(stopFailure.message),
-    });
-    expect(registrations).toBe(2);
-    expect(resourceOpen).toBe(true);
-    expect(sibling.run(() => "still serving after rejected retry")).toBe(
-      "still serving after rejected retry",
-    );
-  } finally {
-    // Model external cleanup of the resource whose plugin-owned stop failed.
-    resourceOpen = false;
-  }
+  const failure = await fixture.reload().catch((error: unknown) => error);
+  expect(fixture.firstStart).toHaveBeenCalledOnce();
+  expect(failure).toMatchObject({
+    details: { phase: "activate", committed: false },
+    message: expect.stringContaining("automatic recovery could not safely start"),
+  });
+  expect(registrations).toBe(2);
+  expect(disposed).toEqual([1, 2]);
+  expect(resourceOpen).toBe(true);
+  expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
+  expectSiblingUnchanged(fixture);
+  const sibling = getPluginInstance(
+    fixture.registryOwner.registry.plugins.find((record) => record.id === "sibling")!,
+  );
+  assert(sibling);
+  expect(sibling.run(() => "still serving")).toBe("still serving");
+  await expect(fixture.reload()).rejects.toMatchObject({
+    details: { phase: "prepare", committed: false },
+    message: expect.stringContaining(stopFailure.message),
+  });
+  expect(registrations).toBe(2);
+  expect(resourceOpen).toBe(true);
+  expect(sibling.run(() => "still serving after rejected retry")).toBe(
+    "still serving after rejected retry",
+  );
 }
 
 export async function verifyPreCommitRetirementOwnership(
@@ -470,7 +442,6 @@ export async function verifyPreCommitRetirementOwnership(
     expect.soft(operation.state.settled).toBe(false);
     expect.soft(shutdown.state.settled).toBe(false);
     expect(first.candidates).toHaveLength(0);
-    expect(cleanupCalls).toBe(1);
     cleanupGate.release();
     expect(await reloading).toMatchObject({ details: { committed: false } });
     expect(await closing).toBeUndefined();

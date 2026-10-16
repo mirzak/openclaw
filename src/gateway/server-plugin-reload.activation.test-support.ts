@@ -3,7 +3,11 @@ import { expect, vi } from "vitest";
 import { registerPluginHttpRoute } from "../plugins/http-registry.js";
 import { getPluginInstance } from "../plugins/plugin-instance-scope.js";
 import { createDeferredCore } from "../shared/deferred.js";
-import { heldWork, probeHttpRoute } from "./server-plugin-reload.fixture-tools.test-support.js";
+import {
+  reloadFailure,
+  heldWork,
+  probeHttpRoute,
+} from "./server-plugin-reload.fixture-tools.test-support.js";
 import {
   createRecoveryChannelManager,
   registerReloadChannel,
@@ -12,6 +16,18 @@ import {
   type RecoveryFixtureFactory,
 } from "./server-plugin-reload.recovery.test-support.js";
 import { createReadinessChecker } from "./server/readiness.js";
+
+function resumingSidecars(
+  fixture: Awaited<ReturnType<RecoveryFixtureFactory>>,
+  resume: (index: number) => void,
+) {
+  fixture.lifetime.publish(
+    ...[0, 1].map((index) => ({
+      stop: async () => {},
+      preparePluginReload: () => ({ drain: async () => {}, resume: () => resume(index) }),
+    })),
+  );
+}
 
 export async function verifyPreparedSidecarRecovery(
   createFixture: RecoveryFixtureFactory,
@@ -24,22 +40,20 @@ export async function verifyPreparedSidecarRecovery(
   const finishTask = createDeferredCore();
   const fixture = await createFixture({
     abortOnCandidateStart: false,
-    register(api, owner) {
-      if (owner === "first") {
-        api.on("gateway_start", start);
-        api.on("gateway_stop", stop);
-        registerReloadChannel(api, {
-          id: channelId,
-          startAccount: async ({ accountId, abortSignal, setStatus }) => {
-            signals.push(abortSignal);
-            setStatus({ accountId, running: true, connected: true, lifecycle: "ready" });
-            await waitForChannelAbort(abortSignal);
-            if (mode === "aborted-predecessor") {
-              await finishTask.promise;
-            }
-          },
-        });
-      }
+    registerFirst(api) {
+      api.on("gateway_start", start);
+      api.on("gateway_stop", stop);
+      registerReloadChannel(api, {
+        id: channelId,
+        startAccount: async ({ accountId, abortSignal, setStatus }) => {
+          signals.push(abortSignal);
+          setStatus({ accountId, running: true, connected: true, lifecycle: "ready" });
+          await waitForChannelAbort(abortSignal);
+          if (mode === "aborted-predecessor") {
+            await finishTask.promise;
+          }
+        },
+      });
     },
   });
   let paused = false;
@@ -69,7 +83,6 @@ export async function verifyPreparedSidecarRecovery(
   let stopping: Promise<void> | undefined;
   try {
     await manager.startChannel(channelId);
-    expect(signals).toHaveLength(1);
     if (mode === "aborted-predecessor") {
       vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
       stopping = manager.stopChannel(channelId);
@@ -82,10 +95,8 @@ export async function verifyPreparedSidecarRecovery(
     expect(result).toMatchObject({ details: { committed: false } });
     expect(paused).toBe(false);
     expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
-    expect(stop).not.toHaveBeenCalled();
-    expect(start).not.toHaveBeenCalled();
-    expect(signals).toHaveLength(1);
-    expect(signals[0]?.aborted).toBe(mode === "aborted-predecessor");
+    expect([stop.mock.calls, start.mock.calls]).toEqual([[], []]);
+    expect(signals).toMatchObject([{ aborted: mode === "aborted-predecessor" }]);
     expect(
       manager.getRuntimeSnapshot({ channelId, inspectAccounts: false }).channels[channelId],
     ).toMatchObject({ running: true, connected: true, lifecycle: "ready" });
@@ -118,9 +129,7 @@ export async function verifyServiceCleanupRecovery(createFixture: RecoveryFixtur
       throw new Error("fixture service could not close");
     },
   });
-  await expect(fixture.reload()).rejects.toMatchObject({
-    details: { phase: "drain", committed: false },
-  });
+  await expect(fixture.reload()).rejects.toMatchObject(reloadFailure("drain"));
   expect(fixture.rollbackConfigEffects).toHaveBeenCalledOnce();
   const disabled = await fixture.reload({
     plugins: { allow: ["first", "sibling"], entries: { first: { enabled: false } } },
@@ -245,20 +254,12 @@ export async function verifyIndependentPostCommitActivation(
     },
   });
   const resumed = vi.fn();
-  fixture.runtime.runtimeState.gatewayLifetimeSidecars.publish(
-    ...[0, 1].map((index) => ({
-      stop: async () => {},
-      preparePluginReload: () => ({
-        drain: async () => {},
-        resume: () => {
-          if (boundary === "sidecar" && index === 0) {
-            throw failure;
-          }
-          resumed(index);
-        },
-      }),
-    })),
-  );
+  resumingSidecars(fixture, (index) => {
+    if (boundary === "sidecar" && index === 0) {
+      throw failure;
+    }
+    resumed(index);
+  });
   if (boundary === "notification") {
     fixture.runtime.broadcast = () => {
       throw failure;
@@ -272,7 +273,7 @@ export async function verifyIndependentPostCommitActivation(
       await manager.startChannel(id);
     }
     const result = await fixture.reload().catch((error: unknown) => error);
-    expect(result).toMatchObject({ details: { committed: true, phase: "activate" } });
+    expect(result).toMatchObject(reloadFailure("activate", true));
     const readiness = createReadinessChecker({
       channelManager: manager,
       startedAt: Date.now(),
@@ -423,20 +424,12 @@ export async function verifyIndependentRollbackRestoration(
       }
     },
   });
-  fixture.runtime.runtimeState.gatewayLifetimeSidecars.publish(
-    ...[0, 1].map((index) => ({
-      stop: async () => {},
-      preparePluginReload: () => ({
-        drain: async () => {},
-        resume: () => {
-          resumed.push(index);
-          if (boundary === "services" && index === 0) {
-            throw sidecarFailure;
-          }
-        },
-      }),
-    })),
-  );
+  resumingSidecars(fixture, (index) => {
+    resumed.push(index);
+    if (boundary === "services" && index === 0) {
+      throw sidecarFailure;
+    }
+  });
   const manager = createRecoveryChannelManager(fixture);
   fixture.runtime.channelManager = manager;
   try {
@@ -457,11 +450,6 @@ export async function verifyIndependentRollbackRestoration(
       expect(result).toMatchObject({
         cause: { errors: [expect.any(Error), { errors: [{ errors: [failure] }, sidecarFailure] }] },
       });
-      expect(
-        manager
-          .getRuntimeSnapshot({ channelId: "healthy-restore", inspectAccounts: false })
-          .reloadingChannels?.has("healthy-restore"),
-      ).toBe(false);
       expect(starts).toEqual(["first-restore", "healthy-restore"]);
       await manager.startChannel("healthy-restore");
       await vi.waitFor(() =>

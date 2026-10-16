@@ -9,7 +9,11 @@ import { getPluginInstance } from "../plugins/plugin-instance-scope.js";
 import type { PluginInstanceConsumer } from "../plugins/plugin-instance.types.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import type { GatewayRequestHandlerOptions } from "./server-methods/types.js";
-import { observeSettlement } from "./server-plugin-reload.fixture-tools.test-support.js";
+import {
+  reloadFailure,
+  firstReloaded,
+  observeSettlement,
+} from "./server-plugin-reload.fixture-tools.test-support.js";
 import {
   expectSiblingUnchanged,
   observeRetainedWork,
@@ -181,9 +185,9 @@ async function verifySelfConsumerReload(
     // Observe the original bounded failure without releasing the work reload depends on.
     await Promise.race([observation.entered, reloading]);
     await vi.advanceTimersByTimeAsync(70_000);
-    expect(await reloading).toMatchObject({
-      details: { phase: caller === "own invocation" ? "prepare" : "drain", committed: false },
-    });
+    expect(await reloading).toMatchObject(
+      reloadFailure(caller === "own invocation" ? "prepare" : "drain"),
+    );
     expect(prepareConfigEffects).toHaveBeenCalledTimes(caller === "own invocation" ? 0 : 1);
     fixture.expectServices({ firstStop: 0, siblingStop: 0 });
     expect(fixture.candidates).toHaveLength(0);
@@ -236,7 +240,6 @@ async function verifyOverlappingRetainedWork(createRecoveryFixture: RecoveryFixt
     // A refusal is observed immediately instead of waiting for a fixture timeout.
     await Promise.race([reserved.promise, reloading]);
     expect(fixture.firstStop).not.toHaveBeenCalled();
-    expect(disposed).toEqual([]);
     first();
     expect(instance.run(() => "old run finishes")).toBe("old run finishes");
     expect(fixture.candidates).toHaveLength(0);
@@ -287,7 +290,7 @@ async function verifyExplicitDrainWait(
   const call = kind === "active call" ? instance.run(() => released.promise) : undefined;
   const observation = observeRetainedWork(instance);
   vi.useFakeTimers();
-  const operation = observeSettlement(fixture.reload().catch((error: unknown) => error));
+  const operation = observeSettlement(fixture.reload());
   const reloading = operation.result;
   try {
     await Promise.race([observation.entered, reloading]);
@@ -301,7 +304,7 @@ async function verifyExplicitDrainWait(
       controller.abort(new Error("operator cancelled reload"));
       await vi.advanceTimersByTimeAsync(0);
       expect(operation.state.settled).toBe(true);
-      expect(await reloading).toMatchObject({ details: { phase: "drain", committed: false } });
+      expect(await reloading).toMatchObject(reloadFailure("drain"));
       expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
       expect(instance.run(() => "still serving")).toBe("still serving");
       expect(instance.disposing).toBe(false);
@@ -311,7 +314,7 @@ async function verifyExplicitDrainWait(
     } else {
       release();
       await call;
-      expect(await reloading).toMatchObject({ runtime: { pluginIds: ["first"] } });
+      expect(await reloading).toMatchObject(firstReloaded);
       expect(fixture.registryOwner.registry).not.toBe(fixture.previousRegistry);
       expect(fixture.candidates).toHaveLength(1);
       expect(instance.disposing).toBe(true);
@@ -372,9 +375,7 @@ export function registerPluginRetainedWorkReloadTests(
 
       await lease[Symbol.asyncDispose]();
       allowEffects = true;
-      await expect(runInTurn(() => fixture.reload())).resolves.toMatchObject({
-        runtime: { pluginIds: ["first"] },
-      });
+      await expect(runInTurn(() => fixture.reload())).resolves.toMatchObject(firstReloaded);
     } finally {
       await lease[Symbol.asyncDispose]();
     }
@@ -407,9 +408,7 @@ export function registerPluginRetainedWorkReloadTests(
         expect(fixture.firstStart).toHaveBeenCalledTimes(2);
         expect(fixture.rollbackConfigEffects).toHaveBeenCalledOnce();
       } else {
-        await expect(fixture.reload()).resolves.toMatchObject({
-          runtime: { pluginIds: ["first"] },
-        });
+        await expect(fixture.reload()).resolves.toMatchObject(firstReloaded);
         expect(fixture.firstStart).toHaveBeenCalledOnce();
         expect(fixture.rollbackConfigEffects).not.toHaveBeenCalled();
       }

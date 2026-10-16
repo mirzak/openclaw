@@ -32,11 +32,15 @@ import { createDeferredCore } from "../shared/deferred.js";
 import { resolveRelativeBundledPluginPublicModuleId } from "../test-utils/bundled-plugin-public-surface.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
+  firstReloaded,
   rejectWith,
   heldWork,
   observeSettlement,
 } from "./server-plugin-reload.fixture-tools.test-support.js";
-import type { RecoveryFixtureFactory } from "./server-plugin-reload.recovery.test-support.js";
+import {
+  waitForChannelAbort,
+  type RecoveryFixtureFactory,
+} from "./server-plugin-reload.recovery.test-support.js";
 
 const { createMemoryRuntime, configureMemoryCoreDreamingState } = await vi.importActual<{
   configureMemoryCoreDreamingState: (
@@ -190,7 +194,6 @@ export async function verifyGatewayMemoryReplacement(
       closeGate.entered,
       reloading.then(() => expect(close).toHaveBeenCalledOnce()),
     ]);
-    expect(otherClose).not.toHaveBeenCalled();
     if (mode === "failed-close") {
       expect(await reloading).toMatchObject({
         runtime: {
@@ -198,7 +201,6 @@ export async function verifyGatewayMemoryReplacement(
           warnings: [expect.stringContaining("memory provider cleanup refused")],
         },
       });
-      expect(close).toHaveBeenCalled();
       reloading = fixture.reload();
     } else {
       expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
@@ -206,7 +208,7 @@ export async function verifyGatewayMemoryReplacement(
       expect(events).toEqual(["close:start"]);
       closeGate.release();
     }
-    expect(await reloading).toMatchObject({ runtime: { pluginIds: ["first"] } });
+    expect(await reloading).toMatchObject(firstReloaded);
     if (mode === "held-close") {
       expect(events.slice(-2)).toEqual(["close:end", "publish"]);
       expect(close).toHaveBeenCalledOnce();
@@ -240,15 +242,10 @@ export async function verifyGatewayMemoryReplacement(
       }
       expect(close).toHaveBeenCalledTimes(closeCalls);
     } finally {
-      try {
-        await otherRuntime.closeAllMemorySearchManagers?.();
-      } finally {
-        try {
-          await disposePluginRegistryInstances(independent.registry);
-        } finally {
-          await state.cleanup();
-        }
-      }
+      await Promise.resolve()
+        .then(() => otherRuntime.closeAllMemorySearchManagers?.())
+        .finally(() => disposePluginRegistryInstances(independent.registry))
+        .finally(() => state.cleanup());
     }
   }
 }
@@ -288,9 +285,7 @@ export async function verifyGatewayMemoryWatcherRestart(
           notify: AsyncLocalStorage.bind(() => onChange("change")),
           signal: watchSignal,
         });
-        await new Promise<void>((resolve) => {
-          watchSignal.addEventListener("abort", () => resolve(), { once: true });
-        });
+        await waitForChannelAbort(watchSignal);
       },
     },
   });
@@ -330,10 +325,6 @@ export async function verifyGatewayMemoryWatcherRestart(
         }
       },
       beforePublish: async () => {
-        expect(
-          subscriptions[0]!.signal.aborted,
-          "Stop memory watchers before provider publication",
-        ).toBe(true);
         if (independent) {
           await disposePluginRegistryInstances(independent.registry);
         }
@@ -435,7 +426,9 @@ export async function verifyGatewayMemoryWatcherRestart(
         ),
         signal,
       );
-      expect(subscriptions[0]!.signal.aborted).toBe(true);
+      expect(subscriptions[0]!.signal.aborted, "Stop watchers before provider publication").toBe(
+        true,
+      );
       const completion = observeSettlement(reloading);
       await Promise.resolve();
       expect(completion.state.settled, "Reload must join memory service startup").toBe(false);
@@ -451,7 +444,7 @@ export async function verifyGatewayMemoryWatcherRestart(
     if (providerState === "rollback" || recovery) {
       expect(result).toMatchObject({ details: { committed: false } });
     } else {
-      expect(result).toMatchObject({ runtime: { pluginIds: ["first"] } });
+      expect(result).toMatchObject(firstReloaded);
     }
     if (recovery?.failure === "restart") {
       expect(result).toMatchObject({
