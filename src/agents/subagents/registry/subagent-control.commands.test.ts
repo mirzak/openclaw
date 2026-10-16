@@ -43,37 +43,47 @@ beforeEach(async () => {
   await captureRuntimeConfigAsyncReader()();
 });
 
-function commandTool(runId: string, sessionKey: string, sessionId: string) {
-  return createLazyExecTool({
-    runId,
-    sessionKey,
-    sessionId,
-    agentId: "main",
-    config: getRuntimeConfig(),
-    cwd: fixture.stateDir,
-    scopeKey: sessionKey,
-    host: "gateway",
-    mode: "full",
-    ask: "off",
-    allowBackground: true,
-    notifyOnExit: false,
-    preparedStoreEnvironment: {},
-  });
-}
-
-const commandInput = (background = false) => ({
-  command: `node -e "require('fs').watch('.', () => {})"`,
-  ...(background ? { background: true } : { yieldMs: 10 }),
-  timeoutSeconds: 60,
-});
-
-function runningCommand(result: { details?: unknown }) {
-  const details = asOptionalRecord(result.details);
-  expect(details?.status).toBe("running");
-  if (typeof details?.sessionId !== "string") {
-    throw new Error("Expected a running command's process handle");
-  }
-  return expectDefined(getSession(details.sessionId), "child command");
+function withCommands<T>(
+  commands: ProcessSession[],
+  identity: { runId: string; sessionKey: string; sessionId: string; agentId: string },
+  body: (start: (background?: boolean, callId?: string) => Promise<ProcessSession>) => Promise<T>,
+  abortSignal?: AbortSignal,
+) {
+  return withEnvAsync({ OPENCLAW_EXEC_SHELL_SNAPSHOT: "0" }, () =>
+    withExecRequestTurn({ identity, abortSignal }, async () => {
+      const exec = createLazyExecTool({
+        ...identity,
+        config: getRuntimeConfig(),
+        cwd: fixture.stateDir,
+        scopeKey: identity.sessionKey,
+        host: "gateway",
+        mode: "full",
+        ask: "off",
+        allowBackground: true,
+        notifyOnExit: false,
+        preparedStoreEnvironment: {},
+      });
+      return body(async (background = false, callId = "child-command") => {
+        const result = await exec.execute(
+          callId,
+          {
+            command: `node -e "require('fs').watch('.', () => {})"`,
+            ...(background ? { background: true } : { yieldMs: 10 }),
+            timeoutSeconds: 60,
+          },
+          abortSignal,
+        );
+        const details = asOptionalRecord(result.details);
+        expect(details?.status).toBe("running");
+        if (typeof details?.sessionId !== "string") {
+          throw new Error("Expected a running command's process handle");
+        }
+        const command = expectDefined(getSession(details.sessionId), "child command");
+        commands.push(command);
+        return command;
+      });
+    }),
+  );
 }
 
 function controllerFor(controllerSessionKey: string) {
@@ -129,15 +139,12 @@ it.each([
     let captured = false;
     let injected = false;
     const alternate = selection.startsWith("alternate-");
-    const shouldCancel =
-      selection === "owned" ||
-      selection === "legacy-owned" ||
-      selection === "postaccept-revoked" ||
-      selection === "gateway" ||
-      selection === "gateway-error" ||
-      selection === "channel" ||
-      selection === "nested" ||
-      alternate;
+    const shouldCancel = ![
+      "other-controller",
+      "new-generation",
+      "admin-root",
+      "preaccept-revoked",
+    ].includes(selection);
     const supervisor = getProcessSupervisor();
     const spawn = supervisor.spawn.bind(supervisor);
     const spawnFault = vi.spyOn(supervisor, "spawn").mockImplementation(async (input) => {
@@ -166,25 +173,10 @@ it.each([
       includeService: boolean,
       target = { sessionKey: childSessionKey, sessionId },
     ) =>
-      withEnvAsync({ OPENCLAW_EXEC_SHELL_SNAPSHOT: "0" }, () =>
-        withExecRequestTurn(
-          {
-            identity: { runId, ...target, agentId: "main" },
-          },
-          async () => {
-            const exec = commandTool(runId, target.sessionKey, target.sessionId);
-            const started: ProcessSession[] = [];
-            for (const background of includeService ? [false, true] : [false]) {
-              const command = runningCommand(
-                await exec.execute("child-command", commandInput(background)),
-              );
-              commands.push(command);
-              started.push(command);
-            }
-            return started;
-          },
-        ),
-      );
+      withCommands(commands, { runId, ...target, agentId: "main" }, async (start) => {
+        const ordinary = await start();
+        return includeService ? [ordinary, await start(true)] : [ordinary];
+      });
     const createdAt = Date.now();
     const completed = (
       runId: string,
@@ -204,12 +196,6 @@ it.each([
         endedAt: createdAt + generation + 1,
         outcome: { status: "ok" },
         expectsCompletionMessage: false,
-        completion: {
-          required: false,
-          resultText: "Completed child result",
-          capturedAt: createdAt + generation + 1,
-        },
-        delivery: { status: "not_required" },
         ...overrides,
       });
     const original = completed("completed-command-run", 1);
@@ -243,13 +229,6 @@ it.each([
           },
           requesterSessionKey: childSessionKey,
           controllerSessionKey: childSessionKey,
-          createdAt,
-          endedAt: createdAt + 1,
-          completion: {
-            required: false,
-            resultText: "Completed nested result",
-            capturedAt: createdAt + 1,
-          },
         });
         await publish(nested);
         nestedReceipt = structuredClone(
@@ -524,53 +503,32 @@ it.each([
           ready.resolve();
           await ownerRequested.promise;
         }
-        return withEnvAsync({ OPENCLAW_EXEC_SHELL_SNAPSHOT: "0" }, () =>
-          withExecRequestTurn(
-            {
-              identity: { runId, sessionKey: childSessionKey, sessionId, agentId: "main" },
-              abortSignal: controller.signal,
-            },
-            async () => {
-              if (lateOwner) {
-                order.push("owner-created");
-              }
-              const exec = commandTool(runId, childSessionKey, sessionId);
-              for (const background of [false, true]) {
-                const result = await exec.execute(
-                  background ? "independent-service" : "ordinary-command",
-                  commandInput(background),
-                  controller.signal,
-                );
-                commands.push(runningCommand(result));
-              }
-              if (lateOwner) {
-                lateStarted = true;
-                order.push("registered");
-                ownerCommandsReady.resolve();
-              }
-              const startLateCommand = async () => {
-                lateStarted = true;
-                const result = await exec.execute(
-                  "late-ordinary-command",
-                  commandInput(),
-                  controller.signal,
-                );
-                const details = asOptionalRecord(result.details);
-                if (typeof details?.sessionId !== "string") {
-                  throw new Error("Expected late ordinary process handle");
-                }
-                commands.push(expectDefined(getSession(details.sessionId), "late child command"));
-                order.push("registered");
-              };
-              ready.resolve();
-              if (late) {
-                await lateCommandRequested.promise;
-                await startLateCommand();
-                lateCommandReady.resolve();
-              }
-              await interrupted.promise;
-            },
-          ),
+        return withCommands(
+          commands,
+          { runId, sessionKey: childSessionKey, sessionId, agentId: "main" },
+          async (start) => {
+            if (lateOwner) {
+              order.push("owner-created");
+            }
+            for (const background of [false, true]) {
+              await start(background, background ? "independent-service" : "ordinary-command");
+            }
+            if (lateOwner) {
+              lateStarted = true;
+              order.push("registered");
+              ownerCommandsReady.resolve();
+            }
+            ready.resolve();
+            if (late) {
+              await lateCommandRequested.promise;
+              lateStarted = true;
+              await start(false, "late-ordinary-command");
+              order.push("registered");
+              lateCommandReady.resolve();
+            }
+            await interrupted.promise;
+          },
+          controller.signal,
         );
       })
       .finally(() => {
@@ -666,18 +624,7 @@ it.each([
       if (faultInjected) {
         expect(rootExitObserved).toBe(true);
       }
-      expect(
-        result,
-        JSON.stringify({
-          result,
-          order,
-          native: {
-            execution: subagentRuns.get(runId)?.execution,
-            killIntent: subagentRuns.get(runId)?.killIntent,
-            killReconciliation: subagentRuns.get(runId)?.killReconciliation,
-          },
-        }),
-      ).toMatchObject({
+      expect(result).toMatchObject({
         status: cleanup === "confirmed" ? "ok" : "error",
         killed: 1,
         ...(cleanup !== "confirmed"
