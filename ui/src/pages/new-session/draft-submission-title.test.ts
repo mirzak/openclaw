@@ -28,6 +28,12 @@ function createdParams(context: ReturnType<typeof createDraftTitleFixture>["cont
   return vi.mocked(context.sessions.createResult).mock.calls[0]?.[0];
 }
 
+const personal = ({ authProfileId, label }: UserModelAccount) => ({
+  kind: "personal" as const,
+  authProfileId,
+  label,
+});
+
 function accountTitleFixture(preview?: Promise<ModelCatalogResult>) {
   const makeAccount = (id: string): UserModelAccount => ({
     authProfileId: `personal:person-a:test:${id}`,
@@ -39,11 +45,7 @@ function accountTitleFixture(preview?: Promise<ModelCatalogResult>) {
   const accounts: [UserModelAccount, UserModelAccount] = [makeAccount("one"), makeAccount("two")];
   const confirmed: ModelCatalogResult = {
     models: [{ id: "primary", name: "Primary", provider: "test", available: true }],
-    accountSelection: {
-      kind: "personal",
-      authProfileId: accounts[0].authProfileId,
-      label: accounts[0].label,
-    },
+    accountSelection: personal(accounts[0]),
   };
   const titleRequest = vi.fn(async (_params?: unknown) => ({ title: "Prepared title" }));
   const fixture = createDraftTitleFixture(
@@ -61,11 +63,7 @@ function accountTitleFixture(preview?: Promise<ModelCatalogResult>) {
         return account
           ? (preview ?? {
               ...confirmed,
-              accountSelection: {
-                kind: "personal",
-                authProfileId: account.authProfileId,
-                label: account.label,
-              },
+              accountSelection: personal(account),
             })
           : {
               models: confirmed.models.map((model) =>
@@ -107,23 +105,18 @@ describe("prepared title creation handoff", () => {
     try {
       titleRequest
         .mockResolvedValueOnce({ title: "Automatic title" })
-        .mockResolvedValueOnce({ title: "First account title" })
-        .mockResolvedValueOnce({ title: "Second account title" });
+        .mockResolvedValueOnce({ title: "First account title" });
       await prepareTitle(fixture, "repair the sidebar naming");
       expect(titleRequest).toHaveBeenCalledOnce();
 
-      for (const [index, account] of accounts.entries()) {
-        await chooseAccount(account);
-        if (index === 1) {
-          break;
-        }
-        await prepareTitle(fixture);
-        expect(titleRequest).toHaveBeenLastCalledWith({
-          agentId: "main",
-          message: flow.message,
-          model: `test/primary@${account.authProfileId}`,
-        });
-      }
+      await chooseAccount(accounts[0]);
+      await prepareTitle(fixture);
+      expect(titleRequest).toHaveBeenLastCalledWith({
+        agentId: "main",
+        message: flow.message,
+        model: `test/primary@${accounts[0].authProfileId}`,
+      });
+      await chooseAccount(accounts[1]);
       expect(place.modelControl.selected).toBe("");
       await flow.submit();
       expect(context.sessions.createResult).toHaveBeenCalledWith(
@@ -153,11 +146,7 @@ describe("prepared title creation handoff", () => {
             ...confirmed,
             ...(outcome === "unconfirmed"
               ? {
-                  accountSelection: {
-                    kind: "personal",
-                    authProfileId: accounts[1].authProfileId,
-                    label: accounts[1].label,
-                  },
+                  accountSelection: personal(accounts[1]),
                 }
               : {
                   models: confirmed.models?.map((model) =>

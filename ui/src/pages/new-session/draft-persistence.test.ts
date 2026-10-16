@@ -46,10 +46,7 @@ const store = vi.hoisted(() => {
     >(async () => ({ status: "persisted" as const })),
     writeDurableComposerSnapshot: vi.fn<
       typeof import("../chat/durable-composer-persistence.ts").writeDurableComposerSnapshot
-    >(async () => ({
-      result: { status: "persisted" as const },
-      payloadUnavailable: false,
-    })),
+    >(async () => ({ result: { status: "persisted" as const }, payloadUnavailable: false })),
   };
 });
 
@@ -80,6 +77,23 @@ vi.mock("../chat/durable-composer-persistence.ts", async (importOriginal) => {
 const writeSnapshot = store.writeDurableComposerSnapshot;
 const retireDraft = store.retireDurableComposerDraft;
 const hydrateAttachments = store.hydrateDurableComposerAttachments;
+type Retirement = { status: "persisted"; revision: number; writeId: string };
+type SnapshotResult = Awaited<ReturnType<typeof writeSnapshot>>;
+
+function holdWrite() {
+  const pending = createDeferred<SnapshotResult>();
+  writeSnapshot.mockReturnValueOnce(pending.promise);
+  return () => pending.resolve({ result: { status: "persisted" }, payloadUnavailable: false });
+}
+
+function modelSelection(
+  flow: DraftSubmissionFlow,
+  read: NonNullable<DraftSubmissionFlow["draftPersistence"]["modelSelection"]>["read"],
+) {
+  const selection = { read, restore: vi.fn(), retire: vi.fn() };
+  flow.draftPersistence.modelSelection = selection;
+  return selection;
+}
 
 async function resolvePendingRead(result: StoreReadResult) {
   // The read is issued behind the store's lazy import; wait for it to land.
@@ -96,6 +110,11 @@ function settle() {
   return new Promise((resolve) => {
     setTimeout(resolve, 0);
   });
+}
+
+async function restore(result: StoreReadResult) {
+  await resolvePendingRead(result);
+  await settle();
 }
 
 // The gateway/place states are untouched by draft persistence and typing paths.
@@ -127,12 +146,7 @@ describe("NewSessionDraftPersistence restore race", () => {
     const flow = createFlow();
     const hydrationEntered = createDeferred();
     const hydration = createDeferred<[]>();
-    const restoreSelection = vi.fn();
-    flow.draftPersistence.modelSelection = {
-      read: () => undefined,
-      restore: restoreSelection,
-      retire: vi.fn(),
-    };
+    const { restore: restoreSelection } = modelSelection(flow, () => undefined);
     store.readDurableComposerDraft.mockResolvedValueOnce(
       storedDraft("@Alex stored draft", "stored", 7, {
         mentions: [{ profileId: "old-alex", start: 0, end: 5 }],
@@ -169,11 +183,7 @@ describe("NewSessionDraftPersistence restore race", () => {
     async (restoration) => {
       const flow = createFlow();
       const selection = { agentId: "main", model: "openai/retry", thinkingLevel: "high" };
-      flow.draftPersistence.modelSelection = {
-        read: () => selection,
-        restore: vi.fn(),
-        retire: vi.fn(),
-      };
+      modelSelection(flow, () => selection);
       flow.draftPersistence.setOwner("ws://gateway.example", "principal-a");
       flow.draftPersistence.activateRoute("failed-restoration");
       if (restoration !== "pending") {
@@ -182,8 +192,7 @@ describe("NewSessionDraftPersistence restore race", () => {
       flow.draftPersistence.noteModelSelectionMutation();
       const saved = storedDraft("Keep saved content", "saved", 10);
       if (restoration !== "pending") {
-        await resolvePendingRead(saved);
-        await settle();
+        await restore(saved);
         flow.draftPersistence.persistNow();
         expect(writeSnapshot).not.toHaveBeenCalled();
       }
@@ -191,8 +200,7 @@ describe("NewSessionDraftPersistence restore race", () => {
         if (restoration === "attachments") {
           hydrateAttachments.mockRejectedValueOnce(new Error("Attachment unavailable"));
         }
-        await resolvePendingRead(restoration === "read" ? { status: "storage-failed" } : saved);
-        await settle();
+        await restore(restoration === "read" ? { status: "storage-failed" } : saved);
         flow.draftPersistence.persistNow();
         expect(writeSnapshot).not.toHaveBeenCalled();
         flow.draftPersistence.noteModelSelectionMutation();
@@ -212,15 +220,10 @@ describe("NewSessionDraftPersistence restore race", () => {
   it("persists a model-only edit after a submission capture fails without consuming the draft", async () => {
     const flow = createFlow();
     let selected = "openai/first";
-    flow.draftPersistence.modelSelection = {
-      read: () => ({ agentId: "main", model: selected, thinkingLevel: "low" }),
-      restore: vi.fn(),
-      retire: vi.fn(),
-    };
+    modelSelection(flow, () => ({ agentId: "main", model: selected, thinkingLevel: "low" }));
     flow.draftPersistence.setOwner("ws://gateway.example", "principal-a");
     flow.draftPersistence.activateRoute("failed-submission");
-    await resolvePendingRead({ status: "not-found" });
-    await settle();
+    await restore({ status: "not-found" });
     flow.setMessage("Still unsent");
     flow.draftPersistence.captureSubmission();
     // A rejected/no-result create keeps this same unsent mutation and text.
@@ -240,8 +243,7 @@ describe("NewSessionDraftPersistence restore race", () => {
 
   it("retires accepted model intent only while the submitted mutation still owns the view", async () => {
     const flow = createFlow();
-    const retire = vi.fn();
-    flow.draftPersistence.modelSelection = { read: () => undefined, restore: vi.fn(), retire };
+    const { retire } = modelSelection(flow, () => undefined);
     flow.setMessage("Submitted draft");
     const accepted = flow.draftPersistence.captureSubmission();
     await flow.draftPersistence.clearSubmittedDraft(accepted);
@@ -254,7 +256,7 @@ describe("NewSessionDraftPersistence restore race", () => {
   });
 
   it("saves the captured normal draft after retirement settles on another route", async () => {
-    const retirement = createDeferred<{ status: "persisted"; revision: number; writeId: string }>();
+    const retirement = createDeferred<Retirement>();
     retireDraft.mockReturnValueOnce(retirement.promise);
     const flow = createFlow("original-route");
     flow.setVisibility("incognito");
@@ -283,14 +285,9 @@ describe("NewSessionDraftPersistence restore race", () => {
   it.each([false, true])(
     "revokes a waiting ordinary write before a second retirement settles (newer edit: %s)",
     async (editAgain) => {
-      const retirements: Array<
-        (result: { status: "persisted"; revision: number; writeId: string }) => void
-      > = [];
-      const holdRetirement = () =>
-        new Promise<{ status: "persisted"; revision: number; writeId: string }>((resolve) => {
-          retirements.push(resolve);
-        });
-      retireDraft.mockImplementationOnce(holdRetirement).mockImplementationOnce(holdRetirement);
+      const first = createDeferred<Retirement>();
+      const second = createDeferred<Retirement>();
+      retireDraft.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
       const flow = createFlow("private-route");
       flow.setVisibility("incognito");
       flow.setMessage("must remain private");
@@ -300,17 +297,13 @@ describe("NewSessionDraftPersistence restore race", () => {
         flow.setMessage("newer private input");
       }
       flow.setVisibility("incognito");
-      await vi.waitFor(() => expect(retirements).toHaveLength(2));
-      const [finishFirst, finishSecond] = retirements;
-      if (!finishFirst || !finishSecond) {
-        throw new Error("Both privacy retirements must be pending");
-      }
+      await vi.waitFor(() => expect(retireDraft.mock.calls.length).toBeGreaterThanOrEqual(2));
       const revision = Date.now() + 1000;
-      finishFirst({ status: "persisted", revision, writeId: "retired:first" });
+      first.resolve({ status: "persisted", revision, writeId: "retired:first" });
       await settle();
       // The later retirement is deliberately still pending: CAS cannot fence this interval.
       expect(writeSnapshot).not.toHaveBeenCalled();
-      finishSecond({ status: "persisted", revision: revision + 1, writeId: "retired:second" });
+      second.resolve({ status: "persisted", revision: revision + 1, writeId: "retired:second" });
       await settle();
       expect(writeSnapshot).not.toHaveBeenCalled();
       expect(flow.visibility).toBe("incognito");
@@ -334,11 +327,9 @@ describe("NewSessionDraftPersistence restore race", () => {
     expect(canReloadControlUiDocument()).toBe(true);
     await settle();
     if (store.pendingReads.length) {
-      await resolvePendingRead({ status: "not-found", revision: Date.now() });
-      await settle();
+      await restore({ status: "not-found", revision: Date.now() });
     }
-    expect(target.visibility).toBe("incognito");
-    expect(target.message).toBe("private incognito draft");
+    expect(target).toMatchObject({ visibility: "incognito", message: "private incognito draft" });
     expect(writeSnapshot).not.toHaveBeenCalled();
     target.disconnect();
     handoff.dispose();
@@ -348,8 +339,7 @@ describe("NewSessionDraftPersistence restore race", () => {
   it.each(["conflict", "late commit"])("reconciles a handed-off edit after %s", async (outcome) => {
     const route = "pending-handoff";
     const source = createFlow(route, true);
-    await resolvePendingRead(storedDraft("original", "original-write"));
-    await settle();
+    await restore(storedDraft("original", "original-write"));
     let finishWrite: (() => void) | undefined;
     if (outcome === "conflict") {
       writeSnapshot.mockResolvedValueOnce({
@@ -357,13 +347,7 @@ describe("NewSessionDraftPersistence restore race", () => {
         payloadUnavailable: false,
       });
     } else {
-      writeSnapshot.mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            finishWrite = () =>
-              resolve({ result: { status: "persisted" }, payloadUnavailable: false });
-          }),
-      );
+      finishWrite = holdWrite();
     }
     source.setMessage("latest unsent edit");
     const handoff = source.draftPersistence.captureSubmission();
@@ -401,8 +385,7 @@ describe("NewSessionDraftPersistence restore race", () => {
       fallbacks: {},
     });
     restoreDraft(context, flow, "first-owner", "");
-    await resolvePendingRead(storedDraft("newer stored draft", "newer-stored"));
-    await settle();
+    await restore(storedDraft("newer stored draft", "newer-stored"));
     expect(flow.message).toBe("newer stored draft");
     flow.disconnect();
     handoff.dispose();
@@ -411,8 +394,7 @@ describe("NewSessionDraftPersistence restore race", () => {
   it("consumes a handed-off draft sent before its durable restore resolves", async () => {
     const source = createFlow("handoff-route", true);
     const stored = storedDraft("handed-off draft", "stored-handoff");
-    await resolvePendingRead(stored);
-    await settle();
+    await restore(stored);
     const handoff = source.draftPersistence.captureSubmission();
     source.disconnect();
     const target = createFlow("handoff-route");
@@ -421,8 +403,7 @@ describe("NewSessionDraftPersistence restore race", () => {
     persistence.adoptHandoff(handoff);
     persistence.activateRoute("handoff-route");
     const submitted = persistence.captureSubmission();
-    await resolvePendingRead(stored);
-    await settle();
+    await restore(stored);
     const clearing = persistence.clearSubmittedDraft(submitted, () => target.restoreMessage(""));
     await resolvePendingRead(stored);
     await clearing;
@@ -449,8 +430,7 @@ describe("NewSessionDraftPersistence restore race", () => {
       const submitted = persistence.captureSubmission();
       const competing = storedDraft("another draft", "another-writer");
       const clearing = settled ? null : persistence.clearSubmittedDraft(submitted);
-      await resolvePendingRead(competing);
-      await settle();
+      await restore(competing);
       if (settled) {
         expect(writeSnapshot).toHaveBeenCalledTimes(2);
         const retry = writeSnapshot.mock.calls[1]![0];
@@ -471,14 +451,7 @@ describe("NewSessionDraftPersistence restore race", () => {
   it("settles the captured write before retiring an accepted submission", async () => {
     const flow = createFlow("accepted-route");
     const persistence = flow.draftPersistence;
-    let finishWrite!: () => void;
-    writeSnapshot.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          finishWrite = () =>
-            resolve({ result: { status: "persisted" }, payloadUnavailable: false });
-        }),
-    );
+    const finishWrite = holdWrite();
     flow.setMessage("submitted prompt");
     const submitted = persistence.captureSubmission();
     const clearing = persistence.clearSubmittedDraft(submitted);
@@ -550,15 +523,13 @@ describe("NewSessionDraftPersistence restore race", () => {
 
   it("re-arms restore for the next route once the page resets the draft", async () => {
     const flow = createFlow("agent:route-a", true);
-    await resolvePendingRead({ status: "not-found" });
-    await settle();
+    await restore({ status: "not-found" });
     flow.setMessage("typed on route a");
     // Route switch: the page persists, resets the composer, then activates.
     flow.draftPersistence.persistNow();
     flow.resetDraft();
     flow.draftPersistence.activateRoute("agent:route-b");
-    await resolvePendingRead(storedDraft("route b draft", "w-2", 9));
-    await settle();
+    await restore(storedDraft("route b draft", "w-2", 9));
     expect(flow.message).toBe("route b draft");
   });
 });

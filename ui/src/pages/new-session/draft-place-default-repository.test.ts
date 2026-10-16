@@ -125,8 +125,7 @@ describe("DraftPlaceState configured repository defaults", () => {
     projectsReady = true;
     configured.state.restorePreferenceSelections();
     expect(configured.browser.remoteProject).toEqual(repository);
-    expect(configured.state.baseRef).toBe("");
-    expect(configured.state.cloudProfileId).toBe("aws");
+    expect(configured.state).toMatchObject({ baseRef: "", cloudProfileId: "aws" });
     expect(configured.state.remoteRepository).toEqual({
       url: "https://ghe.example.test/acme/private-repo.git",
     });
@@ -166,8 +165,7 @@ describe("DraftPlaceState configured repository defaults", () => {
     configured.state.restorePreferenceSelections();
 
     expect(configured.browser.remoteProject).toBeNull();
-    expect(configured.state.remoteRepository).toBeUndefined();
-    expect(configured.state.cloudProfileId).toBe("");
+    expect(configured.state).toMatchObject({ remoteRepository: undefined, cloudProfileId: "" });
   });
 
   it("moves a saved configured repository from the Gateway onto its worker profile", () => {

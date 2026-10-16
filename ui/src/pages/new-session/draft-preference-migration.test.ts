@@ -10,8 +10,7 @@ afterEach(() => {
 });
 
 it("does not restore an accepted name when an older first-load browser migration commits last", async () => {
-  seedBrowserPreferences();
-  const prefs = identityPreferences(true, undefined, {});
+  const prefs = migration();
   const migrationStarted = createDeferred();
   const releaseMigration = createDeferred();
   let heldMigration = false;
@@ -55,8 +54,18 @@ it("does not restore an accepted name when an older first-load browser migration
 });
 
 const migrationKey = "new-session.migration.v1";
+const mainKey = "new-session.v1:main";
+type DraftFixture = ReturnType<ReturnType<typeof identityPreferences>["make"]>;
 
-function seedBrowserPreferences(extraAgents = 0) {
+function setEntries(draft: DraftFixture, entries: Record<string, unknown>) {
+  return draft.context.gateway.snapshot.client!.request("users.prefs.set", { entries });
+}
+
+function getEntries(draft: DraftFixture) {
+  return draft.context.gateway.snapshot.client!.request("users.prefs.get", {});
+}
+
+function migration(extraAgents = 0, entries: Record<string, unknown> = {}) {
   const preference = {
     workspace: "/repo",
     folder: "/repo",
@@ -74,12 +83,11 @@ function seedBrowserPreferences(extraAgents = 0) {
       ),
     ).toBe(true);
   }
-  return preference;
+  return { ...identityPreferences(true, undefined, entries), preference };
 }
 
 it("imports bounded batches, compares raw undecodable values, and completes the marker last", async () => {
-  seedBrowserPreferences(33);
-  const prefs = identityPreferences(true, undefined, { "new-session.v1:main": "legacy" });
+  const prefs = migration(33, { [mainKey]: "legacy" });
   const first = prefs.make();
   await prefs.ready(first);
   const batches = prefs.beforeSave.mock.calls.map(([params]) => params);
@@ -97,19 +105,16 @@ it("imports bounded batches, compares raw undecodable values, and completes the 
 });
 
 it("honors another completed marker before a later non-final import batch", async () => {
-  const preference = seedBrowserPreferences(65);
-  const prefs = identityPreferences(true, undefined, {});
+  const prefs = migration(65);
   let batches = 0;
   prefs.beforeSave.mockImplementation(async (params) => {
     if (Object.hasOwn(params.expectedEntries ?? {}, migrationKey)) {
       batches += 1;
       if (batches === 2) {
         expect(params.entries).not.toHaveProperty(migrationKey);
-        await first.context.gateway.snapshot.client!.request("users.prefs.set", {
-          entries: {
-            [migrationKey]: true,
-            "new-session.v1:main": { ...preference, worktreeName: "" },
-          },
+        await setEntries(first, {
+          [migrationKey]: true,
+          [mainKey]: { ...prefs.preference, worktreeName: "" },
         });
       }
     }
@@ -126,17 +131,14 @@ it("honors another completed marker before a later non-final import batch", asyn
 it.each([false, true])(
   "rebases migration conflicts on authoritative values (exhausted: %s)",
   async (exhausted) => {
-    const preference = seedBrowserPreferences(1);
-    const prefs = identityPreferences(true, undefined, {});
+    const prefs = migration(1);
     let attempts = 0;
     prefs.beforeSave.mockImplementation(async (params) => {
       if (params.entries[migrationKey] === true && (exhausted || attempts === 0)) {
         attempts += 1;
-        await first.context.gateway.snapshot.client!.request("users.prefs.set", {
-          entries: {
-            ...(exhausted ? { [migrationKey]: attempts } : {}),
-            "new-session.v1:main": { ...preference, worktreeName: `newer-${attempts}` },
-          },
+        await setEntries(first, {
+          ...(exhausted ? { [migrationKey]: attempts } : {}),
+          [mainKey]: { ...prefs.preference, worktreeName: `newer-${attempts}` },
         });
       }
     });
@@ -150,19 +152,17 @@ it.each([false, true])(
       expect(prefs.stored("agent-00")).toBeUndefined();
     } else {
       expect(prefs.stored("agent-00")).toMatchObject({ worktreeName: "first-task" });
-      expect(
-        await first.context.gateway.snapshot.client!.request("users.prefs.get", {}),
-      ).toMatchObject({ entries: { [migrationKey]: true } });
+      expect(await getEntries(first)).toMatchObject({ entries: { [migrationKey]: true } });
     }
   },
 );
 
 it("does not publish browser fallback when a conflict reread fails", async () => {
-  const preference = seedBrowserPreferences();
-  const prefs = identityPreferences(true, undefined, {});
+  const prefs = migration();
   prefs.beforeSave.mockImplementationOnce(async () => {
-    await first.context.gateway.snapshot.client!.request("users.prefs.set", {
-      entries: { [migrationKey]: true, "new-session.v1:main": { ...preference, worktreeName: "" } },
+    await setEntries(first, {
+      [migrationKey]: true,
+      [mainKey]: { ...prefs.preference, worktreeName: "" },
     });
     prefs.beforeRead.mockRejectedValue(new Error("preference read unavailable"));
   });
@@ -173,8 +173,7 @@ it("does not publish browser fallback when a conflict reread fails", async () =>
 });
 
 it("keeps browser fallback after a non-conflict partial migration failure", async () => {
-  seedBrowserPreferences(33);
-  const prefs = identityPreferences(true, undefined, {});
+  const prefs = migration(33);
   prefs.beforeSave.mockImplementation(async (params) => {
     if (params.entries[migrationKey] === true) {
       throw new Error("preference save unavailable");
@@ -185,14 +184,13 @@ it("keeps browser fallback after a non-conflict partial migration failure", asyn
   expect(prefs.stored("agent-00")).toMatchObject({ worktreeName: "first-task" });
   expect(prefs.stored()).toBeUndefined();
   expect(first.gateway.readPreference("main")).toMatchObject({ worktreeName: "first-task" });
-  expect(await first.context.gateway.snapshot.client!.request("users.prefs.get", {})).toMatchObject(
-    { entries: { "new-session.v1:agent-00": expect.any(Object) } },
-  );
+  expect(await getEntries(first)).toMatchObject({
+    entries: { "new-session.v1:agent-00": expect.any(Object) },
+  });
 });
 
 it("does not publish a rejected old migration into a replacement identity scope", async () => {
-  seedBrowserPreferences();
-  const prefs = identityPreferences(true, undefined, {});
+  const prefs = migration();
   const started = createDeferred();
   const release = createDeferred();
   prefs.beforeSave.mockImplementationOnce(async () => {

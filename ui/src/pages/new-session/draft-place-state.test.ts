@@ -8,6 +8,7 @@ import { DraftCloudMachineState } from "./draft-cloud-machine-state.ts";
 import { buildSelectedSessionCreateParams } from "./draft-create-params.ts";
 import { createRepositoryFixture } from "./draft-place-state.test-support.ts";
 import { renderControl } from "./model-control.test-support.ts";
+import type { NewSessionPreference } from "./preferences.ts";
 
 const REMOTE_PROJECT = {
   identity: "openclaw/openclaw",
@@ -17,6 +18,14 @@ const REMOTE_PROJECT = {
 
 function createParams(state: ReturnType<typeof createRepositoryFixture>["state"], message = "") {
   return buildSelectedSessionCreateParams(state, { message, visibility: "normal" });
+}
+
+function pendingRepository(preference: NewSessionPreference) {
+  const fixture = createRepositoryFixture({ workspaceGit: true });
+  const discovery = createDeferred<WorktreesBranchesResult>();
+  fixture.request.mockReturnValue(discovery.promise);
+  fixture.readPreference.mockReturnValue(preference);
+  return { ...fixture, discovery };
 }
 
 function machineProfile(id = "aws", machines = ["standard", "fast"]): DraftCloudProfile {
@@ -124,8 +133,7 @@ describe("DraftPlaceState repository selection", () => {
     f.state.selectProjectId("old");
     f.state.selectProjectId("current");
     await settled.promise;
-    expect(f.state.worktree).toBe(false);
-    expect(f.state.currentCheckoutUnavailableReason).toBeUndefined();
+    expect(f.state).toMatchObject({ worktree: false, currentCheckoutUnavailableReason: undefined });
     old.resolve({ current: false, worktree: true });
     await old.promise;
     expect(f.browser.projectId).toBe("current");
@@ -191,10 +199,7 @@ describe("DraftPlaceState repository selection", () => {
 
     expect(restored.browser.remoteProject).toEqual(REMOTE_PROJECT);
     expect(restored.state).toMatchObject({ baseRef: "main", cloudProfileId: "aws" });
-    expect(restored.state.remoteRepository).toEqual({
-      url: REMOTE_PROJECT.cloneUrl,
-      ref: "main",
-    });
+    expect(restored.state.remoteRepository).toEqual({ url: REMOTE_PROJECT.cloneUrl, ref: "main" });
     expect(restored.state.placementPreferenceReady).toBe(true);
   });
 
@@ -297,18 +302,14 @@ describe("DraftPlaceState repository selection", () => {
   });
 
   it("captures pending placement preferences instead of transient discovery defaults", () => {
-    const { state, request, readPreference } = createRepositoryFixture({ workspaceGit: true });
-    const discovery = createDeferred<WorktreesBranchesResult>();
-    request.mockReturnValue(discovery.promise);
-    readPreference.mockReturnValue({
+    const { state, discovery } = pendingRepository({
       worktree: true,
       where: { kind: "device", id: "desktop" },
       projectId: "pending-project",
       baseRef: "release/next",
     });
     state.adoptAgentDefaults();
-    expect(state.placementPreferenceReady).toBe(false);
-    expect(state.worktree).toBe(false);
+    expect(state).toMatchObject({ placementPreferenceReady: false, worktree: false });
     expect(state.preferenceSelection()).toMatchObject({
       worktree: true,
       where: { kind: "device", id: "desktop" },
@@ -349,8 +350,7 @@ describe("DraftPlaceState repository selection", () => {
 
       expect(state.freshWorkspace).toBe(!explicitFolder);
       if (explicitFolder) {
-        expect(state.remotePlacement).toBe(true);
-        expect(state.folder).toBe("/chosen/project");
+        expect(state).toMatchObject({ remotePlacement: true, folder: "/chosen/project" });
       } else {
         expect(state.placementPreferenceReady).toBe(true);
         expect(create()).toEqual({
@@ -380,10 +380,7 @@ describe("DraftPlaceState repository selection", () => {
   );
 
   it("restores an explicit empty workspace across reconnect without waiting for Git", () => {
-    const { state, readPreference, request } = createRepositoryFixture({ workspaceGit: true });
-    const discovery = createDeferred<WorktreesBranchesResult>();
-    request.mockReturnValue(discovery.promise);
-    readPreference.mockReturnValue({
+    const { state } = pendingRepository({
       freshWorkspace: true,
       where: { kind: "cloud", id: "aws" },
       worktree: true,
@@ -402,10 +399,7 @@ describe("DraftPlaceState repository selection", () => {
   it.each(["device", "cloud"] as const)(
     "preserves a legacy %s worktree preference until New workspace is explicitly selected",
     async (destination) => {
-      const { state, request, readPreference } = createRepositoryFixture({ workspaceGit: true });
-      const discovery = createDeferred<WorktreesBranchesResult>();
-      request.mockReturnValue(discovery.promise);
-      readPreference.mockReturnValue({
+      const { state, discovery } = pendingRepository({
         workspace: "/workspace",
         folder: "/workspace",
         where:
@@ -458,9 +452,11 @@ describe("DraftPlaceState repository selection", () => {
       } else {
         state.selectDevice(destination === "device" ? "desktop" : "");
       }
-      expect(state.autoDevice).toBe(false);
-      expect(state.deviceId).toBe(destination === "device" ? "desktop" : "");
-      expect(state.cloudProfileId).toBe(destination === "cloud" ? "aws" : "");
+      expect(state).toMatchObject({
+        autoDevice: false,
+        deviceId: destination === "device" ? "desktop" : "",
+        cloudProfileId: destination === "cloud" ? "aws" : "",
+      });
       expect(browser.popoverOpen("where")).toBe(destination === "cloud");
     },
   );
@@ -683,8 +679,7 @@ describe("DraftPlaceState repository selection", () => {
           cloneUrl: REMOTE_PROJECT.cloneUrl,
         });
         expect(state.worktreeAvailable()).toBe(true);
-        expect(state.checkoutVisible).toBe(true);
-        expect(state.worktree).toBe(false);
+        expect(state).toMatchObject({ checkoutVisible: true, worktree: false });
         state.selectWorktree(true);
         expect(state.worktree).toBe(true);
       }
@@ -760,17 +755,13 @@ describe("DraftPlaceState repository selection", () => {
     state.adoptAgentDefaults();
     expect(state.repository.kind).toBe("direct");
     state.selectCloudProfile("aws");
-    expect(state.freshWorkspace).toBe(true);
-    expect(state.worktree).toBe(true);
-    expect(state.checkoutVisible).toBe(false);
+    expect(state).toMatchObject({ freshWorkspace: true, worktree: true, checkoutVisible: false });
     state.applyFolder("/workspace");
-    expect(state.freshWorkspace).toBe(false);
-    expect(state.checkoutVisible).toBe(false);
+    expect(state).toMatchObject({ freshWorkspace: false, checkoutVisible: false });
 
     state.clearCloudProfile();
 
-    expect(state.worktree).toBe(false);
-    expect(state.checkoutVisible).toBe(false);
+    expect(state).toMatchObject({ worktree: false, checkoutVisible: false });
     expect(state.preferenceSelection().worktree).toBe(false);
     expect(createParams(state, "notes")).not.toHaveProperty("worktree");
   });
@@ -898,53 +889,45 @@ describe("DraftPlaceState cloud machine selection", () => {
     expect(state.cloudSelection.machineClass).toBe("");
   });
 
-  it.each([
-    {
-      name: "preserves a recovered one-mode cloud profile when the runtime becomes incompatible",
-      executionModes: ["worker-turn"] as const,
-      selectedByUser: false,
-    },
-    {
-      name: "preserves an explicitly chosen one-mode cloud profile when the runtime becomes incompatible",
-      executionModes: ["worker-turn"] as const,
-      selectedByUser: true,
-    },
-  ])("$name", ({ executionModes, selectedByUser }) => {
-    const cloudProfiles = [{ ...machineProfile(), executionModes }];
-    const { state, persistPreference } = createRepositoryFixture({ cloudProfiles });
-    const resolveRuntime = vi.spyOn(state.modelControl, "resolveAgentRuntime");
-    resolveRuntime.mockReturnValue({
-      id: "openclaw",
-      cloudPlacementSupported: true,
-      cloudPlacementExecutionMode: "worker-turn",
-      source: "model",
-    });
-    if (selectedByUser) {
-      vi.spyOn(state, "isAdmin").mockReturnValue(true);
-      vi.spyOn(state, "worktreeAvailable").mockReturnValue(true);
-      state.selectCloudProfile("aws");
-      state.cloudMachines.select("aws", "fast", cloudProfiles);
-      persistPreference.mockClear();
-    } else {
-      state.applyPendingPlacement({ agentId: "main", profileId: "aws", machineClass: "fast" });
-    }
-    state.restorePreferenceSelections();
-    expect(state.cloudProfileId).toBe("aws");
-    expect(state.cloudSelection.machineClass).toBe("fast");
+  it.each([false, true])(
+    "retains an incompatible cloud choice (user-selected: %s)",
+    (selectedByUser) => {
+      const cloudProfiles = [{ ...machineProfile(), executionModes: ["worker-turn"] as const }];
+      const { state, persistPreference } = createRepositoryFixture({ cloudProfiles });
+      const resolveRuntime = vi.spyOn(state.modelControl, "resolveAgentRuntime");
+      resolveRuntime.mockReturnValue({
+        id: "openclaw",
+        cloudPlacementSupported: true,
+        cloudPlacementExecutionMode: "worker-turn",
+        source: "model",
+      });
+      if (selectedByUser) {
+        vi.spyOn(state, "isAdmin").mockReturnValue(true);
+        vi.spyOn(state, "worktreeAvailable").mockReturnValue(true);
+        state.selectCloudProfile("aws");
+        state.cloudMachines.select("aws", "fast", cloudProfiles);
+        persistPreference.mockClear();
+      } else {
+        state.applyPendingPlacement({ agentId: "main", profileId: "aws", machineClass: "fast" });
+      }
+      state.restorePreferenceSelections();
+      expect(state.cloudProfileId).toBe("aws");
+      expect(state.cloudSelection.machineClass).toBe("fast");
 
-    resolveRuntime.mockReturnValue({
-      id: "codex",
-      cloudPlacementSupported: true,
-      cloudPlacementExecutionMode: "remote-exec",
-      source: "model",
-    });
-    state.restorePreferenceSelections();
+      resolveRuntime.mockReturnValue({
+        id: "codex",
+        cloudPlacementSupported: true,
+        cloudPlacementExecutionMode: "remote-exec",
+        source: "model",
+      });
+      state.restorePreferenceSelections();
 
-    expect(state.cloudProfileId).toBe("aws");
-    expect(state.cloudSelection.machineClass).toBe("fast");
-    expect(state.worktree).toBe(true);
-    expect(persistPreference).not.toHaveBeenCalled();
-  });
+      expect(state.cloudProfileId).toBe("aws");
+      expect(state.cloudSelection.machineClass).toBe("fast");
+      expect(state.worktree).toBe(true);
+      expect(persistPreference).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("device folder selection", () => {
@@ -996,16 +979,14 @@ describe("device folder selection", () => {
     expect(f.state.folderSubmissionBlocked()).toBe(true);
     f.state.setDeviceFolderPath("/srv/existing project");
     expect(f.state.folderSubmissionBlocked()).toBe(false);
-    expect(f.state.worktree).toBe(false);
-    expect(f.state.checkoutVisible).toBe(false);
+    expect(f.state).toMatchObject({ worktree: false, checkoutVisible: false });
     expect(f.request).not.toHaveBeenCalled();
     expect(f.persistPreference).not.toHaveBeenCalled();
     expect(createParams(f.state, "hello")).toMatchObject({
       deviceFolder: { deviceId: "desktop", path: "/srv/existing project" },
     });
     f.state.selectDevice("", true);
-    expect(f.state.deviceFolderAvailable).toBe(false);
-    expect(f.state.deviceFolder).toBeUndefined();
+    expect(f.state).toMatchObject({ deviceFolderAvailable: false, deviceFolder: undefined });
   });
 
   it("blocks a selected device folder when current capability is withdrawn", () => {
@@ -1019,7 +1000,6 @@ describe("device folder selection", () => {
     expect(f.state.folderSubmissionBlocked()).toBe(true);
     expect(f.state.deviceFolder).toEqual({ deviceId: "desktop", path: "/srv/project" });
     f.state.selectNewWorkspace();
-    expect(f.state.deviceFolder).toBeUndefined();
-    expect(f.state.freshWorkspace).toBe(true);
+    expect(f.state).toMatchObject({ deviceFolder: undefined, freshWorkspace: true });
   });
 });

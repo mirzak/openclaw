@@ -48,9 +48,14 @@ function createParamsOf(context: ApplicationContext, index = 0) {
   return vi.mocked(context.sessions.createResult).mock.calls[index]?.[0];
 }
 
+function expectCreated(context: ApplicationContext, params: Record<string, unknown>) {
+  expect(context.sessions.createResult).toHaveBeenCalledWith(expect.objectContaining(params), {
+    reconciliation: "background",
+  });
+}
+
 function expectEmptyDraft(flow: ReturnType<typeof createDraftFixture>["flow"]) {
-  expect(flow.message).toBe("");
-  expect(flow.mentions).toEqual([]);
+  expect(flow).toMatchObject({ message: "", mentions: [] });
   expect(flow.attachmentDraft.attachments).toEqual([]);
 }
 
@@ -91,30 +96,31 @@ describe("DraftSubmissionFlow", () => {
       await flow.submit();
 
       if (storage !== "unavailable before create") {
-        expect(context.sessions.createResult).toHaveBeenCalledExactlyOnceWith(
-          expect.objectContaining({
-            agentId: "main",
-            message: "",
-            worktree: true,
-            model: "openai/gpt-5.6-sol",
-            agentRuntime: "codex",
-          }),
-          { reconciliation: "background" },
-        );
+        expect(context.sessions.createResult).toHaveBeenCalledOnce();
+        expectCreated(context, {
+          agentId: "main",
+          message: "",
+          worktree: true,
+          model: "openai/gpt-5.6-sol",
+          agentRuntime: "codex",
+        });
         if (storage === "available") {
           expect(context.placementStartup.start).toHaveBeenCalledOnce();
         } else {
           expect(context.placementStartup.start).not.toHaveBeenCalled();
-          expect(flow.error).toBe(
-            "The session was created, but startup needs attention: placement recovery storage is unavailable",
-          );
-          expect(flow.message).toBe("Keep my model and runtime");
+          expect(flow).toMatchObject({
+            error:
+              "The session was created, but startup needs attention: placement recovery storage is unavailable",
+            message: "Keep my model and runtime",
+          });
         }
       } else {
         expect(context.sessions.createResult).not.toHaveBeenCalled();
         expect(context.placementStartup.start).not.toHaveBeenCalled();
-        expect(flow.error).toBe("Couldn't prepare session recovery. Your draft has been kept.");
-        expect(flow.message).toBe("Keep my model and runtime");
+        expect(flow).toMatchObject({
+          error: "Couldn't prepare session recovery. Your draft has been kept.",
+          message: "Keep my model and runtime",
+        });
       }
       flow.disconnect();
     },
@@ -197,9 +203,11 @@ describe("DraftSubmissionFlow", () => {
       initialRun: { status: "started", runId: "created-run" },
     });
     await pending;
-    expect(flow.message).toBe(mode === "navigation" ? "a newer prompt" : "");
-    expect(flow.submitting).toBe(false);
-    expect(flow.pendingMessage).toBeNull();
+    expect(flow).toMatchObject({
+      message: mode === "navigation" ? "a newer prompt" : "",
+      submitting: false,
+      pendingMessage: null,
+    });
     expect(clear).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         scope: expect.objectContaining({ scopeKey: "original-route" }),
@@ -366,14 +374,11 @@ describe("DraftSubmissionFlow", () => {
     context.gateway.snapshot.phase = "connected";
     await vi.advanceTimersByTimeAsync(1_000);
 
-    expect(context.sessions.createResult).toHaveBeenCalledWith(
-      expect.objectContaining({
-        agentId: "main",
-        message: "@Alex start this in the background",
-        mentions: alex,
-      }),
-      { reconciliation: "background" },
-    );
+    expectCreated(context, {
+      agentId: "main",
+      message: "@Alex start this in the background",
+      mentions: alex,
+    });
     expect(context.navigateAndWait).not.toHaveBeenCalled();
     expect(request).toHaveBeenCalledWith(
       "agent.wait",
@@ -398,9 +403,7 @@ describe("DraftSubmissionFlow", () => {
         mimeType: "text/plain",
       },
     });
-    expect(flow.message).toBe("");
-    expect(flow.mentions).toEqual([]);
-    expect(flow.submitting).toBe(false);
+    expect(flow).toMatchObject({ message: "", mentions: [], submitting: false });
   });
 
   it.each([false, true])(
@@ -571,12 +574,7 @@ describe("DraftSubmissionFlow", () => {
     expect(flow.message).toBe("@Alex recovered cloud prompt");
     expect(flow.mentions).toEqual(alex);
     expect(buildChatApiAttachments(flow.attachmentDraft.attachments)).toEqual([
-      {
-        type: "file",
-        mimeType: "text/plain",
-        fileName: "recovered.txt",
-        content: "cmVjb3ZlcmVk",
-      },
+      { type: "file", mimeType: "text/plain", fileName: "recovered.txt", content: "cmVjb3ZlcmVk" },
     ]);
     flow.attachmentDraft.reset();
   });
@@ -673,15 +671,12 @@ describe("DraftSubmissionFlow", () => {
     const submitted = flow.submit();
     const duplicate = flow.submit();
     await vi.waitFor(() => expect(context.sessions.createResult).toHaveBeenCalledOnce());
-    expect(context.sessions.createResult).toHaveBeenCalledWith(
-      expect.objectContaining({
-        agentId: "main",
-        message,
-        projectGitUrl: "https://github.com/openclaw/openclaw.git",
-        attachments: [expect.objectContaining({ fileName: "note.txt", mimeType: "text/plain" })],
-      }),
-      { reconciliation: "background" },
-    );
+    expectCreated(context, {
+      agentId: "main",
+      message,
+      projectGitUrl: REMOTE_PROJECT.cloneUrl,
+      attachments: [expect.objectContaining({ fileName: "note.txt", mimeType: "text/plain" })],
+    });
     expect(request).not.toHaveBeenCalledWith("projects.add", expect.anything(), expect.anything());
     expect(createParamsOf(context)?.worktree).toBe(worktree || undefined);
 
