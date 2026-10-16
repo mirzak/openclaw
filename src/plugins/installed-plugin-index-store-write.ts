@@ -208,7 +208,7 @@ function writePersistedInstalledPluginIndexRow(
   database: EngineConnection,
   index: InstalledPluginIndex,
   revision: number,
-): void {
+): InstalledPluginIndexRow {
   const persistedIndex = {
     version: index.version,
     warning: index.warning ?? INSTALLED_PLUGIN_INDEX_WARNING,
@@ -242,14 +242,15 @@ function writePersistedInstalledPluginIndexRow(
     revision,
     index: persistedIndex,
   } satisfies PersistedInstalledPluginIndexValue);
+  const row: InstalledPluginIndexRow = {
+    state_key: INSTALLED_PLUGIN_INDEX_STATE_KEY,
+    value_json: valueJson,
+    updated_at_ms: revision,
+  };
   const { compiled, bind } = compileSqliteQueryBindings<void>(() =>
     getNodeSqliteKysely<InstalledPluginIndexDatabase>(database)
       .insertInto("config_machine_state")
-      .values({
-        state_key: INSTALLED_PLUGIN_INDEX_STATE_KEY,
-        value_json: valueJson,
-        updated_at_ms: revision,
-      })
+      .values(row)
       .onConflict((conflict) =>
         conflict.column("state_key").doUpdateSet((eb) => ({
           value_json: eb.ref("excluded.value_json"),
@@ -259,6 +260,7 @@ function writePersistedInstalledPluginIndexRow(
   );
   // sqlite-allow-raw: Serialization precedes native prepare; the caller owns rollback.
   database.prepare(compiled.sql).run(...bind());
+  return row;
 }
 
 export function writePersistedInstalledPluginIndexToSqlite(
@@ -296,12 +298,7 @@ export function writePersistedInstalledPluginIndexToSqlite(
       const revision = resolveNextInstalledPluginIndexRevision(
         previousRow ? previousRow.revision : null,
       );
-      writePersistedInstalledPluginIndexRow(db, persisted, revision);
-      // Capture inside the same transaction; later reads could include another writer's work.
-      const after = readInstalledPluginIndexRow(db);
-      if (!after) {
-        throw new Error("Installed plugin index write did not persist its row");
-      }
+      const after = writePersistedInstalledPluginIndexRow(db, persisted, revision);
       lease.assertOwnedInTransaction(db, "commit");
       return {
         previous: previousRow ? parseInstalledPluginIndex(previousRow.index) : null,
