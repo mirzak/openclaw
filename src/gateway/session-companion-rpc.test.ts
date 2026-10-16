@@ -31,11 +31,7 @@ afterEach(() => {
 async function invoke(
   method: "ask" | "state" | "reset",
   params: unknown,
-  companion: {
-    ask?: ReturnType<typeof vi.fn>;
-    state?: ReturnType<typeof vi.fn>;
-    reset?: ReturnType<typeof vi.fn>;
-  },
+  companion: Partial<Record<"ask" | "state" | "reset", ReturnType<typeof vi.fn>>>,
   {
     client = { connId: "conn-1" },
     signal,
@@ -82,8 +78,8 @@ const createDraft = (sessionKey: string, sessionId: string, profileId: string | 
   upsertSessionEntryCore({ agentId: "main", sessionKey }, sessionEntry(sessionId, profileId));
 const viewer = (label: string, connId: string) => ({ ...roleClient("view", label), connId });
 
-it("keeps a memory incognito source current through operator authority for durable side chat writes", async () => {
-  await withProfiles(async () => {
+it("keeps a memory incognito source current through operator authority for durable side chat writes", () =>
+  withProfiles(async () => {
     const profile = ensureProfileForEmail("incognito-companion@example.test");
     const client = {
       ...sharingPolicyClient({ user: profile.id, scopes: ["operator.admin"] }),
@@ -122,7 +118,6 @@ it("keeps a memory incognito source current through operator authority for durab
     const ask = vi.fn(async (request: Parameters<SessionCompanionService["ask"]>[0]) => {
       const authority = expectDefined(request.operatorAuthority, "Captured operator authority");
       expect(authority.profileId).toBe(profile.id);
-      // The captured authority composes the real RPC source through the operator owner.
       await patchSessionEntryCore(target, () => ({ label: "private source accepted" }), {
         workerGuard: { source: authority.assertCurrent },
       });
@@ -138,8 +133,7 @@ it("keeps a memory incognito source current through operator authority for durab
     expect(ask).toHaveBeenCalledOnce();
     success(respond, { answer: "Private source accepted.", ts: 125 });
     expect(loadSessionEntry(target)?.label).toBe("private source accepted");
-  });
-});
+  }));
 
 it("carries the authenticated model policy and releases it after answering", async () => {
   const controller = new AbortController();
@@ -325,10 +319,7 @@ it("reads companion visibility while an unrelated writer remains admitted", asyn
       const [visible, hidden] = await withinTest(Promise.all(reads), signal);
       success(visible, { exchanges });
       expectError(hidden, "INVALID_REQUEST");
-      expect(state).toHaveBeenCalledExactlyOnceWith({
-        agentId: "main",
-        sessionKey: keys[0],
-      });
+      expect(state).toHaveBeenCalledExactlyOnceWith({ agentId: "main", sessionKey: keys[0] });
     } finally {
       release.resolve();
       await Promise.allSettled([writer, ...reads]);

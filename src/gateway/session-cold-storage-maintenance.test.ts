@@ -107,51 +107,47 @@ it("picks up enabled and changed age settings without recreating the scheduler",
   expect(sweep).toHaveBeenCalledTimes(2);
 });
 
-it("coalesces manual and periodic work and rejects commits after a config change", async () => {
-  config = { session: { maintenance: { coldStorage: { enabled: true, afterDays: 30 } } } };
+it.each([
+  ["periodic", "config"],
+  ["periodic", "shutdown"],
+  ["manual", "shutdown"],
+] as const)("drains a %s sweep after %s cancellation", async (trigger, cancellation) => {
+  if (cancellation === "config") {
+    config = { session: { maintenance: { coldStorage: { enabled: true, afterDays: 30 } } } };
+  }
   const { completion, started } = blockSweep();
-  const running = clock.wake();
-  requestGatewaySessionColdStorageMaintenance(getRuntimeConfig);
-  void clock.advanceBy(180_000);
+  const running =
+    trigger === "manual"
+      ? requestGatewaySessionColdStorageMaintenance(getRuntimeConfig)
+      : clock.wake();
+  if (cancellation === "config") {
+    requestGatewaySessionColdStorageMaintenance(getRuntimeConfig);
+    void clock.advanceBy(180_000);
+  }
   await started.promise;
   expect(sweep).toHaveBeenCalledTimes(1);
-
-  config = { session: { maintenance: { coldStorage: { enabled: false } } } };
-  completion.resolve({ archivedTranscripts: 1 });
-  await running;
-  expect(onError).toHaveBeenCalledOnce();
-  expect(getSessionColdStorageMaintenanceStatus(getRuntimeConfig)).toMatchObject({
-    running: false,
-    archivedTranscripts: 0,
-    lastError: expect.stringContaining("canceled"),
-  });
-  await clock.advanceBy(60_000);
-  expect(sweep).toHaveBeenCalledTimes(1);
-});
-
-it.each(["periodic", "manual"] as const)(
-  "waits for an admitted %s worker to relinquish its writer before shutdown completes",
-  async (trigger) => {
-    const { completion, started } = blockSweep();
-    if (trigger === "periodic") {
-      void clock.wake();
-    } else {
-      requestGatewaySessionColdStorageMaintenance(getRuntimeConfig);
-    }
-    await started.promise;
-    let drained = false;
-    const stopped = maintenance.stop().then(() => {
-      drained = true;
+  if (cancellation === "config") {
+    config = { session: { maintenance: { coldStorage: { enabled: false } } } };
+    completion.resolve({ archivedTranscripts: 1 });
+    await running;
+    expect(onError).toHaveBeenCalledOnce();
+    expect(getSessionColdStorageMaintenanceStatus(getRuntimeConfig)).toMatchObject({
+      running: false,
+      archivedTranscripts: 0,
+      lastError: expect.stringContaining("canceled"),
     });
+  } else {
+    const drained = vi.fn();
+    const stopped = maintenance.stop().then(drained);
     await Promise.resolve();
-    expect(drained).toBe(false);
+    expect(drained).not.toHaveBeenCalled();
     completion.resolve({ archivedTranscripts: 1 });
     await stopped;
-    expect(drained).toBe(true);
-    await clock.advanceBy(120_000);
-    expect(sweep).toHaveBeenCalledTimes(1);
-  },
-);
+    expect(drained).toHaveBeenCalledOnce();
+  }
+  await clock.advanceBy(cancellation === "config" ? 60_000 : 120_000);
+  expect(sweep).toHaveBeenCalledTimes(1);
+});
 
 it("acknowledges Run now before worker completion and exposes committed progress after failure", async () => {
   const progress = { archivedTranscripts: 1, externalizedTranscripts: 2 };

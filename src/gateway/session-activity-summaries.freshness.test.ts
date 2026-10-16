@@ -37,12 +37,11 @@ const recap = "Completed the requested work.";
 const complete = vi.fn<typeof defaultCompleteModel>();
 const changed = vi.fn();
 const read = () => loadSessionEntryReadOnly(scope);
-const view = ({
+const view = (
   entry = read(),
   watermark = readSessionTranscriptWatermark(scope),
-  ...overrides
-}: Partial<Parameters<typeof projectSessionActivitySummary>[0]> = {}) =>
-  projectSessionActivitySummary({ ...target, cfg, entry, watermark, ...overrides });
+  enabled?: boolean,
+) => projectSessionActivitySummary({ ...target, cfg, entry, watermark, enabled });
 const createService = () =>
   createSessionActivitySummaries({
     scheduler: createTestGatewayScheduler(),
@@ -130,18 +129,14 @@ it("prepares recap freshness off thread and observes an in-process transcript ap
   try {
     await service.ensure(target, entry);
     const before = await readSessionTranscriptWatermarkAsync(scope);
-    expect(view({ entry, enabled: true, watermark: before })?.state).toBe("current");
+    expect(view(entry, before, true)?.state).toBe("current");
     await messages(1, 1);
     const after = await readSessionTranscriptWatermarkAsync(scope);
     expect(after.maxSeq).toBeGreaterThan(before.maxSeq!);
-    expect(view({ entry, enabled: true, watermark: after })?.state).toBe("stale");
-    expect(
-      observed.queries.filter((sql) =>
-        /transcript_events|transcript_rewrite_watermarks|session_transcript_cold_archives/i.test(
-          sql,
-        ),
-      ),
-    ).toEqual([]);
+    expect(view(entry, after, true)?.state).toBe("stale");
+    expect(observed.queries.join("\n")).not.toMatch(
+      /transcript_events|transcript_rewrite_watermarks|session_transcript_cold_archives/i,
+    );
   } finally {
     observed.restore();
   }

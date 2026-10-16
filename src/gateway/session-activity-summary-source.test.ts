@@ -47,33 +47,34 @@ function summaryFacts(source: SessionActivitySummaryBatchResult) {
   };
 }
 
-it("reuses complete actor context with the worker's byte bounds, anchors and role-aware omissions", async () => {
-  await withActor(async (f) => {
+it("reuses complete actor context with the worker's byte bounds, anchors and role-aware omissions", () =>
+  withActor(async (f) => {
     if (f.target.database.kind !== "file") {
       throw new Error("Summary replica fixture requires a durable actor");
     }
-    const makeEvent = (index: number, message: { role: string; content: string }) => ({
+    const makeEvent = (index: number, role: string, content: string) => ({
       type: "message",
       id: `message-${index}`,
       parentId: index === 0 ? "runtime-context" : `message-${index - 1}`,
       timestamp: "2026-01-01T00:00:00Z",
-      message,
+      message: { role, content },
     });
-    const exactCapEvent = makeEvent(5, { role: "assistant", content: "" });
+    const exactCapEvent = makeEvent(5, "assistant", "");
     exactCapEvent.message.content = "x".repeat(
       128 * 1024 - 1 - Buffer.byteLength(JSON.stringify(exactCapEvent)),
     );
-    const content = [
-      { role: "toolResult", content: "t".repeat(128 * 1024) },
-      { role: "user", content: "Small question" },
-      { role: "assistant", content: "a".repeat(128 * 1024) },
-      { role: "user", content: "é".repeat(40 * 1024) },
-      { role: "assistant", content: "é".repeat(40 * 1024) },
-      exactCapEvent.message,
-      { ...exactCapEvent.message, content: `${exactCapEvent.message.content}x` },
-      ...Array.from({ length: 64 }, (_, index) => ({ role: "user", content: `Question ${index}` })),
+    const events = [
+      makeEvent(0, "toolResult", "t".repeat(128 * 1024)),
+      makeEvent(1, "user", "Small question"),
+      makeEvent(2, "assistant", "a".repeat(128 * 1024)),
+      makeEvent(3, "user", "é".repeat(40 * 1024)),
+      makeEvent(4, "assistant", "é".repeat(40 * 1024)),
+      exactCapEvent,
+      makeEvent(6, "assistant", `${exactCapEvent.message.content}x`),
+      ...Array.from({ length: 64 }, (_, index) =>
+        makeEvent(index + 7, "user", `Question ${index}`),
+      ),
     ];
-    const events = content.map((message, index) => makeEvent(index, message));
     runSqliteImmediateTransactionSync(f.database.db, () => {
       writeSessionEntry(f.database, f.target.sessionKey, {
         sessionId: f.scope.sessionId,
@@ -152,6 +153,8 @@ it("reuses complete actor context with the worker's byte bounds, anchors and rol
         page: { scannedMessages: 1, events: selected },
         omitted,
       });
+      const readReplica = (prior?: SessionActivitySummary) =>
+        summaryFacts(readActivitySummaryBatchFromReplica({ scope: f.scope, previous: prior }));
       for (const [prior, expected] of [
         [undefined, page(0, [], false)],
         [previous(1), page(1, [events[1]], false)],
@@ -171,7 +174,7 @@ it("reuses complete actor context with the worker's byte bounds, anchors and rol
         ].map((invalid) => [invalid, { previous: undefined, covered: 0 }] as const),
       ] as const) {
         const input = { scope: f.scope, previous: prior };
-        const resident = summaryFacts(readActivitySummaryBatchFromReplica(input));
+        const resident = readReplica(prior);
         expect(resident).toMatchObject(expected);
         expect(resident).toEqual(summaryFacts(readActivitySummaryBatch(input)));
       }
@@ -194,16 +197,11 @@ it("reuses complete actor context with the worker's byte bounds, anchors and rol
           throw new Error("Expected a selected user message");
         }
         event.message.content = "caller mutation";
-        expect(
-          summaryFacts(
-            readActivitySummaryBatchFromReplica({ scope: f.scope, previous: previous(1) }),
-          ).page.events,
-        ).toEqual([events[1]]);
+        expect(readReplica(previous(1)).page.events).toEqual([events[1]]);
       } finally {
         reads.restore();
       }
     } finally {
       replica.close();
     }
-  });
-});
+  }));

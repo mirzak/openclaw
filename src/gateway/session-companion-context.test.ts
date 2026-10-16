@@ -59,6 +59,17 @@ function turn(
   return { eventId, parentId, message: { role, content, timestamp } };
 }
 
+function chain(
+  count: number,
+  message: (index: number) => readonly [Parameters<typeof turn>[2], string],
+  prefix = "message",
+  parentId: string | null = null,
+) {
+  return Array.from({ length: count }, (_, i) =>
+    turn(`${prefix}-${i}`, i ? `${prefix}-${i - 1}` : parentId, ...message(i), i),
+  );
+}
+
 const persist = (
   scope: ReturnType<typeof createScope>,
   messages: Parameters<typeof persistSessionTranscriptTurn>[1]["messages"],
@@ -225,16 +236,10 @@ it("reads current incognito context without creating missing sessions", async ()
 
 it("reads a bounded active SQLite tail without decoding old transcript rows", async () => {
   const scope = await seedScope("companion-context-tail");
-  const transcript = Array.from({ length: 201 }, (_, index) =>
-    turn(
-      `message-${index}`,
-      index === 0 ? null : `message-${index - 1}`,
-      index % 2 === 0 ? "user" : "assistant",
-      `message ${index}`,
-      index,
-    ),
+  await persist(
+    scope,
+    chain(201, (i) => [i % 2 === 0 ? "user" : "assistant", `message ${i}`]),
   );
-  await persist(scope, transcript);
 
   const database = openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env });
   database.db
@@ -251,18 +256,13 @@ it("reads a bounded active SQLite tail without decoding old transcript rows", as
 
 it("pages past a tool-heavy tail while retaining the selected session's latest user turn", async () => {
   const scope = await seedScope("companion-context-tools");
-  const transcriptMessages = Array.from({ length: 451 }, (_, index) =>
-    turn(
-      `message-${index}`,
-      index === 0 ? null : `message-${index - 1}`,
-      index === 450 ? "user" : index >= 50 ? "toolResult" : index % 2 ? "assistant" : "user",
-      index === 450
-        ? "visible latest question"
-        : `${index < 50 ? "useful" : "tool result"} ${index}`,
-      index,
-    ),
+  await persist(
+    scope,
+    chain(451, (i) => [
+      i === 450 ? "user" : i >= 50 ? "toolResult" : i % 2 ? "assistant" : "user",
+      i === 450 ? "visible latest question" : `${i < 50 ? "useful" : "tool result"} ${i}`,
+    ]),
   );
-  await persist(scope, transcriptMessages);
 
   const messages = await readReady(scope);
   expect(messages).toHaveLength(40);
@@ -272,20 +272,15 @@ it("pages past a tool-heavy tail while retaining the selected session's latest u
 
 it("keeps complete recent context when older tool rows exhaust the scan byte budget", async () => {
   const scope = await seedScope("companion-context-byte-budget");
-  const recentMessages = Array.from({ length: 128 }, (_, index) =>
-    turn(
-      `recent-${index}`,
-      index === 0 ? "older-tool" : `recent-${index - 1}`,
-      index % 9 === 0 ? "user" : "toolResult",
-      index % 9 === 0 ? `useful ${index}` : "x".repeat(7800),
-      index,
-    ),
-  );
-  const transcript = [
+  await persist(scope, [
     turn("older-tool", null, "toolResult", "x".repeat(200_000), -1),
-    ...recentMessages,
-  ];
-  await persist(scope, transcript);
+    ...chain(
+      128,
+      (i) => [i % 9 === 0 ? "user" : "toolResult", i % 9 === 0 ? `useful ${i}` : "x".repeat(7800)],
+      "recent",
+      "older-tool",
+    ),
+  ]);
 
   const messages = await readReady(scope);
   expect(messages.length).toBeGreaterThan(0);
