@@ -48,18 +48,20 @@ function runningGraphics(graphics: BrowserStatus["graphics"]) {
 
 describe("buildBrowserDoctorReport", () => {
   it("reports stopped managed browsers as launchable diagnostics", () => {
-    const report = buildBrowserDoctorReport({
-      platform: "linux",
-      env: { DISPLAY: ":99" },
-      uid: 1000,
-      status: makeStatus(),
-    });
+    const report = reportFor(
+      {},
+      {
+        platform: "linux",
+        env: { DISPLAY: ":99" },
+        uid: 1000,
+      },
+    );
 
     expect(report.ok).toBe(true);
-    const websocketCheck = report.checks.find((check) => check.id === "cdp-websocket");
+    const websocketCheck = report.checks.find((entry) => entry.id === "cdp-websocket");
     expect(websocketCheck?.status).toBe("info");
     expect(websocketCheck?.summary).toBe("Browser is launchable but not running");
-    expect(report.checks.find((check) => check.id === "extension-version")).toBeUndefined();
+    expect(report.checks.find((entry) => entry.id === "extension-version")).toBeUndefined();
   });
 
   it("fails when Chrome MCP attach is not ready", () => {

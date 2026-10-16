@@ -472,40 +472,38 @@ it("cancels a disconnected request before a late model result can commit", async
   expect(harness.service.state(target)).toEqual({
     exchanges: [savedExchange("What is already known?", "existing answer")],
   });
+});
 
-  it("keeps provider failures terminal after one model call", async () => {
-    vi.useFakeTimers();
-    const harness = createHarness({
-      run: async () => {
-        throw new Error("provider unavailable");
-      },
-    });
-
-    await expect(harness.service.ask(askRequest("Can the provider answer?"))).rejects.toMatchObject(
-      {
-        reason: "unavailable",
-      } satisfies Partial<SessionCompanionAskError>,
-    );
-    expect(harness.run).toHaveBeenCalledOnce();
-    expect(harness.service.state({ agentId: "main", sessionKey: "agent:main:main" })).toEqual({
-      exchanges: [],
-    });
-    harness.service.dispose();
+it("keeps provider failures terminal after one model call", async () => {
+  vi.useFakeTimers();
+  const harness = createHarness({
+    run: async () => {
+      throw new Error("provider unavailable");
+    },
   });
 
-  it("clears a thread when the committed gateway reset path notifies", async () => {
-    vi.useFakeTimers();
-    const harness = createHarness();
-    await harness.service.ask(askRequest("Before reset?"));
-    expect(
-      harness.service.state({ agentId: "main", sessionKey: "agent:main:main" }).exchanges,
-    ).toHaveLength(1);
-
-    notifyGatewaySessionReset("agent:main:main", "main");
-
-    expect(harness.service.state({ agentId: "main", sessionKey: "agent:main:main" })).toEqual({
-      exchanges: [],
-    });
-    harness.service.dispose();
+  await expect(harness.service.ask(askRequest("Can the provider answer?"))).rejects.toMatchObject({
+    reason: "unavailable",
+  } satisfies Partial<SessionCompanionAskError>);
+  expect(harness.run).toHaveBeenCalledOnce();
+  expect(harness.service.state({ agentId: "main", sessionKey: "agent:main:main" })).toEqual({
+    exchanges: [],
   });
+  harness.service.dispose();
+});
+
+it("clears a thread when the committed gateway reset path notifies", async () => {
+  vi.useFakeTimers();
+  const harness = createHarness();
+  await harness.service.ask(askRequest("Before reset?"));
+  expect(
+    harness.service.state({ agentId: "main", sessionKey: "agent:main:main" }).exchanges,
+  ).toHaveLength(1);
+
+  notifyGatewaySessionReset("agent:main:main", "main");
+
+  expect(harness.service.state({ agentId: "main", sessionKey: "agent:main:main" })).toEqual({
+    exchanges: [],
+  });
+  harness.service.dispose();
 });

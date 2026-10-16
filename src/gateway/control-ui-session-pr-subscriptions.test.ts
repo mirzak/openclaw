@@ -503,28 +503,21 @@ describe("control UI session PR subscriptions", () => {
 
   it("propagates rate-limit and failure states per key", async () => {
     vi.useFakeTimers();
-    const load = vi.fn(
-      async ({ sessionKey }: { sessionKey: string }): Promise<ControlUiSessionPullRequests> => {
-        if (sessionKey === "limited") {
-          return { pullRequests: [], rateLimited: true };
-        }
-        if (sessionKey === "repository-only") {
-          return {
-            pullRequests: [],
-            repository: { owner: "openclaw", repo: "openclaw" },
-            rateLimited: false,
-            status: "unavailable",
-          };
-        }
-        throw new Error("GitHub unavailable");
-      },
-    );
-    const broadcastToConnIds = vi.fn();
-    active = createTestControlUiSessionPrSubscriptions({
-      broadcastToConnIds,
-      load,
-      scheduler: createTestGatewayScheduler(),
+    const load = vi.fn(async ({ sessionKey }: { sessionKey: string }): Promise<Snapshot> => {
+      if (sessionKey === "limited") {
+        return { pullRequests: [], rateLimited: true };
+      }
+      if (sessionKey === "repository-only") {
+        return {
+          pullRequests: [],
+          repository: { owner: "openclaw", repo: "openclaw" },
+          rateLimited: false,
+          status: "unavailable",
+        };
+      }
+      throw new Error("GitHub unavailable");
     });
+    const active = start({ load });
 
     await active.replace("conn-a", ["limited", "failed", "repository-only"]);
     expect(broadcastToConnIds).toHaveBeenCalledTimes(3);
