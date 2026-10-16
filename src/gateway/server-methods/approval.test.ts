@@ -27,12 +27,14 @@ import {
   cancelUnboundRunApprovals,
 } from "./approval-run-cancellation.js";
 import {
+  bindApprovalHandlers,
+  createHandlers,
+  createFixture,
   cleanupApprovalHandlerFixtures,
   createClient,
   createDatabaseOptions,
   createManagers,
   getOperatorApproval,
-  invoke,
   registerExec,
   tempDirs,
 } from "./approval.handlers.test-support.js";
@@ -44,42 +46,7 @@ import {
 } from "./approval.test-support.js";
 import type { GatewayRequestHandlerOptions } from "./types.js";
 
-const prepareApprovalChannelCustodyMock = vi.hoisted(() => vi.fn());
-
-// mock-isolation: Approval fixtures control custody and config revocation without loading channel runtimes.
-vi.mock("../approval-channel-custody.js", () => ({
-  prepareApprovalChannelCustody: (...args: unknown[]) => {
-    const custody = prepareApprovalChannelCustodyMock(...args);
-    return (
-      custody && {
-        ...custody,
-        isCurrent:
-          custody.isCurrent ??
-          ((request: unknown) => {
-            const input = args[0] as { cfg: unknown; getCfg?: () => unknown };
-            return (!input.getCfg || input.getCfg() === input.cfg) && custody.authorizes(request);
-          }),
-        [Symbol.dispose]() {},
-      }
-    );
-  },
-}));
-
-function createHandlers(
-  managers: ReturnType<typeof createManagers>,
-  databaseOptions: OpenClawStateDatabaseOptions,
-  options: Omit<
-    Parameters<typeof createApprovalHandlers>[0],
-    "execApprovalManager" | "pluginApprovalManager" | "databaseOptions"
-  > = {},
-) {
-  return createApprovalHandlers({
-    execApprovalManager: managers.exec,
-    pluginApprovalManager: managers.plugin,
-    databaseOptions,
-    ...options,
-  });
-}
+vi.mock("../approval-channel-custody.js", () => ({ prepareApprovalChannelCustody: vi.fn() }));
 
 async function registerPlugin(
   manager: ExecApprovalManager<PluginApprovalRequestPayload>,
@@ -111,6 +78,17 @@ async function registerPlugin(
   return { record, decision };
 }
 
+function createForwarder(overrides: Partial<ExecApprovalForwarder>): ExecApprovalForwarder {
+  return {
+    handleRequested: vi.fn(async () => false),
+    handleResolved: vi.fn(async () => {}),
+    handlePluginApprovalRequested: vi.fn(async () => false),
+    handlePluginApprovalResolved: vi.fn(async () => {}),
+    stop: vi.fn(),
+    ...overrides,
+  };
+}
+
 function approvalFromResult(result: unknown) {
   if (!result || typeof result !== "object" || !("approval" in result)) {
     throw new Error("missing approval response");
@@ -125,31 +103,24 @@ describe("unified approval handlers", () => {
   });
 
   it("returns mapped terminal history with attribution and a next cursor", async () => {
-    const databaseOptions = createDatabaseOptions();
-    const managers = createManagers(databaseOptions);
+    const { managers, request } = createFixture();
     const first = await registerExec(managers.exec, { id: "history:first" });
     const second = await registerPlugin(managers.plugin, { id: "history:second" });
-    const handlers = createHandlers(managers, databaseOptions);
+
     for (const [id, kind] of [
       [first.record.id, "exec"],
       [second.record.id, "plugin"],
     ] as const) {
-      const response = await invoke({
-        handlers,
-        method: "approval.resolve",
-        body: { id, kind, decision: "deny" },
-        client: createClient({ deviceId: "reviewer" }),
-      });
+      const response = await request("approval.resolve", { id, kind, decision: "deny" });
       expect(response.ok).toBe(true);
     }
 
-    const firstPage = await invoke({
-      handlers,
-      method: "approval.history",
-      body: { limit: 1 },
-      client: createClient({ deviceId: "reviewer" }),
-      context: createContext("/operator/"),
-    });
+    const firstPage = await request(
+      "approval.history",
+      { limit: 1 },
+      undefined,
+      createContext("/operator/"),
+    );
     expect(firstPage.ok).toBe(true);
     expect(validateApprovalHistoryResult(firstPage.result)).toBe(true);
     const firstResult = firstPage.result as ApprovalHistoryResult;
@@ -162,11 +133,9 @@ describe("unified approval handlers", () => {
     });
     expect(firstResult.nextCursor).toEqual(expect.any(String));
 
-    const secondPage = await invoke({
-      handlers,
-      method: "approval.history",
-      body: { cursor: firstResult.nextCursor, limit: 1 },
-      client: createClient({ deviceId: "reviewer" }),
+    const secondPage = await request("approval.history", {
+      cursor: firstResult.nextCursor,
+      limit: 1,
     });
     expect(secondPage.ok).toBe(true);
     expect((secondPage.result as ApprovalHistoryResult).items).toHaveLength(1);
@@ -174,8 +143,7 @@ describe("unified approval handlers", () => {
   });
 
   it("cancels only approvals owned by the aborted active run", async () => {
-    const databaseOptions = createDatabaseOptions();
-    const managers = createManagers(databaseOptions);
+    const { managers, request } = createFixture();
     const aborted = await registerExec(managers.exec, {
       id: "aborted-run-approval",
       request: { runId: "run-active", toolCallId: "tool-active" },
@@ -211,14 +179,12 @@ describe("unified approval handlers", () => {
       expect.objectContaining({ id: aborted.record.id }),
     );
 
-    const handlers = createHandlers(managers, databaseOptions);
-    const replay = await invoke({
-      handlers,
-      method: "approval.resolve",
-      body: { id: aborted.record.id, kind: "exec", decision: "allow-once" },
-      client: createClient({ deviceId: "later-surface" }),
+    const replay = await request(
+      "approval.resolve",
+      { id: aborted.record.id, kind: "exec", decision: "allow-once" },
+      createClient({ deviceId: "later-surface" }),
       context,
-    });
+    );
     expect(replay.result).toMatchObject({
       applied: false,
       approval: {
@@ -299,8 +265,7 @@ describe("unified approval handlers", () => {
   });
 
   it("resolves a durable deny without reconstructing a raw legacy request", async () => {
-    const databaseOptions = createDatabaseOptions();
-    const managers = createManagers(databaseOptions);
+    const { databaseOptions, request } = createFixture();
     const id = "durable-deny-without-live-request";
     const nowMs = Date.now();
     await insertOperatorApproval({
@@ -319,15 +284,13 @@ describe("unified approval handlers", () => {
       databaseOptions,
     });
     const context = createContext();
-    const handlers = createHandlers(managers, databaseOptions);
 
-    const response = await invoke({
-      handlers,
-      method: "approval.resolve",
-      body: { id, kind: "exec", decision: "deny" },
-      client: createClient({ deviceId: "reviewer" }),
+    const response = await request(
+      "approval.resolve",
+      { id, kind: "exec", decision: "deny" },
+      undefined,
       context,
-    });
+    );
 
     expect(response.ok).toBe(true);
     expect(response.result).toMatchObject({
@@ -350,21 +313,15 @@ describe("unified approval handlers", () => {
       get({ ...params, nowMs: Date.now() }),
     );
     const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
-    const databaseOptions = createDatabaseOptions();
-    const managers = createManagers(databaseOptions);
+    const { managers, request } = createFixture();
     const pending = await registerExec(managers.exec, {
       id: "forward-clock-expiry",
       expiresAtMs: 2_000,
     });
-    const handlers = createHandlers(managers, databaseOptions);
+
     now.mockReturnValue(2_000);
 
-    const response = await invoke({
-      handlers,
-      method: "approval.get",
-      body: { id: pending.record.id },
-      client: createClient({ deviceId: "reviewer" }),
-    });
+    const response = await request("approval.get", { id: pending.record.id });
 
     expect(response.result).toMatchObject({
       approval: { status: "expired", reason: "timeout", resolvedAtMs: 2_000 },
@@ -377,18 +334,11 @@ describe("unified approval handlers", () => {
     ["missing", deleteDurableApproval],
     ["corrupt", corruptDurableApprovalPresentation],
   ] as const)("fails a live waiter closed when durable state is %s", async (_label, mutate) => {
-    const databaseOptions = createDatabaseOptions();
-    const managers = createManagers(databaseOptions);
+    const { databaseOptions, managers, request } = createFixture();
     const pending = await registerExec(managers.exec, { id: `durable-${_label}` });
     mutate(databaseOptions, pending.record.id);
-    const handlers = createHandlers(managers, databaseOptions);
 
-    const response = await invoke({
-      handlers,
-      method: "approval.get",
-      body: { id: pending.record.id },
-      client: createClient({ deviceId: "reviewer" }),
-    });
+    const response = await request("approval.get", { id: pending.record.id });
 
     expect(response).toMatchObject({
       ok: false,
@@ -402,22 +352,19 @@ describe("unified approval handlers", () => {
   });
 
   it("settles the canonical live waiter when a transport-ref lookup finds corrupt state", async () => {
-    const databaseOptions = createDatabaseOptions();
-    const managers = createManagers(databaseOptions);
+    const { databaseOptions, managers, request } = createFixture();
     const pending = await registerExec(managers.exec, { id: "corrupt-through-transport-ref" });
     const durable = await getOperatorApproval({ id: pending.record.id, databaseOptions });
     if (!durable) {
       throw new Error("expected durable approval");
     }
     corruptDurableApprovalPresentation(databaseOptions, pending.record.id);
-    const handlers = createHandlers(managers, databaseOptions);
 
-    const response = await invoke({
-      handlers,
-      method: "approval.resolve",
-      body: { id: durable.resolutionRef, kind: "exec", decision: "allow-once" },
-      client: createClient({ deviceId: "telegram" }),
-    });
+    const response = await request(
+      "approval.resolve",
+      { id: durable.resolutionRef, kind: "exec", decision: "allow-once" },
+      createClient({ deviceId: "telegram" }),
+    );
 
     expect(response).toMatchObject({
       ok: false,
@@ -453,14 +400,9 @@ describe("unified approval handlers", () => {
     await expect(pending.decision).resolves.toBe("deny");
     fs.rmSync(databasePath, { recursive: true });
     fs.renameSync(backupPath, databasePath);
-    const handlers = createHandlers(managers, databaseOptions);
+    const request = bindApprovalHandlers(createHandlers(managers, databaseOptions));
 
-    const response = await invoke({
-      handlers,
-      method: "approval.get",
-      body: { id: pending.record.id },
-      client: createClient({ deviceId: "reviewer" }),
-    });
+    const response = await request("approval.get", { id: pending.record.id });
 
     expect(response.result).toMatchObject({
       approval: {
@@ -491,25 +433,19 @@ describe("unified approval handlers", () => {
     });
     const handlePluginApprovalResolved = vi.fn(async () => {});
     const handlePluginIosPushResolved = vi.fn(async () => {});
-    const forwarder = {
-      handleRequested: vi.fn(async () => false),
-      handleResolved: vi.fn(async () => {}),
-      handlePluginApprovalRequested: vi.fn(async () => false),
-      handlePluginApprovalResolved,
-      stop: vi.fn(),
-    } satisfies ExecApprovalForwarder;
+    const forwarder = createForwarder({ handlePluginApprovalResolved });
     const handlers = createHandlers(managers, databaseOptions, {
       forwarder,
       pluginIosPushDelivery: { handleResolved: handlePluginIosPushResolved },
     });
+    const request = bindApprovalHandlers(handlers);
 
-    const response = await invoke({
-      handlers,
-      method: "approval.resolve",
-      body: { id: pending.record.id, kind: "plugin", decision: "deny" },
-      client: createClient({ deviceId: "phone-device" }),
+    const response = await request(
+      "approval.resolve",
+      { id: pending.record.id, kind: "plugin", decision: "deny" },
+      createClient({ deviceId: "phone-device" }),
       context,
-    });
+    );
     expect(response.ok).toBe(true);
     expect(validateApprovalResolveResult(response.result)).toBe(true);
     expect(response.result).toMatchObject({
@@ -581,12 +517,11 @@ describe("unified approval handlers", () => {
       ),
     ).toBe(true);
 
-    const terminal = await invoke({
-      handlers,
-      method: "approval.get",
-      body: { id: pending.record.id },
-      client: createClient({ scopes: ["operator.admin"] }),
-    });
+    const terminal = await request(
+      "approval.get",
+      { id: pending.record.id },
+      createClient({ scopes: ["operator.admin"] }),
+    );
     expect(validateApprovalGetResult(terminal.result)).toBe(true);
     expect(approvalFromResult(terminal.result)).toMatchObject({
       status: "denied",
@@ -607,25 +542,19 @@ describe("unified approval handlers", () => {
       throw new Error("forwarder unavailable");
     });
     const handleIosResolved = vi.fn(async () => {});
-    const forwarder = {
-      handleRequested: vi.fn(async () => false),
-      handleResolved,
-      handlePluginApprovalRequested: vi.fn(async () => false),
-      handlePluginApprovalResolved: vi.fn(async () => {}),
-      stop: vi.fn(),
-    } satisfies ExecApprovalForwarder;
+    const forwarder = createForwarder({ handleResolved });
     const handlers = createHandlers(managers, databaseOptions, {
       forwarder,
       iosPushDelivery: { handleResolved: handleIosResolved },
     });
+    const request = bindApprovalHandlers(handlers);
 
-    const response = await invoke({
-      handlers,
-      method: "approval.resolve",
-      body: { id: pending.record.id, kind: "exec", decision: "deny" },
-      client: createClient({ deviceId: "reviewer" }),
+    const response = await request(
+      "approval.resolve",
+      { id: pending.record.id, kind: "exec", decision: "deny" },
+      undefined,
       context,
-    });
+    );
 
     expect(response.result).toMatchObject({
       applied: true,
@@ -657,13 +586,7 @@ describe("unified approval handlers", () => {
     const pending = await registerExec(managers.exec, { id: "exec-slow-resolution-forwarder" });
     const { promise: forwarderPending, resolve: releaseForwarder } = createDeferred();
     const handleResolved = vi.fn(() => forwarderPending);
-    const forwarder = {
-      handleRequested: vi.fn(async () => false),
-      handleResolved,
-      handlePluginApprovalRequested: vi.fn(async () => false),
-      handlePluginApprovalResolved: vi.fn(async () => {}),
-      stop: vi.fn(),
-    } satisfies ExecApprovalForwarder;
+    const forwarder = createForwarder({ handleResolved });
     const handlers = createHandlers(managers, databaseOptions, {
       forwarder,
     });
@@ -704,8 +627,7 @@ describe("unified approval handlers", () => {
   });
 
   it("uses the live requester connection when filtering legacy resolved events", async () => {
-    const databaseOptions = createDatabaseOptions();
-    const managers = createManagers(databaseOptions);
+    const { managers, request } = createFixture();
     const pending = await registerExec(managers.exec, {
       id: "device-less-requester",
       reviewerDeviceIds: ["reviewer-device"],
@@ -716,15 +638,13 @@ describe("unified approval handlers", () => {
       },
     });
     const context = createContext();
-    const handlers = createHandlers(managers, databaseOptions);
 
-    const response = await invoke({
-      handlers,
-      method: "approval.resolve",
-      body: { id: pending.record.id, kind: "exec", decision: "deny" },
-      client: createClient({ deviceId: "reviewer-device" }),
+    const response = await request(
+      "approval.resolve",
+      { id: pending.record.id, kind: "exec", decision: "deny" },
+      createClient({ deviceId: "reviewer-device" }),
       context,
-    });
+    );
 
     expect(response.result).toMatchObject({ applied: true, approval: { status: "denied" } });
     const recipientLookup = context.getApprovalClientConnIds as ReturnType<typeof vi.fn>;
@@ -756,30 +676,26 @@ describe("unified approval handlers", () => {
   });
 
   it("returns the recorded winner to a competing surface without rebroadcasting", async () => {
-    const databaseOptions = createDatabaseOptions();
-    const managers = createManagers(databaseOptions);
+    const { managers, request } = createFixture();
     const pending = await registerExec(managers.exec, {
       id: "first-answer-wins",
       reviewerDeviceIds: ["control-ui", "telegram"],
     });
     const context = createContext();
-    const handlers = createHandlers(managers, databaseOptions);
 
     const [first, second] = await Promise.all([
-      invoke({
-        handlers,
-        method: "approval.resolve",
-        body: { id: pending.record.id, kind: "exec", decision: "allow-once" },
-        client: createClient({ deviceId: "control-ui" }),
+      request(
+        "approval.resolve",
+        { id: pending.record.id, kind: "exec", decision: "allow-once" },
+        createClient({ deviceId: "control-ui" }),
         context,
-      }),
-      invoke({
-        handlers,
-        method: "approval.resolve",
-        body: { id: pending.record.id, kind: "exec", decision: "deny" },
-        client: createClient({ deviceId: "telegram" }),
+      ),
+      request(
+        "approval.resolve",
+        { id: pending.record.id, kind: "exec", decision: "deny" },
+        createClient({ deviceId: "telegram" }),
         context,
-      }),
+      ),
     ]);
     expect([first.result, second.result]).toEqual([
       expect.objectContaining({
@@ -798,8 +714,7 @@ describe("unified approval handlers", () => {
   });
 
   it("resolves through the durable transport ref exactly like the canonical id", async () => {
-    const databaseOptions = createDatabaseOptions();
-    const managers = createManagers(databaseOptions);
+    const { databaseOptions, managers, request } = createFixture();
     // No explicit reviewer binding: any authorized reviewer device may resolve,
     // and the opaque transport ref must behave exactly like the canonical id.
     const pending = await registerExec(managers.exec, {
@@ -809,26 +724,23 @@ describe("unified approval handlers", () => {
     });
     const durable = await getOperatorApproval({ id: pending.record.id, databaseOptions });
     expect(durable?.resolutionRef).toHaveLength(43);
-    const handlers = createHandlers(managers, databaseOptions);
 
-    const winner = await invoke({
-      handlers,
-      method: "approval.resolve",
-      body: { id: durable?.resolutionRef, kind: "exec", decision: "deny" },
-      client: createClient({ deviceId: "reviewer-surface" }),
-    });
+    const winner = await request(
+      "approval.resolve",
+      { id: durable?.resolutionRef, kind: "exec", decision: "deny" },
+      createClient({ deviceId: "reviewer-surface" }),
+    );
     expect(winner.result).toMatchObject({
       applied: true,
       approval: { id: pending.record.id, status: "denied", decision: "deny" },
     });
     await expect(pending.decision).resolves.toBe("deny");
 
-    const replayByCanonicalId = await invoke({
-      handlers,
-      method: "approval.resolve",
-      body: { id: pending.record.id, kind: "exec", decision: "deny" },
-      client: createClient({ deviceId: "another-surface" }),
-    });
+    const replayByCanonicalId = await request(
+      "approval.resolve",
+      { id: pending.record.id, kind: "exec", decision: "deny" },
+      createClient({ deviceId: "another-surface" }),
+    );
     expect(replayByCanonicalId.result).toMatchObject({
       applied: false,
       approval: { id: pending.record.id, status: "denied", decision: "deny" },
@@ -869,13 +781,13 @@ describe("unified approval handlers", () => {
         pluginApprovalManager: restartedManagers.plugin,
         databaseOptions,
       });
-      const response = await invoke({
-        handlers,
-        method: "approval.resolve",
-        body: { id: pending.record.id, kind: "exec", decision },
-        client: createClient({ deviceId: "later-surface" }),
+      const request = bindApprovalHandlers(handlers);
+      const response = await request(
+        "approval.resolve",
+        { id: pending.record.id, kind: "exec", decision },
+        createClient({ deviceId: "later-surface" }),
         context,
-      });
+      );
 
       expect(response.result).toMatchObject({
         applied: false,
@@ -890,8 +802,7 @@ describe("unified approval handlers", () => {
   );
 
   it("atomically denies malformed, mismatched-kind, and disallowed approving verdicts", async () => {
-    const databaseOptions = createDatabaseOptions();
-    const managers = createManagers(databaseOptions);
+    const { managers, request } = createFixture();
     const disallowed = await registerExec(managers.exec, {
       id: "disallowed-allow-always",
       request: { unavailableDecisions: ["allow-always"] },
@@ -904,39 +815,36 @@ describe("unified approval handlers", () => {
       id: "opaque-plugin-id",
       request: { allowedDecisions: ["allow-once"] },
     });
-    const handlers = createHandlers(managers, databaseOptions);
+
     const client = createClient({ deviceId: "reviewer" });
 
-    const disallowedResponse = await invoke({
-      handlers,
-      method: "approval.resolve",
-      body: { id: disallowed.record.id, kind: "exec", decision: "allow-always" },
+    const disallowedResponse = await request(
+      "approval.resolve",
+      { id: disallowed.record.id, kind: "exec", decision: "allow-always" },
       client,
-    });
+    );
     expect(disallowedResponse.result).toMatchObject({
       applied: true,
       approval: { status: "denied", decision: "deny", reason: "malformed-verdict" },
     });
     await expect(disallowed.decision).resolves.toBe("deny");
 
-    const malformedResponse = await invoke({
-      handlers,
-      method: "approval.resolve",
-      body: { id: malformed.record.id, kind: "plugin", decision: "ACCEPT" },
+    const malformedResponse = await request(
+      "approval.resolve",
+      { id: malformed.record.id, kind: "plugin", decision: "ACCEPT" },
       client,
-    });
+    );
     expect(malformedResponse.result).toMatchObject({
       applied: true,
       approval: { status: "denied", decision: "deny", reason: "malformed-verdict" },
     });
     await expect(malformed.decision).resolves.toBe("deny");
 
-    const mismatchedKindResponse = await invoke({
-      handlers,
-      method: "approval.resolve",
-      body: { id: mismatchedKind.record.id, kind: "exec", decision: "allow-once" },
+    const mismatchedKindResponse = await request(
+      "approval.resolve",
+      { id: mismatchedKind.record.id, kind: "exec", decision: "allow-once" },
       client,
-    });
+    );
     expect(mismatchedKindResponse.result).toMatchObject({
       applied: true,
       approval: {
@@ -956,25 +864,23 @@ describe("unified approval handlers", () => {
       get({ ...params, nowMs: Date.now() }),
     );
     const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
-    const databaseOptions = createDatabaseOptions();
-    const managers = createManagers(databaseOptions);
+    const { managers, request } = createFixture();
     const pending = await registerExec(managers.exec, {
       id: "malformed-at-deadline",
       expiresAtMs: 2_000,
     });
     const context = createContext();
-    const handlers = createHandlers(managers, databaseOptions);
+
     // The lookup observes pending immediately before the deadline; force-deny's
     // store transaction reaches the exact deadline and must reconcile expiry.
     now.mockReturnValueOnce(1_999).mockReturnValue(2_000);
 
-    const response = await invoke({
-      handlers,
-      method: "approval.resolve",
-      body: { id: pending.record.id, kind: "exec", decision: "ACCEPT" },
-      client: createClient({ deviceId: "reviewer" }),
+    const response = await request(
+      "approval.resolve",
+      { id: pending.record.id, kind: "exec", decision: "ACCEPT" },
+      undefined,
       context,
-    });
+    );
 
     expect(response.result).toMatchObject({
       applied: false,

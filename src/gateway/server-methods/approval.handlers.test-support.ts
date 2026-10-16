@@ -21,7 +21,7 @@ import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-c
 import { ExecApprovalManager } from "../exec-approval-manager.js";
 import type { ExecApprovalManagerOptions } from "../exec-approval-manager.types.js";
 import { getOperatorApprovalDetailed } from "../operator-approval-store.js";
-import type { createApprovalHandlers } from "./approval.js";
+import { createApprovalHandlers } from "./approval.js";
 import { createContext } from "./approval.test-support.js";
 import type { GatewayRequestHandlerOptions } from "./types.js";
 
@@ -76,6 +76,40 @@ export function createManagers(databaseOptions: OpenClawStateDatabaseOptions) {
   };
   managersForCleanup.push(managers.exec, managers.plugin, managers.systemAgent);
   return managers;
+}
+
+export function createHandlers(
+  managers: ReturnType<typeof createManagers>,
+  databaseOptions: OpenClawStateDatabaseOptions,
+  options: Omit<
+    Parameters<typeof createApprovalHandlers>[0],
+    "execApprovalManager" | "pluginApprovalManager" | "databaseOptions"
+  > = {},
+) {
+  return createApprovalHandlers({
+    execApprovalManager: managers.exec,
+    pluginApprovalManager: managers.plugin,
+    databaseOptions,
+    ...options,
+  });
+}
+
+export function createFixture(includeSystemAgent = false) {
+  const databaseOptions = createDatabaseOptions();
+  const managers = createManagers(databaseOptions);
+  const handlers = createHandlers(managers, databaseOptions, {
+    systemAgentApprovalManager: includeSystemAgent ? managers.systemAgent : undefined,
+  });
+  return { databaseOptions, managers, handlers, request: bindApprovalHandlers(handlers) };
+}
+
+export function bindApprovalHandlers(handlers: ReturnType<typeof createApprovalHandlers>) {
+  return (
+    method: Parameters<typeof invoke>[0]["method"],
+    body: Record<string, unknown>,
+    client = createClient({ deviceId: "reviewer" }),
+    context?: GatewayRequestHandlerOptions["context"],
+  ) => invoke({ handlers, method, body, client, context });
 }
 
 export async function registerExec(
