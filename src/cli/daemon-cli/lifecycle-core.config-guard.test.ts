@@ -1,6 +1,6 @@
-// Daemon lifecycle config guard tests cover config checks before service lifecycle actions.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  createGatewayServiceRunArgs as createServiceRunArgs,
   lifecycleTestRuntime,
   resetLifecycleRuntimeLogs,
   resetLifecycleServiceMocks,
@@ -75,33 +75,22 @@ function setConfigSnapshot(params: {
   });
 }
 
-function setPluginPackagingInvalidSnapshot() {
+function setInvalidConfig(path: string) {
   setConfigSnapshot({
     exists: true,
     valid: false,
-    issues: [
-      {
-        path: "plugins.slots.memory",
-        message: "plugin not found: source-only-pack",
-      },
-    ],
-    warnings: [
-      {
-        path: "plugins",
-        message:
-          "plugin source-only-pack: installed plugin package requires compiled runtime output for TypeScript entry index.ts: expected ./dist/index.js. This is a plugin packaging issue, not a local config problem.",
-      },
-    ],
+    issues: [{ path, message: "Unrecognized key" }],
   });
 }
 
-function createServiceRunArgs() {
-  return {
-    serviceNoun: "Gateway",
-    service,
-    renderStartHints: () => [],
-    opts: { json: true },
-  };
+function expectConfigWarning(result: string, path: string) {
+  expect(lifecycleTestRuntime.writeJson).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      ok: true,
+      result,
+      warnings: [expect.stringContaining(`${path}: Unrecognized key`)],
+    }),
+  );
 }
 
 import {
@@ -123,11 +112,7 @@ beforeEach(() => {
 
 describe("runServiceRestart config pre-flight (#35862)", () => {
   it("restarts the recorded service and warns without repairing from invalid config", async () => {
-    setConfigSnapshot({
-      exists: true,
-      valid: false,
-      issues: [{ path: "agents.defaults.pdfModel", message: "Unrecognized key" }],
-    });
+    setInvalidConfig("agents.defaults.pdfModel");
     const repairLoadedService = vi.fn();
     const postRestartCheck = vi.fn();
 
@@ -171,11 +156,7 @@ describe("runServiceRestart config pre-flight (#35862)", () => {
 
 describe("runServiceStart config pre-flight (#35862)", () => {
   it("aborts start when config is invalid", async () => {
-    setConfigSnapshot({
-      exists: true,
-      valid: false,
-      issues: [{ path: "agents.defaults.pdfModel", message: "Unrecognized key" }],
-    });
+    setInvalidConfig("agents.defaults.pdfModel");
 
     await expect(runServiceStart(createServiceRunArgs())).rejects.toThrow("__exit__:1");
 
@@ -187,7 +168,18 @@ describe("runServiceStart config pre-flight (#35862)", () => {
   });
 
   it("points start at plugin packaging recovery for packaging-only invalid config", async () => {
-    setPluginPackagingInvalidSnapshot();
+    setConfigSnapshot({
+      exists: true,
+      valid: false,
+      issues: [{ path: "plugins.slots.memory", message: "plugin not found: source-only-pack" }],
+      warnings: [
+        {
+          path: "plugins",
+          message:
+            "plugin source-only-pack: installed plugin package requires compiled runtime output for TypeScript entry index.ts: expected ./dist/index.js. This is a plugin packaging issue, not a local config problem.",
+        },
+      ],
+    });
 
     await expect(runServiceStart(createServiceRunArgs())).rejects.toThrow("__exit__:1");
 
@@ -201,8 +193,6 @@ describe("runServiceStart config pre-flight (#35862)", () => {
   });
 
   it("proceeds with start when config is valid", async () => {
-    setConfigSnapshot({ exists: true, valid: true });
-
     await runServiceStart(createServiceRunArgs());
 
     expect(service.start).toHaveBeenCalledTimes(1);
@@ -211,32 +201,18 @@ describe("runServiceStart config pre-flight (#35862)", () => {
 
 describe("runServiceStop future-config guard", () => {
   it("stops the service before warning about invalid config", async () => {
-    setConfigSnapshot({
-      exists: true,
-      valid: false,
-      issues: [{ path: "meta.lastTouchedAt", message: "Unrecognized key" }],
-    });
+    setInvalidConfig("meta.lastTouchedAt");
     await runServiceStop(createServiceRunArgs());
 
     expect(service.stop).toHaveBeenCalledTimes(1);
     expect(service.stop.mock.invocationCallOrder[0]).toBeLessThan(
       readConfigFileSnapshotMock.mock.invocationCallOrder[0]!,
     );
-    expect(lifecycleTestRuntime.writeJson).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        ok: true,
-        result: "stopped",
-        warnings: [expect.stringContaining("meta.lastTouchedAt: Unrecognized key")],
-      }),
-    );
+    expectConfigWarning("stopped", "meta.lastTouchedAt");
   });
 
   it("uninstalls the service and warns without rewriting invalid config", async () => {
-    setConfigSnapshot({
-      exists: true,
-      valid: false,
-      issues: [{ path: "memory.qmd", message: "Unrecognized key" }],
-    });
+    setInvalidConfig("memory.qmd");
     service.isLoaded.mockResolvedValueOnce(true).mockResolvedValue(false);
 
     await runServiceUninstall({
@@ -250,12 +226,6 @@ describe("runServiceStop future-config guard", () => {
     expect(service.uninstall.mock.invocationCallOrder[0]).toBeLessThan(
       readConfigFileSnapshotMock.mock.invocationCallOrder[0]!,
     );
-    expect(lifecycleTestRuntime.writeJson).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        ok: true,
-        result: "uninstalled",
-        warnings: [expect.stringContaining("memory.qmd: Unrecognized key")],
-      }),
-    );
+    expectConfigWarning("uninstalled", "memory.qmd");
   });
 });

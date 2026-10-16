@@ -1,4 +1,3 @@
-// Daemon lifecycle tests cover CLI service lifecycle orchestration and cleanup.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mockSystemAccountHome } from "../../daemon/service.test-helpers.js";
 import { captureEnv } from "../../test-utils/env.js";
@@ -210,6 +209,17 @@ function expectListenerHealth(
   });
 }
 const restartTarget = { pid: 4200, ownerId: "gateway-owner-old", port: 18_789 };
+const stalePortIssue = { code: "port-mismatch", message: "service port is stale" };
+
+function makeServiceCommand(port = "18789", environment: NodeJS.ProcessEnv = {}) {
+  return { programArguments: ["openclaw", "gateway", "--port", port], environment };
+}
+
+function expectUnused(...mocks: unknown[]) {
+  for (const mock of mocks) {
+    expect(mock).not.toHaveBeenCalled();
+  }
+}
 
 describe("runDaemonRestart health checks", () => {
   let envSnapshot: ReturnType<typeof captureEnv>;
@@ -259,10 +269,7 @@ describe("runDaemonRestart health checks", () => {
     service.restart.mockReset().mockResolvedValue({ outcome: "completed" });
     service.stop.mockReset();
     runServiceStart.mockReset().mockResolvedValue(undefined);
-    runServiceRestart.mockReset();
     runServiceStop.mockReset().mockResolvedValue(undefined);
-    waitForGatewayHealthyListener.mockReset();
-    waitForGatewayHealthyRestart.mockReset();
     terminateStaleGatewayPids.mockReset();
     renderGatewayPortHealthDiagnostics.mockReset();
     renderRestartDiagnostics.mockReset();
@@ -280,7 +287,7 @@ describe("runDaemonRestart health checks", () => {
       .mockImplementation(() => ({ readBestEffortConfig: async () => loadConfig() }));
     readActiveGatewayLockPort.mockReset().mockResolvedValue(undefined);
     readGatewayOwnerLease.mockReset().mockReturnValue(undefined);
-    readActiveGatewayLockIdentity.mockReset();
+    readActiveGatewayLockIdentity.mockReset().mockResolvedValue(createGatewayLockIdentity());
     recoverInstalledLaunchAgent.mockReset().mockResolvedValue(null);
     repairLoadedGatewayServiceForStart.mockReset();
     isTerminalInteractive.mockReset().mockReturnValue(true);
@@ -290,24 +297,20 @@ describe("runDaemonRestart health checks", () => {
     probePortUsage.mockReset().mockResolvedValue("free");
     mockSystemAccountHome();
 
-    service.readCommand.mockResolvedValue({
-      programArguments: ["openclaw", "gateway", "--port", "18789"],
-      environment: {},
-    });
-    readActiveGatewayLockIdentity.mockResolvedValue(createGatewayLockIdentity());
+    service.readCommand.mockResolvedValue(makeServiceCommand());
     findInstalledSystemdGatewayScope.mockReset().mockResolvedValue(null);
     restartSystemdService.mockReset().mockResolvedValue({ outcome: "completed" });
     stopSystemdService.mockReset().mockResolvedValue(undefined);
 
-    runServiceRestart.mockImplementation(async (params: RestartParams) => {
+    runServiceRestart.mockReset().mockImplementation(async (params: RestartParams) => {
       await runRestartPostCheck(params, true);
       return true;
     });
-    waitForGatewayHealthyListener.mockResolvedValue({
+    waitForGatewayHealthyListener.mockReset().mockResolvedValue({
       healthy: true,
       portUsage: { port: 18789, status: "busy", listeners: [], hints: [] },
     });
-    waitForGatewayHealthyRestart.mockResolvedValue(createHealthyRestartSnapshot());
+    waitForGatewayHealthyRestart.mockReset().mockResolvedValue(createHealthyRestartSnapshot());
     probeGateway.mockResolvedValue({
       ok: true,
       configSnapshot: { commands: { restart: true } },
@@ -351,17 +354,15 @@ describe("runDaemonRestart health checks", () => {
     process.env.OPENCLAW_STATE_DIR = "/tmp/openclaw-caller-state";
     process.env.OPENCLAW_SYSTEMD_UNIT = "openclaw-gateway-maintenance.service";
     service.readCommand
-      .mockResolvedValueOnce({
-        programArguments: ["openclaw", "gateway", "--port", "18789"],
-        environment: { OPENCLAW_STATE_DIR: "/tmp/openclaw-stale-state" },
-      })
-      .mockResolvedValue({
-        programArguments: ["openclaw", "gateway", "--port", "19001"],
-        environment: {
+      .mockResolvedValueOnce(
+        makeServiceCommand("18789", { OPENCLAW_STATE_DIR: "/tmp/openclaw-stale-state" }),
+      )
+      .mockResolvedValue(
+        makeServiceCommand("19001", {
           OPENCLAW_STATE_DIR: "/tmp/openclaw-repaired-state",
           OPENCLAW_SYSTEMD_UNIT: "openclaw-gateway.service",
-        },
-      });
+        }),
+      );
     repairLoadedGatewayServiceForStart.mockResolvedValue({
       result: "restarted",
       message: "Gateway service definition repaired and restarted.",
@@ -372,7 +373,7 @@ describe("runDaemonRestart health checks", () => {
         json: true,
         stdout: process.stdout,
         state: {},
-        issues: [{ code: "port-mismatch", message: "service port is stale" }],
+        issues: [stalePortIssue],
       });
       await runRestartPostCheck(params, false);
       return true;
@@ -396,8 +397,7 @@ describe("runDaemonRestart health checks", () => {
     await expect(runDaemonRestart({ json: true, skipDeferral: true })).rejects.toThrow(
       "--skip-deferral requires --safe",
     );
-    expect(callGatewayCli).not.toHaveBeenCalled();
-    expect(runServiceRestart).not.toHaveBeenCalled();
+    expectUnused(callGatewayCli, runServiceRestart);
   });
 
   it("repairs loaded service definitions with port drift from gateway start", async () => {
@@ -409,19 +409,12 @@ describe("runDaemonRestart health checks", () => {
       loaded: true,
     });
     runServiceStart.mockImplementation(
-      async (params: {
-        repairLoadedService?: (args: {
-          json: boolean;
-          stdout: NodeJS.WritableStream;
-          state: unknown;
-          issues: unknown[];
-        }) => Promise<unknown>;
-      }) => {
+      async (params: Pick<RestartParams, "repairLoadedService">) => {
         await params.repairLoadedService?.({
           json: true,
           stdout: process.stdout,
           state: { command: { environment: { OPENCLAW_GATEWAY_PORT: "18789" } } },
-          issues: [{ code: "port-mismatch", message: "service port is stale" }],
+          issues: [stalePortIssue],
         });
       },
     );
@@ -434,7 +427,7 @@ describe("runDaemonRestart health checks", () => {
         service,
         json: true,
         state: { command: { environment: { OPENCLAW_GATEWAY_PORT: "18789" } } },
-        issues: [{ code: "port-mismatch", message: "service port is stale" }],
+        issues: [stalePortIssue],
       }),
     );
   });
@@ -564,9 +557,7 @@ describe("runDaemonRestart health checks", () => {
         error: expect.stringContaining("openclaw gateway run --dev"),
       }),
     );
-    expect(runServiceStop).not.toHaveBeenCalled();
-    expect(service.stop).not.toHaveBeenCalled();
-    expect(findVerifiedGatewayListenerPidsOnPortSync).not.toHaveBeenCalled();
+    expectUnused(runServiceStop, service.stop, findVerifiedGatewayListenerPidsOnPortSync);
   });
 
   it("routes macOS disable stops through the service manager when not loaded", async () => {
@@ -580,9 +571,7 @@ describe("runDaemonRestart health checks", () => {
         stopWhenNotLoaded: true,
       }),
     );
-    expect(service.readCommand).not.toHaveBeenCalled();
-    expect(loadConfig).not.toHaveBeenCalled();
-    expect(resolveGatewayPort).not.toHaveBeenCalled();
+    expectUnused(service.readCommand, loadConfig, resolveGatewayPort);
   });
 
   it("stops a running disabled systemd unit through the service manager", async () => {
@@ -650,9 +639,7 @@ describe("runDaemonRestart health checks", () => {
     });
     expect(probeGateway).toHaveBeenCalledTimes(1);
     expect(waitForGatewayHealthyListener).toHaveBeenCalledTimes(1);
-    expect(waitForGatewayHealthyRestart).not.toHaveBeenCalled();
-    expect(terminateStaleGatewayPids).not.toHaveBeenCalled();
-    expect(service.restart).not.toHaveBeenCalled();
+    expectUnused(waitForGatewayHealthyRestart, terminateStaleGatewayPids, service.restart);
   });
 
   it("rejects denied Darwin recovery when no unmanaged listener exists", async () => {
@@ -662,8 +649,7 @@ describe("runDaemonRestart health checks", () => {
 
     await expect(runDaemonRestart({ json: true })).rejects.toThrow(/non-default state dir/);
 
-    expect(recoverInstalledLaunchAgent).not.toHaveBeenCalled();
-    expect(signalVerifiedGatewayPidSync).not.toHaveBeenCalled();
+    expectUnused(recoverInstalledLaunchAgent, signalVerifiedGatewayPidSync);
   });
 
   it.each([
@@ -680,9 +666,7 @@ describe("runDaemonRestart health checks", () => {
       'gateway lock identity does not match the verified listener on port 18789; use "openclaw gateway status --deep"',
     );
 
-    expect(writeGatewayRestartIntentSync).not.toHaveBeenCalled();
-    expect(signalVerifiedGatewayPidSync).not.toHaveBeenCalled();
-    expect(callGatewayCli).not.toHaveBeenCalled();
+    expectUnused(writeGatewayRestartIntentSync, signalVerifiedGatewayPidSync, callGatewayCli);
   });
 
   it("uses the legacy local RPC contract for a pre-upgrade Windows gateway lock", async () => {
@@ -756,8 +740,7 @@ describe("runDaemonRestart health checks", () => {
     await runDaemonRestart({ json: true });
 
     expect(recoverInstalledLaunchAgent).toHaveBeenCalledWith({ result: "restarted" });
-    expect(signalVerifiedGatewayPidSync).not.toHaveBeenCalled();
-    expect(waitForGatewayHealthyListener).not.toHaveBeenCalled();
+    expectUnused(signalVerifiedGatewayPidSync, waitForGatewayHealthyListener);
     expect(waitForGatewayHealthyRestart).toHaveBeenCalledWith(
       expect.objectContaining({ supervisorKeepsAlive: true }),
     );
@@ -804,8 +787,7 @@ describe("runDaemonRestart health checks", () => {
     await expect(runDaemonRestart({ json: true })).resolves.toBe(true);
 
     expect(restartSystemdService).toHaveBeenCalled();
-    expect(signalVerifiedGatewayPidSync).not.toHaveBeenCalled();
-    expect(probeGateway).not.toHaveBeenCalled();
+    expectUnused(signalVerifiedGatewayPidSync, probeGateway);
   });
 
   it("surfaces systemd sudo guidance and never signals when restarting a system-scope unit as non-root (openclaw#87577)", async () => {
@@ -821,8 +803,7 @@ describe("runDaemonRestart health checks", () => {
       /sudo systemctl restart openclaw\.service/,
     );
 
-    expect(signalVerifiedGatewayPidSync).not.toHaveBeenCalled();
-    expect(probeGateway).not.toHaveBeenCalled();
+    expectUnused(signalVerifiedGatewayPidSync, probeGateway);
   });
 
   it("delegates system-scope stop to systemctl without unmanaged signaling when root (openclaw#87577)", async () => {
@@ -915,11 +896,13 @@ describe("runDaemonRestart health checks", () => {
         log.mock.invocationCallOrder[0]!,
       );
 
-      expect(runServiceRestart).not.toHaveBeenCalled();
-      expect(service.readCommand).not.toHaveBeenCalled();
-      expect(findInstalledSystemdGatewayScope).not.toHaveBeenCalled();
-      expect(probeGateway).not.toHaveBeenCalled();
-      expect(loadConfig).not.toHaveBeenCalled();
+      expectUnused(
+        runServiceRestart,
+        service.readCommand,
+        findInstalledSystemdGatewayScope,
+        probeGateway,
+        loadConfig,
+      );
       expectRestartRpc(
         {
           reason: "gateway.restart",
@@ -932,9 +915,11 @@ describe("runDaemonRestart health checks", () => {
         },
         19_455,
       );
-      expect(writeGatewayRestartIntentSync).not.toHaveBeenCalled();
-      expect(clearGatewayRestartIntentSync).not.toHaveBeenCalled();
-      expect(signalVerifiedGatewayPidSync).not.toHaveBeenCalled();
+      expectUnused(
+        writeGatewayRestartIntentSync,
+        clearGatewayRestartIntentSync,
+        signalVerifiedGatewayPidSync,
+      );
       expect(appendGatewayLifecycleAudit).toHaveBeenCalledWith({
         action: "restart",
         source: "supervisor",
@@ -964,9 +949,7 @@ describe("runDaemonRestart health checks", () => {
         18_789,
         true,
       );
-      expect(loadConfig).not.toHaveBeenCalled();
-      expect(writeGatewayRestartIntentSync).not.toHaveBeenCalled();
-      expect(signalVerifiedGatewayPidSync).not.toHaveBeenCalled();
+      expectUnused(loadConfig, writeGatewayRestartIntentSync, signalVerifiedGatewayPidSync);
     });
 
     it("does not touch state when lock ownership changes before delivery", async () => {
@@ -983,10 +966,12 @@ describe("runDaemonRestart health checks", () => {
 
       await expectExternalRestartFailure("gateway lock owner changed");
 
-      expect(writeGatewayRestartIntentSync).not.toHaveBeenCalled();
-      expect(clearGatewayRestartIntentSync).not.toHaveBeenCalled();
-      expect(callGatewayCli).not.toHaveBeenCalled();
-      expect(signalVerifiedGatewayPidSync).not.toHaveBeenCalled();
+      expectUnused(
+        writeGatewayRestartIntentSync,
+        clearGatewayRestartIntentSync,
+        callGatewayCli,
+        signalVerifiedGatewayPidSync,
+      );
     });
 
     it("rejects a legacy generic restart acknowledgement", async () => {
@@ -998,9 +983,11 @@ describe("runDaemonRestart health checks", () => {
 
       await expectExternalRestartFailure("invalid restart acknowledgement");
 
-      expect(writeGatewayRestartIntentSync).not.toHaveBeenCalled();
-      expect(signalVerifiedGatewayPidSync).not.toHaveBeenCalled();
-      expect(waitForGatewayHealthyListener).not.toHaveBeenCalled();
+      expectUnused(
+        writeGatewayRestartIntentSync,
+        signalVerifiedGatewayPidSync,
+        waitForGatewayHealthyListener,
+      );
     });
 
     it("fails closed before delivery for a pre-targeted-restart Gateway lock", async () => {
@@ -1012,9 +999,7 @@ describe("runDaemonRestart health checks", () => {
 
       await expectExternalRestartFailure("predates targeted restart ownership");
 
-      expect(callGatewayCli).not.toHaveBeenCalled();
-      expect(writeGatewayRestartIntentSync).not.toHaveBeenCalled();
-      expect(signalVerifiedGatewayPidSync).not.toHaveBeenCalled();
+      expectUnused(callGatewayCli, writeGatewayRestartIntentSync, signalVerifiedGatewayPidSync);
     });
 
     it.each([
@@ -1025,15 +1010,17 @@ describe("runDaemonRestart health checks", () => {
     ])("blocks native %s lifecycle access", async (_action, run) => {
       await expect(run()).rejects.toThrow("gateway lifecycle is managed by an external supervisor");
 
-      expect(runServiceStart).not.toHaveBeenCalled();
-      expect(runServiceRestart).not.toHaveBeenCalled();
-      expect(runServiceStop).not.toHaveBeenCalled();
-      expect(runServiceUninstall).not.toHaveBeenCalled();
-      expect(service.readCommand).not.toHaveBeenCalled();
-      expect(readActiveGatewayLockIdentity).not.toHaveBeenCalled();
-      expect(callGatewayCli).not.toHaveBeenCalled();
-      expect(writeGatewayRestartIntentSync).not.toHaveBeenCalled();
-      expect(signalVerifiedGatewayPidSync).not.toHaveBeenCalled();
+      expectUnused(
+        runServiceStart,
+        runServiceRestart,
+        runServiceStop,
+        runServiceUninstall,
+        service.readCommand,
+        readActiveGatewayLockIdentity,
+        callGatewayCli,
+        writeGatewayRestartIntentSync,
+        signalVerifiedGatewayPidSync,
+      );
     });
   });
 });
