@@ -23,18 +23,14 @@ const cases = [
   {
     name: "returns successful output without retrying",
     response: `printf '{"accepted":true}\\n'`,
-    code: 0,
-    output: '{"accepted":true}\n',
-    error: "",
+    result: { status: 0, stdout: '{"accepted":true}\n', stderr: "" },
     attempts: 1,
     sleeps: [],
   },
   {
     name: "preserves a non-retryable failure instead of reporting success",
     response: `printf 'permission denied\\n' >&2; return 42`,
-    code: 42,
-    output: "",
-    error: "permission denied\n",
+    result: { status: 42, stdout: "", stderr: "permission denied\n" },
     attempts: 1,
     sleeps: [],
   },
@@ -46,18 +42,14 @@ const cases = [
         return 41
       fi
       printf 'recovered\\n'`,
-    code: 0,
-    output: "recovered\n",
-    error: "",
+    result: { status: 0, stdout: "recovered\n", stderr: "" },
     attempts: 3,
     sleeps: [5, 20],
   },
   {
     name: "returns the last HTTP 429 failure after five attempts",
     response: `printf 'HTTP 429: throttled on call %s\\n' "$call" >&2; return "$((40 + call))"`,
-    code: 45,
-    output: "",
-    error: "HTTP 429: throttled on call 5\n",
+    result: { status: 45, stdout: "", stderr: "HTTP 429: throttled on call 5\n" },
     attempts: 5,
     sleeps: [5, 20, 45, 80, 125],
   },
@@ -70,9 +62,7 @@ const cases = [
       fi
       printf 'HTTP 403: forbidden\\n' >&2
       return 42`,
-    code: 42,
-    output: "",
-    error: "HTTP 403: forbidden\n",
+    result: { status: 42, stdout: "", stderr: "HTTP 403: forbidden\n" },
     attempts: 2,
     sleeps: [5],
   },
@@ -100,7 +90,7 @@ describe.skipIf(process.platform === "win32")("ClawSweeper GitHub API backoff", 
     bash = compatible;
   });
 
-  it.each(cases)("$name", ({ response, code, output, error, attempts, sleeps }) => {
+  it.each(cases)("$name", ({ response, result: expected, attempts, sleeps }) => {
     const root = mkdtempSync(join(tmpdir(), "clawsweeper-backoff-"));
     const args = ["synthetic/dispatches", "--method", "POST", "-f", "message=two words"];
     try {
@@ -139,13 +129,12 @@ fi`,
         },
       );
       expect(result.error).toBeUndefined();
-      expect(result.status).toBe(code);
-      expect(result.stdout).toBe(output);
+      expect(result).toMatchObject({ status: expected.status, stdout: expected.stdout });
       const stderrLines = result.stderr.split("\n").filter(Boolean);
       const warnings = stderrLines.filter((line) => line.startsWith("::warning::"));
       expect(warnings).toHaveLength(sleeps.length);
       expect(stderrLines.filter((line) => !line.startsWith("::warning::")).join("\n")).toBe(
-        error.trimEnd(),
+        expected.stderr.trimEnd(),
       );
       expect(readFileSync(join(root, "attempt"), "utf8")).toBe(`${attempts}\n`);
       expect(readFileSync(join(root, "sleeps"), "utf8")).toBe(
@@ -206,7 +195,7 @@ function replayBurst(events: BurstEvent[]) {
     }
     return run;
   });
-  return runs.map((run, index) => `${events[index]?.name}${run.cancelled ? " cancelled" : ""}`);
+  return runs.map((run) => run.cancelled);
 }
 
 describe("ClawSweeper dispatch concurrency", () => {
@@ -222,17 +211,8 @@ describe("ClawSweeper dispatch concurrency", () => {
         { name: "pull_request_review", action: "edited" },
         { name: "issue_comment", action: "edited", comment: 21 },
       ]),
-    ).toEqual([
-      "pull_request_review",
-      "pull_request_review_comment",
-      "pull_request_review_comment",
-      "pull_request_review_comment",
-      // Superseded by its own edit; comment runs never attach to the PR head.
-      "issue_comment cancelled",
-      "issue_comment",
-      "pull_request_review",
-      "issue_comment",
-    ]);
+      // Only the issue comment superseded by its own edit is cancelled.
+    ).toEqual([false, false, false, false, true, false, false, false]);
   });
 
   it("supersedes pull request runs only with newer pull request runs", () => {
@@ -245,13 +225,6 @@ describe("ClawSweeper dispatch concurrency", () => {
         { name: "pull_request_target", action: "labeled" },
         { name: "pull_request_target", action: "ready_for_review" },
       ]),
-    ).toEqual([
-      "pull_request_target cancelled",
-      "issue_comment",
-      "pull_request_review",
-      "pull_request_target cancelled",
-      "pull_request_target cancelled",
-      "pull_request_target",
-    ]);
+    ).toEqual([true, false, false, true, true, false]);
   });
 });

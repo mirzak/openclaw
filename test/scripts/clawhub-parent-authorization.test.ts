@@ -30,6 +30,39 @@ const recoveryEnv = {
 const noGh = () => {
   throw new Error("unexpected GitHub lookup");
 };
+const workflowPath = ".github/workflows/plugin-clawhub-release.yml";
+type WorkflowStep = {
+  id?: string;
+  name?: string;
+  uses?: string;
+  run?: string;
+  if?: string;
+  env?: Record<string, string>;
+  with?: Record<string, string>;
+};
+function workflow() {
+  return parse(readFileSync(workflowPath, "utf8")) as {
+    on: { workflow_dispatch: { inputs: Record<string, Record<string, unknown>> } };
+    jobs: Record<
+      | "approve_plugins_clawhub_release"
+      | "validate_release_publish_approval"
+      | "seal_clawhub_transactions"
+      | "publish_plugins_clawhub",
+      {
+        environment?: string;
+        if?: string;
+        needs: string[];
+        outputs?: Record<string, string>;
+        permissions?: Record<string, string>;
+        steps: WorkflowStep[];
+        with?: Record<string, string>;
+      }
+    >;
+  };
+}
+function rejectRecovery(patch: Record<string, string>, error: RegExp) {
+  expect(() => createClawHubRecoveryApproval({ ...recoveryEnv, ...patch }, noGh)).toThrow(error);
+}
 function parentArtifacts(names: string[], total = names.length) {
   return (path: string) => {
     expect(path).toMatch(/^actions\/runs\/10\/artifacts\?per_page=100&page=[1-9]/u);
@@ -85,25 +118,7 @@ it("rejects alpha package transactions before granting parent authority", () => 
 describe("ClawHub parent publication authorization", () => {
   it("writes an exact human recovery receipt once for the child and parent attempts", () => {
     const receipt = createClawHubRecoveryApproval(recoveryEnv, noGh);
-    // Mirrors openclaw/clawhub convex/lib/openClawPublishAuthorization.ts RECOVERY_RECEIPT_KEYS.
-    const recoveryReceiptKeys = [
-      "actor",
-      "approvalJob",
-      "authorizationRoute",
-      "authorizedChildRunAttempt",
-      "authorizedChildRunId",
-      "environment",
-      "kind",
-      "parentRunAttempt",
-      "parentRunId",
-      "repository",
-      "runAttempt",
-      "runId",
-      "version",
-      "workflow",
-    ] as const;
-    expect(Object.keys(receipt).toSorted()).toEqual(recoveryReceiptKeys);
-    expect(receipt).toEqual({
+    expect(receipt).toStrictEqual({
       version: 2,
       kind: "openclaw-clawhub-recovery-approval",
       repository: "openclaw/openclaw",
@@ -121,9 +136,7 @@ describe("ClawHub parent publication authorization", () => {
     });
     expect(Buffer.byteLength(JSON.stringify(receipt))).toBeLessThanOrEqual(8 * 1024);
     for (const actor of ["github-actions[bot]", "Something[Bot]", ""]) {
-      expect(() =>
-        createClawHubRecoveryApproval({ ...recoveryEnv, GITHUB_ACTOR: actor }, noGh),
-      ).toThrow(/human login/u);
+      rejectRecovery({ GITHUB_ACTOR: actor }, /human login/u);
     }
     for (const key of [
       "GITHUB_RUN_ID",
@@ -132,28 +145,17 @@ describe("ClawHub parent publication authorization", () => {
       "RELEASE_PUBLISH_RUN_ATTEMPT",
     ]) {
       for (const value of ["invalid", "0", "01", ""]) {
-        expect(() => createClawHubRecoveryApproval({ ...recoveryEnv, [key]: value }, noGh)).toThrow(
-          /invalid/u,
-        );
+        rejectRecovery({ [key]: value }, /invalid/u);
       }
     }
     // Explicit recovered-child inputs are validated as a pair; one half never falls back to discovery.
     for (const key of ["RECOVERED_CLAWHUB_RUN_ID", "RECOVERED_CLAWHUB_RUN_ATTEMPT"]) {
       for (const value of ["invalid", "0", "01", " ", "", "1.5"]) {
-        expect(() => createClawHubRecoveryApproval({ ...recoveryEnv, [key]: value }, noGh)).toThrow(
-          /Recovered ClawHub run (id|attempt) is invalid/u,
-        );
+        rejectRecovery({ [key]: value }, /Recovered ClawHub run (id|attempt) is invalid/u);
       }
     }
-    expect(() =>
-      createClawHubRecoveryApproval(
-        { ...recoveryEnv, GITHUB_REPOSITORY: "other/repository" },
-        noGh,
-      ),
-    ).toThrow(/repository/u);
-    expect(() =>
-      createClawHubRecoveryApproval({ ...recoveryEnv, GITHUB_RUN_ID: "1".repeat(8 * 1024) }, noGh),
-    ).toThrow(/8 KiB/u);
+    rejectRecovery({ GITHUB_REPOSITORY: "other/repository" }, /repository/u);
+    rejectRecovery({ GITHUB_RUN_ID: "1".repeat(8 * 1024) }, /8 KiB/u);
 
     const directory = mkdtempSync(join(tmpdir(), "clawhub-recovery-approval-"));
     try {
@@ -226,37 +228,14 @@ describe("ClawHub parent publication authorization", () => {
   });
 
   it("uploads recovery approval only for direct human dispatches from trusted tooling", () => {
-    const workflow = parse(
-      readFileSync(".github/workflows/plugin-clawhub-release.yml", "utf8"),
-    ) as {
-      on: { workflow_dispatch: { inputs: Record<string, Record<string, unknown>> } };
-      jobs: Record<
-        "approve_plugins_clawhub_release" | "validate_release_publish_approval",
-        {
-          environment?: string;
-          if?: string;
-          needs: string[];
-          outputs?: Record<string, string>;
-          permissions?: Record<string, string>;
-          steps: {
-            id?: string;
-            name?: string;
-            uses?: string;
-            run?: string;
-            if?: string;
-            env?: Record<string, string>;
-            with?: Record<string, string>;
-          }[];
-        }
-      >;
-    };
-    const approval = workflow.jobs.approve_plugins_clawhub_release;
+    const config = workflow();
+    const approval = config.jobs.approve_plugins_clawhub_release;
     expect(approval.environment).toBe(
       "${{ needs.validate_release_publish_approval.outputs.parent_approval != 'receipt' && 'clawhub-plugin-release' || '' }}",
     );
     expect(approval.needs).toContain("validate_release_publish_approval");
     expect(approval.if).toContain("needs.validate_release_publish_approval.result == 'success'");
-    const validation = workflow.jobs.validate_release_publish_approval;
+    const validation = config.jobs.validate_release_publish_approval;
     expect(validation.outputs?.direct_recovery).toBe(
       "${{ steps.approval.outputs.direct_recovery }}",
     );
@@ -302,7 +281,7 @@ describe("ClawHub parent publication authorization", () => {
       RECOVERED_CLAWHUB_RUN_ATTEMPT: "${{ inputs.recovered_clawhub_run_attempt }}",
     });
     for (const input of ["recovered_clawhub_run_id", "recovered_clawhub_run_attempt"]) {
-      expect(workflow.on.workflow_dispatch.inputs[input]).toMatchObject({
+      expect(config.on.workflow_dispatch.inputs[input]).toMatchObject({
         required: false,
         default: "",
         type: "string",
@@ -311,28 +290,21 @@ describe("ClawHub parent publication authorization", () => {
     const upload = approval.steps.find((step) => step.uses?.startsWith("actions/upload-artifact@"));
     const artifactName =
       "openclaw-clawhub-recovery-approval-${{ github.run_id }}-${{ github.run_attempt }}";
-    expect(upload?.with?.name).toBe(artifactName);
-    expect(upload?.with?.path).toBe(
-      "${{ runner.temp }}/openclaw-clawhub-recovery-approval/approval.json",
-    );
-    expect(upload?.with?.["if-no-files-found"]).toBe("error");
+    expect(upload?.with).toMatchObject({
+      name: artifactName,
+      path: "${{ runner.temp }}/openclaw-clawhub-recovery-approval/approval.json",
+      "if-no-files-found": "error",
+    });
   });
 
   it("publishes source metadata for the exact candidate sealed into authorization", () => {
-    const workflow = parse(
-      readFileSync(".github/workflows/plugin-clawhub-release.yml", "utf8"),
-    ) as {
-      jobs: Record<
-        string,
-        { steps?: { env?: Record<string, string> }[]; with?: Record<string, string> }
-      >;
-    };
-    const candidate = workflow.jobs.seal_clawhub_transactions?.steps?.find(
+    const config = workflow();
+    const candidate = config.jobs.seal_clawhub_transactions?.steps?.find(
       (step) => step.env?.TARGET_SHA,
     )?.env?.TARGET_SHA;
     expect(candidate).toBe("${{ needs.preview_plugins_clawhub.outputs.ref_revision }}");
     // ClawHub compares both source fields with the candidate SHA in the publish token.
-    expect(workflow.jobs.publish_plugins_clawhub?.with).toMatchObject({
+    expect(config.jobs.publish_plugins_clawhub?.with).toMatchObject({
       source_commit: candidate,
       source_ref: candidate,
     });

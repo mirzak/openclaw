@@ -1,6 +1,4 @@
-// Clawlog tests cover argument parsing contracts in the macOS logging helper.
-// These tests do not require a real macOS log(1) binary; they verify that the
-// script reaches the expected code paths before any platform-specific command.
+// Exercise the real shell helper with a synthetic log backend (no macOS log(1) required).
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
@@ -35,15 +33,13 @@ function runClawlog(args: string[] = [], options: MockLogOptions = {}) {
   const sudoPath = path.join(binDir, "sudo");
   writeFileSync(
     sudoPath,
-    [
-      "#!/bin/sh",
-      '[ "$1" = "-n" ] && { printf "%s" "$MOCK_PREFLIGHT_STDERR" >&2; exit "$MOCK_PREFLIGHT_STATUS"; }',
-      'printf "%s\\n" "$@" >> "$MOCK_LOG_CALLS"',
-      'printf "%s" "$MOCK_LOG_STDOUT"',
-      'printf "%s" "$MOCK_LOG_STDERR" >&2',
-      'exit "$MOCK_LOG_STATUS"',
-      "",
-    ].join("\n"),
+    `#!/bin/sh
+[ "$1" = "-n" ] && { printf "%s" "$MOCK_PREFLIGHT_STDERR" >&2; exit "$MOCK_PREFLIGHT_STATUS"; }
+printf "%s\\n" "$@" >> "$MOCK_LOG_CALLS"
+printf "%s" "$MOCK_LOG_STDOUT"
+printf "%s" "$MOCK_LOG_STDERR" >&2
+exit "$MOCK_LOG_STATUS"
+`,
   );
   chmodSync(sudoPath, 0o755);
   if (options.existingOutput !== undefined) {
@@ -66,7 +62,12 @@ function runClawlog(args: string[] = [], options: MockLogOptions = {}) {
     },
   });
 
-  return { ...result, cwd, callsPath };
+  return {
+    ...result,
+    callsPath,
+    read: (name: string) => readFileSync(path.join(cwd, name), "utf8"),
+    files: (name = ".") => readdirSync(path.join(cwd, name)),
+  };
 }
 
 function encodeRecords(count: number): string {
@@ -81,37 +82,27 @@ describe("clawlog.sh argument parsing", () => {
     const result = runClawlog();
     const output = result.stdout + result.stderr;
 
-    // Should reach the default log-view path, not print usage.
     expect(output).toContain("Showing last 50 log lines from the past 5m");
     expect(output).not.toContain("USAGE:");
   });
 
-  const valueOptions = ["-n", "-l", "-c", "-s", "-o"];
-  for (const option of valueOptions) {
+  for (const option of ["-n", "-l", "-c", "-s", "-o"]) {
     it(`reports a clear error when ${option} is missing a value`, () => {
       const result = runClawlog([option]);
-
       expect(result.status).toBe(1);
       expect(result.stderr).toContain(`Error: ${option} requires a value`);
     });
   }
 
-  it("accepts dash-prefixed search text", () => {
-    const result = runClawlog(["-s", "-failed"]);
-
-    expect(result.stderr).not.toContain("requires a value");
-  });
-
-  it("accepts dash-prefixed category", () => {
-    const result = runClawlog(["-c", "-ServerManager"]);
-
-    expect(result.stderr).not.toContain("requires a value");
-  });
-
-  it("accepts a dash-prefixed output path", () => {
-    const result = runClawlog(["-o", "-debug.log"]);
-
-    expect(result.status).toBe(0);
+  it.each([
+    ["-s", "-failed"],
+    ["-c", "-ServerManager"],
+    ["-o", "-debug.log"],
+  ])("accepts a dash-prefixed value for %s", (option, value) => {
+    const result = runClawlog([option, value]);
+    if (option === "-o") {
+      expect(result.status).toBe(0);
+    }
     expect(result.stderr).not.toContain("requires a value");
   });
 });
@@ -125,7 +116,7 @@ describe("clawlog.sh JSON output", () => {
 
     expect(result.status).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual([{ index: 2, message: "line 2\ncontinued" }]);
-    expect(readFileSync(result.callsPath, "utf8")).toContain("--style\nndjson\n");
+    expect(result.read("backend-calls")).toContain("--style\nndjson\n");
     expect(result.stdout).not.toContain("backend warning");
     expect(result.stderr).toBe("backend warning\n");
   });
@@ -137,11 +128,9 @@ describe("clawlog.sh JSON output", () => {
       existingOutput: "previous output",
     });
 
-    expect(result.status).toBe(0);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("backend warning\n");
-    expect(JSON.parse(readFileSync(path.join(result.cwd, "logs.json"), "utf8"))).toHaveLength(2);
-    expect(readdirSync(result.cwd).filter((name) => name.includes(".tmp."))).toEqual([]);
+    expect(result).toMatchObject({ status: 0, stdout: "", stderr: "backend warning\n" });
+    expect(JSON.parse(result.read("logs.json"))).toHaveLength(2);
+    expect(result.files().filter((name) => name.includes(".tmp."))).toEqual([]);
   });
 
   it("preserves the exact backend failure and publishes no partial stdout", () => {
@@ -151,10 +140,8 @@ describe("clawlog.sh JSON output", () => {
       status: 23,
     });
 
-    expect(result.status).toBe(23);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("backend failed\n");
-    expect(readdirSync(result.cwd).filter((name) => name.startsWith("clawlog."))).toEqual([]);
+    expect(result).toMatchObject({ status: 23, stdout: "", stderr: "backend failed\n" });
+    expect(result.files().filter((name) => name.startsWith("clawlog."))).toEqual([]);
   });
 
   it("leaves an existing destination unchanged when the backend fails", () => {
@@ -165,27 +152,22 @@ describe("clawlog.sh JSON output", () => {
       existingOutput: "previous output",
     });
 
-    expect(result.status).toBe(37);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("backend failed\n");
-    expect(readFileSync(path.join(result.cwd, "logs.json"), "utf8")).toBe("previous output");
-    expect(readdirSync(result.cwd).filter((name) => name.includes(".tmp."))).toEqual([]);
+    expect(result).toMatchObject({ status: 37, stdout: "", stderr: "backend failed\n" });
+    expect(result.read("logs.json")).toBe("previous output");
+    expect(result.files().filter((name) => name.includes(".tmp."))).toEqual([]);
   });
 
   it("preserves failed preflight status without staging output", () => {
-    const status = 64;
     const result = runClawlog(["--json", "--output", "logs.json"], {
       preflightStderr: "log preflight failed\n",
-      preflightStatus: status,
+      preflightStatus: 64,
       existingOutput: "previous output",
     });
 
-    expect(result.status).toBe(status);
-    expect(result.stdout).toBe("");
-    expect(result.stderr).toBe("log preflight failed\n");
-    expect(readFileSync(path.join(result.cwd, "logs.json"), "utf8")).toBe("previous output");
+    expect(result).toMatchObject({ status: 64, stdout: "", stderr: "log preflight failed\n" });
+    expect(result.read("logs.json")).toBe("previous output");
     expect(existsSync(result.callsPath)).toBe(false);
-    expect(readdirSync(result.cwd).filter((name) => name.includes(".tmp."))).toEqual([]);
+    expect(result.files().filter((name) => name.includes(".tmp."))).toEqual([]);
   });
 
   it("rejects directory output without moving a staged file into it", () => {
@@ -194,8 +176,8 @@ describe("clawlog.sh JSON output", () => {
     expect(result.status).not.toBe(0);
     expect(result.stdout).toBe("");
     expect(result.stderr).toContain("directory");
-    expect(readdirSync(path.join(result.cwd, "bin"))).toEqual(["sudo"]);
-    expect(readdirSync(result.cwd).filter((name) => name.includes(".tmp."))).toEqual([]);
+    expect(result.files("bin")).toEqual(["sudo"]);
+    expect(result.files().filter((name) => name.includes(".tmp."))).toEqual([]);
   });
 
   it.each([

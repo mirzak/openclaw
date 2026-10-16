@@ -20,17 +20,22 @@ type FixtureTool = {
   execute: (id: string, input: Record<string, unknown>) => Promise<{ details: unknown }>;
 };
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const writeFiles = (workspace: string, files: Record<string, string>) =>
+  Promise.all(
+    Object.entries(files).map(([name, value]) => fs.writeFile(path.join(workspace, name), value)),
+  );
+const decision = ({ invoiceId, revision }: Invoice, reason: string) => ({
+  invoiceId,
+  revision,
+  reason,
+});
 
 async function prepare(repetition: number) {
   const fixture = createDataFixture("invoice-reconciliation", repetition);
   const root = tempDirs.make("openclaw-invoice-matrix-");
   const workspace = path.join(root, "workspace");
   await fs.mkdir(workspace);
-  await Promise.all(
-    Object.entries(fixture.workspaceFiles ?? {}).map(([name, value]) =>
-      fs.writeFile(path.join(workspace, name), value),
-    ),
-  );
+  await writeFiles(workspace, fixture.workspaceFiles ?? {});
   const receiptsPath = path.join(root, "receipts.jsonl");
   const pluginPath = path.join(root, "fixture.mjs");
   await fs.writeFile(pluginPath, fixture.pluginSource!);
@@ -68,18 +73,17 @@ async function prepare(repetition: number) {
     }
   }
   const selected = [...latest.values()].toSorted((a, b) => a.invoiceId.localeCompare(b.invoiceId));
-  const eligible = selected.filter(
-    (row) => row.status === "open" && row.dueDate <= policy.cutoffDate,
-  );
+  const isEligible = (row: Invoice) => row.status === "open" && row.dueDate <= policy.cutoffDate;
+  const eligible = selected.filter(isEligible);
   const payableInvoices = eligible
     .filter((row) => row.amountCents != null)
-    .map((row) => ({
-      invoiceId: row.invoiceId,
-      revision: row.revision,
-      customerId: row.customerId,
-      amountCents: Number(row.amountCents),
-      creditCents: row.creditCents,
-      netCents: Number(row.amountCents) - row.creditCents,
+    .map(({ invoiceId, revision, customerId, amountCents, creditCents }) => ({
+      invoiceId,
+      revision,
+      customerId,
+      amountCents: Number(amountCents),
+      creditCents,
+      netCents: Number(amountCents) - creditCents,
     }));
   const totals = new Map<string, { customerId: string; invoiceCount: number; netCents: number }>();
   for (const row of payableInvoices) {
@@ -102,19 +106,11 @@ async function prepare(repetition: number) {
     cutoffDate: policy.cutoffDate,
     payableInvoices,
     excludedInvoices: selected
-      .filter((row) => row.status !== "open" || row.dueDate > policy.cutoffDate)
-      .map((row) => ({
-        invoiceId: row.invoiceId,
-        revision: row.revision,
-        reason: row.status === "open" ? "future" : row.status,
-      })),
+      .filter((row) => !isEligible(row))
+      .map((row) => decision(row, row.status === "open" ? "future" : row.status)),
     exceptions: eligible
       .filter((row) => row.amountCents == null)
-      .map((row) => ({
-        invoiceId: row.invoiceId,
-        revision: row.revision,
-        reason: "unknown_amount",
-      })),
+      .map((row) => decision(row, "unknown_amount")),
     customerTotals,
     totalNetCents: [...totals.values()].reduce((sum, row) => sum + row.netCents, 0),
   };
@@ -126,11 +122,7 @@ async function prepare(repetition: number) {
         .map((row) => `${row.customerId},${row.invoiceCount},${row.netCents}\n`)
         .join(""),
   };
-  await Promise.all(
-    Object.entries(artifacts).map(([name, value]) =>
-      fs.writeFile(path.join(workspace, name), value),
-    ),
-  );
+  await writeFiles(workspace, artifacts);
   const trace: MatrixPerformanceEvaluation["trace"] = {
     calls: [],
     outcomes: [],
@@ -146,7 +138,6 @@ async function prepare(repetition: number) {
     .split("\n")
     .map((line) => JSON.parse(line));
   return {
-    fixture,
     report,
     rows,
     pages,
@@ -165,9 +156,7 @@ describe("paginated invoice task", () => {
     const totals: number[] = [];
     for (const repetition of [1, 2, 3]) {
       const run = await prepare(repetition);
-      expect(run.rows).toHaveLength(192);
-      expect(run.pages).toHaveLength(8);
-      expect(run.report.invoiceCount).toBe(144);
+      expect([run.rows.length, run.pages.length, run.report.invoiceCount]).toEqual([192, 8, 144]);
       expect(run.report.payableInvoices.some((row) => row.amountCents === 0)).toBe(true);
       expect(run.rows.some((row) => row.amountCents === null)).toBe(true);
       expect(run.rows.some((row) => !("amountCents" in row))).toBe(true);
