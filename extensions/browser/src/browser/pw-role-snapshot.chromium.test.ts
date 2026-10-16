@@ -1,5 +1,5 @@
 import path from "node:path";
-import type { BrowserContext, Page } from "playwright-core";
+import type { BrowserContext, CDPSession, Page } from "playwright-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test-support.js";
 import type { CdpProtocolSend } from "./cdp-ax.js";
@@ -57,15 +57,36 @@ async function withSnapshotPage(
   }
 }
 
-function appendControls(controls: { id: string; name: string }[]) {
-  for (const { id, name } of controls) {
+function appendControls(controls: { id: string; name: string; native?: boolean }[]) {
+  for (const { id, name, native } of controls) {
     const button = document.createElement("button");
-    button.setAttribute("aria-label", name);
-    button.textContent = name ? "control" : "";
+    if (!native) {
+      button.setAttribute("aria-label", name);
+    }
+    button.textContent = native ? name : name ? "control" : "";
     button.addEventListener("click", () => {
       document.querySelector("output")!.textContent = id;
     });
     document.querySelector("main")!.append(button);
+  }
+}
+
+async function withCdpSend(
+  context: BrowserContext,
+  intercept: (send: CdpProtocolSend) => CdpProtocolSend,
+  run: () => Promise<void>,
+) {
+  const newSession = context.newCDPSession.bind(context);
+  const spy = vi.spyOn(context, "newCDPSession").mockImplementation(async (page) => {
+    const session = await newSession(page);
+    const send = session.send.bind(session);
+    vi.spyOn(session, "send").mockImplementation(intercept(send) as CDPSession["send"]);
+    return session;
+  });
+  try {
+    await run();
+  } finally {
+    spy.mockRestore();
   }
 }
 
@@ -75,42 +96,35 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
     it.each(["injection", "lookup"] as const)(
       "clears cursor discovery markers after a failed %s reply",
       async (phase) => {
-        const browser = await getPlaywrightCore().chromium.launch({
-          headless: true,
-          executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
-        });
-        try {
-          const page = await browser.newPage();
-          await page.setContent(
-            '<div style="cursor:pointer" onclick="void 0">Cursor control</div>',
-          );
-          const session = await page.context().newCDPSession(page);
-          const nativeSend = session.send.bind(session);
-          let failed = false;
-          const send: CdpProtocolSend = async (method, params) => {
-            if (!failed && phase === "lookup" && method === "DOM.getDocument") {
-              expect(await page.locator("[data-openclaw-cdp-ci]").count()).toBe(1);
-              failed = true;
-              throw new Error("Synthetic DOM lookup failure");
+        await withSnapshotPage(
+          '<div style="cursor:pointer" onclick="void 0">Cursor control</div>',
+          async ({ page }) => {
+            const session = await page.context().newCDPSession(page);
+            const nativeSend = session.send.bind(session);
+            let failed = false;
+            const send: CdpProtocolSend = async (method, params) => {
+              if (!failed && phase === "lookup" && method === "DOM.getDocument") {
+                expect(await page.locator("[data-openclaw-cdp-ci]").count()).toBe(1);
+                failed = true;
+                throw new Error("Synthetic DOM lookup failure");
+              }
+              const result = await nativeSend(method, params);
+              if (!failed && phase === "injection" && method === "Runtime.evaluate") {
+                expect(await page.locator("[data-openclaw-cdp-ci]").count()).toBe(1);
+                failed = true;
+                throw new Error("Synthetic lost injection reply");
+              }
+              return result;
+            };
+            try {
+              await snapshotRoleViaCdpSession({ send });
+              expect(failed).toBe(true);
+              expect(await page.locator("[data-openclaw-cdp-ci]").count()).toBe(0);
+            } finally {
+              await session.detach();
             }
-            const result = await nativeSend(method, params);
-            if (!failed && phase === "injection" && method === "Runtime.evaluate") {
-              expect(await page.locator("[data-openclaw-cdp-ci]").count()).toBe(1);
-              failed = true;
-              throw new Error("Synthetic lost injection reply");
-            }
-            return result;
-          };
-          try {
-            await snapshotRoleViaCdpSession({ send });
-            expect(failed).toBe(true);
-            expect(await page.locator("[data-openclaw-cdp-ci]").count()).toBe(0);
-          } finally {
-            await session.detach();
-          }
-        } finally {
-          await browser.close();
-        }
+          },
+        );
       },
     );
 
@@ -119,38 +133,25 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
       async (interruptedMethod) => {
         await withSnapshotPage("<button>Save</button>", async ({ page, target }) => {
           const capturedPage = await getPageForTargetId(target);
-          const capturedContext = capturedPage.context();
-          const newSession = capturedContext.newCDPSession.bind(capturedContext);
           const replacement = "data:text/html,<button>Save replacement</button>";
           let interrupted = false;
-          const sessionSpy = vi
-            .spyOn(capturedContext, "newCDPSession")
-            .mockImplementation(async (pageOrFrame) => {
-              const cdp = await newSession(pageOrFrame);
-              const send = cdp.send.bind(cdp);
-              vi.spyOn(cdp, "send").mockImplementation((async (
-                method: string,
-                params?: Record<string, unknown>,
-              ) => {
-                const result = await (
-                  send as (method: string, params?: Record<string, unknown>) => Promise<unknown>
-                )(method, params);
-                if (method === interruptedMethod && !interrupted) {
-                  interrupted = true;
-                  await page.goto(replacement);
-                  await expect.poll(() => capturedPage.url()).toBe(replacement);
-                }
-                return result;
-              }) as typeof cdp.send);
-              return cdp;
-            });
-          try {
-            await expect(snapshotAriaViaPlaywright(target)).rejects.toThrow("Frame changed");
-            expect(interrupted).toBe(true);
-            expect(() => refLocator(capturedPage, "ax1")).toThrow("Unknown ref");
-          } finally {
-            sessionSpy.mockRestore();
-          }
+          await withCdpSend(
+            capturedPage.context(),
+            (send) => async (method, params) => {
+              const result = await send(method, params);
+              if (method === interruptedMethod && !interrupted) {
+                interrupted = true;
+                await page.goto(replacement);
+                await expect.poll(() => capturedPage.url()).toBe(replacement);
+              }
+              return result;
+            },
+            async () => {
+              await expect(snapshotAriaViaPlaywright(target)).rejects.toThrow("Frame changed");
+              expect(interrupted).toBe(true);
+              expect(() => refLocator(capturedPage, "ax1")).toThrow("Unknown ref");
+            },
+          );
         });
       },
       30_000,
@@ -160,28 +161,21 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
       await withSnapshotPage(
         '<main><button id="present">Present</button><a href="https://example.test/docs">Docs</a></main>',
         async ({ target }) => {
+          const request = { ...target, timeoutMs: 30_000 };
           const startedAt = performance.now();
           const missing = await snapshotRoleViaPlaywright({
-            ...target,
+            ...request,
             selector: "#missing",
-            timeoutMs: 30_000,
             urls: true,
           });
           const elapsedMs = performance.now() - startedAt;
-          const present = await snapshotRoleViaPlaywright({
-            ...target,
-            selector: "#present",
-            timeoutMs: 30_000,
-          });
-
+          const present = await snapshotRoleViaPlaywright({ ...request, selector: "#present" });
           const refFree = await snapshotRoleViaPlaywright({
-            ...target,
+            ...request,
             selector: "main",
             options: { maxDepth: 0 },
-            timeoutMs: 30_000,
             urls: true,
           });
-
           expect(missing.snapshot).toBe("(empty)");
           expect(missing.snapshot).not.toContain("https://example.test/docs");
           expect(missing.refs).toEqual({});
@@ -231,36 +225,27 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
           const { mainFrame: expectedDocumentIdentity } =
             await getDocumentIdentitiesViaPlaywright(target);
           const nativeRefSet = new Set(nativeRefs.map(([ref]) => ref));
-          const newCdpSession = context.newCDPSession.bind(context);
-          const newCdpSessionSpy = vi
-            .spyOn(context, "newCDPSession")
-            .mockImplementation(async (pageOrFrame) => {
-              const markerSession = await newCdpSession(pageOrFrame);
-              const send = markerSession.send.bind(markerSession);
-              vi.spyOn(markerSession, "send").mockImplementation((async (
-                method: string,
-                params?: Record<string, unknown>,
-              ) => {
-                const markerValue = typeof params?.value === "string" ? params.value : "";
-                if (method === "DOM.setAttributeValue" && nativeRefSet.has(markerValue)) {
-                  throw new Error("marker write blocked");
-                }
-                return await (
-                  send as (method: string, params?: Record<string, unknown>) => Promise<unknown>
-                )(method, params);
-              }) as typeof markerSession.send);
-              return markerSession;
-            });
-          try {
-            await storeSnapshotRefsViaPlaywright({
-              ...target,
-              page,
-              refs: snapshot.refs,
-              expectedDocumentIdentity,
-            });
-          } finally {
-            newCdpSessionSpy.mockRestore();
-          }
+          await withCdpSend(
+            context,
+            (send) => async (method, params) => {
+              const value = params && "value" in params ? params.value : undefined;
+              if (
+                method === "DOM.setAttributeValue" &&
+                typeof value === "string" &&
+                nativeRefSet.has(value)
+              ) {
+                throw new Error("marker write blocked");
+              }
+              return await send(method, params);
+            },
+            () =>
+              storeSnapshotRefsViaPlaywright({
+                ...target,
+                page,
+                refs: snapshot.refs,
+                expectedDocumentIdentity,
+              }),
+          );
 
           for (const [ref] of nativeRefs) {
             expect(await page.locator(`[${BROWSER_REF_MARKER_ATTRIBUTE}="${ref}"]`).count()).toBe(
@@ -296,30 +281,20 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
             { id: "normalized-901", name: "  x \n".repeat(451) },
           ];
           await page.evaluate(
-            ({ buttonName: label, inputName: inputLabel }) => {
-              for (const id of ["first", "second"]) {
-                const button = document.createElement("button");
-                button.textContent = label;
-                button.addEventListener("click", () => {
-                  document.querySelector("output")!.textContent = id;
-                });
-                document.querySelector("main")!.append(button);
-              }
+            ({ inputName: label }) => {
               const input = document.createElement("input");
-              input.setAttribute("aria-label", inputLabel);
+              input.setAttribute("aria-label", label);
               document.querySelector("main")!.append(input);
-              const slash = document.createElement("button");
-              slash.textContent = "/";
-              slash.addEventListener("click", () => {
-                document.querySelector("output")!.textContent = "/";
-              });
-              document.querySelector("main")!.append(slash);
               document.querySelector("iframe")!.srcdoc =
                 "<button onclick=\"this.textContent='Frame clicked'\">Frame: action</button>";
             },
-            { buttonName, inputName },
+            { inputName },
           );
-          await page.evaluate(appendControls, nameControls);
+          await page.evaluate(appendControls, [
+            ...["first", "second"].map((id) => ({ id, name: buttonName, native: true })),
+            { id: "/", name: "/", native: true },
+            ...nameControls,
+          ]);
           await page.frameLocator("iframe").getByRole("button").waitFor();
           for (const mode of ["role", "interactive", "ai", "interactive-aria"] as const) {
             const snapshot = await snapshotRoleViaPlaywright({

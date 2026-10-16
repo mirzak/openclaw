@@ -31,9 +31,7 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 function listen(server: Server): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      resolve((server.address() as AddressInfo).port);
-    });
+    server.listen(0, "127.0.0.1", () => resolve((server.address() as AddressInfo).port));
   });
 }
 
@@ -46,8 +44,7 @@ function closeServer(server: Server): Promise<void> {
 async function readTargetId(page: import("playwright-core").Page): Promise<string> {
   const session = await page.context().newCDPSession(page);
   try {
-    const { targetInfo } = await session.send("Target.getTargetInfo");
-    return targetInfo.targetId;
+    return (await session.send("Target.getTargetInfo")).targetInfo.targetId;
   } finally {
     await session.detach();
   }
@@ -68,22 +65,7 @@ function setDisabled(page: Page, selector: string, disabled: boolean) {
   }, disabled);
 }
 
-function successOutcome(pending: Promise<void>) {
-  return pending.then(
-    () => ({ ok: true }),
-    (error: unknown) => ({ ok: false, error }),
-  );
-}
-
-function rejectionOutcome<T>(pending: Promise<T>) {
-  return pending.then(
-    (download) => ({ kind: "resolved" as const, download }),
-    (error: unknown) => ({
-      kind: "rejected" as const,
-      message: error instanceof Error ? error.message : String(error),
-    }),
-  );
-}
+const handled = <T>(pending: Promise<T>) => pending.catch((error: unknown) => ({ error }));
 
 function pendingAfter<T>(pending: Promise<T>, milliseconds: number) {
   return Promise.race([
@@ -106,7 +88,6 @@ function captureOptions(
 describe.runIf(runChromiumProof)("managed Chromium action and download cancellation", () => {
   const cleanup: Array<() => Promise<void>> = [];
   const actionObservers = new Map<string, (page: Page) => void>();
-  let observingResolvedPages = false;
 
   afterEach(async () => {
     const errors: unknown[] = [];
@@ -129,14 +110,12 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
 
   async function launchBrowser(rootDir: string, url?: string) {
     const cdpPort = await getFreePort();
-    const context = await getPlaywrightCore().chromium.launchPersistentContext(
-      path.join(rootDir, "profile"),
-      {
-        headless: true,
-        executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
-        args: [`--remote-debugging-port=${cdpPort}`],
-      },
-    );
+    const profileDir = path.join(rootDir, "profile");
+    const context = await getPlaywrightCore().chromium.launchPersistentContext(profileDir, {
+      headless: true,
+      executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+      args: [`--remote-debugging-port=${cdpPort}`],
+    });
     cleanup.push(async () => await context.close());
     const cdpUrl = `http://127.0.0.1:${cdpPort}`;
     cleanup.push(async () => await closePlaywrightBrowserConnection({ cdpUrl }));
@@ -149,8 +128,7 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
 
   async function createDownloadPage(rootDir: string, url: string) {
     const browser = await launchBrowser(rootDir, url);
-    const targetId = await readTargetId(browser.page);
-    return { ...browser, targetId };
+    return { ...browser, targetId: await readTargetId(browser.page) };
   }
 
   async function createActionPages(html: string[]) {
@@ -168,7 +146,7 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
     return { cdpUrl, pages };
   }
 
-  async function createPolicyDownloadPage() {
+  async function preparePolicyDownload(mode: string, allowed: boolean) {
     const rootDir = tempDirs.make("openclaw-download-policy-");
     const payload = Buffer.from("policy download proof\n");
     let downloadRequestCount = 0;
@@ -193,44 +171,28 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
     );
     const controlled = await getPageForTargetId({ cdpUrl, targetId });
     const snapshot = await snapshotRoleViaPlaywright({ cdpUrl, targetId });
-    const refFor = (name: string) => {
-      const match = Object.entries(snapshot.refs).find(([, ref]) => ref.name === name);
-      if (!match) {
-        throw new Error(`Missing download ref: ${name}`);
-      }
-      return match[0];
-    };
-    return {
-      cdpUrl,
-      controlled,
-      downloadRequestCount: () => downloadRequestCount,
-      page,
-      payload,
-      refFor,
-      rootDir,
-      targetId,
-    };
-  }
-
-  async function preparePolicyDownload(mode: string, trigger: string) {
-    const fixture = await createPolicyDownloadPage();
-    const outputPath = path.join(fixture.rootDir, `${mode}-${trigger}.txt`);
+    const trigger = `${allowed ? "Allowed" : "Denied"} download`;
+    const ref = Object.entries(snapshot.refs).find(([, entry]) => entry.name === trigger)?.[0];
+    if (!ref) {
+      throw new Error(`Missing download ref: ${trigger}`);
+    }
+    const outputPath = path.join(rootDir, `${mode}-${trigger}.txt`);
     const options = {
-      ...captureOptions(fixture, fixture.rootDir, outputPath),
+      ...captureOptions({ cdpUrl, targetId }, rootDir, outputPath),
       ssrfPolicy: { dangerouslyAllowPrivateNetwork: false, allowedHostnames: ["localhost"] },
     };
     const pending =
       mode === "ref-based"
-        ? downloadViaPlaywright({ ...options, ref: fixture.refFor(trigger) })
+        ? downloadViaPlaywright({ ...options, ref })
         : waitForDownloadViaPlaywright(options);
     if (mode === "waiter") {
-      await expect.poll(() => ensurePageState(fixture.controlled).downloadWaiterDepth).toBe(1);
-      await fixture.page.getByRole("link", { name: trigger }).click();
+      await expect.poll(() => ensurePageState(controlled).downloadWaiterDepth).toBe(1);
+      await page.getByRole("link", { name: trigger }).click();
     }
-    return { fixture, outputPath, pending };
+    return { outputPath, pending, payload, downloadRequestCount: () => downloadRequestCount };
   }
 
-  function observeLocatorAction(targetId: string, method: "click" | "fill") {
+  function observeLocatorAction(targetId: string, method: "click" | "fill" | "setInputFiles") {
     const started = Promise.withResolvers<void>();
     const settled = Promise.withResolvers<void>();
     const observedFrames = new WeakSet<Frame>();
@@ -250,13 +212,16 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
       if (method === "click") {
         const click = frame.click.bind(frame);
         frame.click = (selector, options) => observe(click(selector, options));
-      } else {
+      } else if (method === "fill") {
         const fill = frame.fill.bind(frame);
         frame.fill = (selector, value, options) => observe(fill(selector, value, options));
+      } else {
+        const setInputFiles = frame.setInputFiles.bind(frame);
+        frame.setInputFiles = (selector, files, options) =>
+          observe(setInputFiles(selector, files, options));
       }
     });
-    if (!observingResolvedPages) {
-      observingResolvedPages = true;
+    if (actionObservers.size === 1) {
       const resolvePage = pwSession.getPageForTargetId;
       const resolver = vi
         .spyOn(pwSession, "getPageForTargetId")
@@ -270,7 +235,6 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
       cleanup.push(async () => {
         resolver.mockRestore();
         actionObservers.clear();
-        observingResolvedPages = false;
       });
     }
     return { started: started.promise, settled: settled.promise };
@@ -300,7 +264,7 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
       ...first!.action,
       signal: controller.signal,
     }).catch((error: unknown) => error);
-    const secondClick = successOutcome(clickViaPlaywright(second!.action));
+    const secondClick = handled(clickViaPlaywright(second!.action));
     await Promise.all([
       waitForNativeAction(firstNative.started, firstClick),
       waitForNativeAction(secondNative.started, secondClick),
@@ -310,7 +274,7 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
     await firstNative.settled;
     await setDisabled(second!.owner, "button", false);
 
-    await expect(secondClick).resolves.toEqual({ ok: true });
+    await expect(secondClick).resolves.toBeUndefined();
     await expect(second!.owner.locator("button").textContent()).resolves.toBe("Clicked");
     expect(second!.controlled.context().browser()?.isConnected()).toBe(true);
   }, 20_000);
@@ -345,18 +309,15 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
     const [first, second] = pages;
     await setDisabled(first!.owner, "button", true);
     const native = observeLocatorAction(first!.targetId, "click");
-    const firstUpload = successOutcome(
-      uploadViaPlaywright({ ...first!.action, paths: [filePath] }),
-    );
+    const firstUpload = handled(uploadViaPlaywright({ ...first!.action, paths: [filePath] }));
     await waitForNativeAction(native.started, firstUpload);
     await uploadViaPlaywright({ ...second!.action, paths: [filePath] });
     await setDisabled(first!.owner, "button", false);
-    await expect(firstUpload).resolves.toEqual({ ok: true });
+    await expect(firstUpload).resolves.toBeUndefined();
     for (const page of pages) {
+      const input = page.owner.locator("input");
       await expect(
-        page.owner
-          .locator("input")
-          .evaluate((element: HTMLInputElement) => element.files?.[0]?.name),
+        input.evaluate((element: HTMLInputElement) => element.files?.[0]?.name),
       ).resolves.toBe("proof.txt");
     }
   }, 20_000);
@@ -365,16 +326,7 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
     const filePath = await createUploadFile();
     const { cdpUrl, pages } = await createActionPages(["<p>Waiting for a file input</p>"]);
     const page = pages[0]!;
-    const started = Promise.withResolvers<void>();
-    const settled = Promise.withResolvers<void>();
-    const frame = page.controlled.mainFrame();
-    const setInputFiles = frame.setInputFiles.bind(frame);
-    frame.setInputFiles = (selector, files, options) => {
-      const pending = setInputFiles(selector, files, options);
-      started.resolve();
-      void pending.then(settled.resolve, settled.resolve);
-      return pending;
-    };
+    const native = observeLocatorAction(page.targetId, "setInputFiles");
     const controller = new AbortController();
     const reason = new Error("direct upload cancelled");
     const upload = setInputFilesViaPlaywright({
@@ -384,7 +336,7 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
       paths: [filePath],
       signal: controller.signal,
     }).catch((error: unknown) => error);
-    await started.promise;
+    await native.started;
     controller.abort(reason);
     await expect(upload).resolves.toBe(reason);
     await page.owner.evaluate(() => {
@@ -392,7 +344,7 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
       input.type = "file";
       document.body.append(input);
     });
-    await settled.promise;
+    await native.settled;
     await expect(
       page.owner.locator("input").evaluate((element: HTMLInputElement) => element.files?.length),
     ).resolves.toBe(0);
@@ -427,24 +379,22 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
     await expect(page.owner.locator("button").textContent()).resolves.toBe("Accepted");
   }, 20_000);
 
-  it.each(["ref-based", "waiter"])(
-    "allows a %s download through a configured strict-policy hostname exception",
-    async (mode) => {
-      const { fixture, pending } = await preparePolicyDownload(mode, "Allowed download");
-      const result = await pending;
-      await expect(fs.readFile(result.path)).resolves.toEqual(fixture.payload);
-      expect(fixture.downloadRequestCount()).toBe(1);
-    },
-    20_000,
-  );
-
-  it.each(["ref-based", "waiter"])(
-    "rejects a %s download outside a configured strict-policy hostname exception",
-    async (mode) => {
-      const { fixture, pending, outputPath } = await preparePolicyDownload(mode, "Denied download");
-      await expect(pending).rejects.toThrow(/blocked|private/i);
-      await expect(fs.access(outputPath)).rejects.toMatchObject({ code: "ENOENT" });
-      expect(fixture.downloadRequestCount()).toBe(0);
+  it.each([
+    { mode: "ref-based", allowed: true },
+    { mode: "waiter", allowed: true },
+    { mode: "ref-based", allowed: false },
+    { mode: "waiter", allowed: false },
+  ])(
+    "applies strict-policy hostname exceptions to $mode downloads (allowed=$allowed)",
+    async ({ mode, allowed }) => {
+      const download = await preparePolicyDownload(mode, allowed);
+      if (allowed) {
+        await expect(fs.readFile((await download.pending).path)).resolves.toEqual(download.payload);
+      } else {
+        await expect(download.pending).rejects.toThrow(/blocked|private/i);
+        await expect(fs.access(download.outputPath)).rejects.toMatchObject({ code: "ENOENT" });
+      }
+      expect(download.downloadRequestCount()).toBe(allowed ? 1 : 0);
     },
     20_000,
   );
@@ -456,7 +406,6 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
       const { write, writeSettled } = observeOutputWriteSettlement(outputFiles);
       onTestFinished(() => write.mockRestore());
       const rootDir = tempDirs.make("openclaw-download-stream-cancel-");
-      cleanup.push(async () => await fs.rm(rootDir, { recursive: true, force: true }));
       let closeDownloadResponse: (() => void) | undefined;
       let responseClosed = false;
       const downloadServer = createServer((request, response) => {
@@ -513,10 +462,7 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
       const capture = waitForDownloadViaPlaywright(
         captureOptions({ cdpUrl, targetId }, outputRoot, outputPath, controller.signal),
       );
-      const outcome = capture.then(
-        () => "resolved" as const,
-        (error: unknown) => error,
-      );
+      const outcome = capture.catch((error: unknown) => error);
       await expect.poll(() => ensurePageState(controlledPage).downloadWaiterDepth).toBe(1);
       await page.locator("#download").click();
       if (failure === "caller abort") {
@@ -542,7 +488,6 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
 
   it("does not let a cancelled waiter capture and write a later download", async () => {
     const rootDir = tempDirs.make("openclaw-download-cancel-");
-    cleanup.push(async () => await fs.rm(rootDir, { recursive: true, force: true }));
 
     const abandonedPayload = Buffer.from("abandoned-click-download\n");
     const successorPayload = Buffer.from("successor-download\n");
@@ -568,30 +513,29 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
     const { context, page, cdpUrl, targetId } = await createDownloadPage(rootDir, url);
     const target = { cdpUrl, targetId };
     const outputRoot = path.join(rootDir, "downloads");
+    const waitForDownload = (file?: string, signal?: AbortSignal) =>
+      waitForDownloadViaPlaywright(captureOptions(target, outputRoot, file, signal));
     const outputPath = path.join(outputRoot, "cancelled.txt");
     const controller = new AbortController();
-    const wait = waitForDownloadViaPlaywright(
-      captureOptions(target, outputRoot, outputPath, controller.signal),
-    );
-    const outcome = rejectionOutcome(wait);
+    const wait = waitForDownload(outputPath, controller.signal);
+    const outcome = wait.catch((error: unknown) => error);
 
     const controlledPage = await getPageForTargetId({ cdpUrl, targetId });
     await expect.poll(() => ensurePageState(controlledPage).downloadWaiterDepth).toBe(1);
-    controller.abort(new Error("request aborted"));
+    const reason = new Error("request aborted");
+    controller.abort(reason);
     const afterAbort = await pendingAfter(outcome, 200);
 
     const successorPath = path.join(outputRoot, "successor.txt");
-    const successor = waitForDownloadViaPlaywright(
-      captureOptions(target, outputRoot, successorPath),
-    );
+    const successor = waitForDownload(successorPath);
     await expect.poll(() => ensurePageState(controlledPage).downloadWaiterDepth).toBe(1);
     await page.locator("#download").click();
     const finalOutcome = await outcome;
     const written = await fs.readFile(outputPath).catch(() => undefined);
     const successorResult = await successor;
 
-    expect(afterAbort).toEqual({ kind: "rejected", message: "request aborted" });
-    expect(finalOutcome).toEqual({ kind: "rejected", message: "request aborted" });
+    expect(afterAbort).toBe(reason);
+    expect(finalOutcome).toBe(reason);
     expect(written).toBeUndefined();
     expect(successorResult.suggestedFilename).toBe("duplicate.txt");
     expect(await fs.readFile(successorResult.path)).toEqual(successorPayload);
@@ -613,25 +557,22 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
       ...captureOptions(target, outputRoot, sharedPath, clickController.signal),
       ref: "e1",
     });
-    const clickOutcome = rejectionOutcome(cancelledClick);
+    const clickOutcome = cancelledClick.catch((error: unknown) => error);
     await expect.poll(() => pageState.downloadWaiterDepth).toBe(1);
-    clickController.abort(new Error("click request aborted"));
+    const clickReason = new Error("click request aborted");
+    clickController.abort(clickReason);
     const clickAfterAbort = await pendingAfter(clickOutcome, 200);
-    expect(clickAfterAbort).toEqual({ kind: "rejected", message: "click request aborted" });
+    expect(clickAfterAbort).toBe(clickReason);
     expect(pageState.downloadWaiterDepth).toBe(0);
 
-    const clickSuccessor = waitForDownloadViaPlaywright(
-      captureOptions(target, outputRoot, sharedPath),
-    );
+    const clickSuccessor = waitForDownload(sharedPath);
     await expect.poll(() => pageState.downloadWaiterDepth).toBe(1);
     const beforeSuccessorClick = await pendingAfter(clickSuccessor, 700);
     expect(beforeSuccessorClick).toEqual({ kind: "pending" });
     await expect(fs.access(sharedPath)).rejects.toMatchObject({ code: "ENOENT" });
     await page.locator("#download").click();
     const clickSuccessorResult = await clickSuccessor;
-    await expect(fs.readFile(clickSuccessorResult.path, "utf8")).resolves.toBe(
-      successorPayload.toString("utf8"),
-    );
+    await expect(fs.readFile(clickSuccessorResult.path)).resolves.toEqual(successorPayload);
 
     await closePlaywrightBrowserConnection({ cdpUrl });
     await context.close();
@@ -640,10 +581,7 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
 
     const downloadAfterRestart = async () => {
       const pending = waitForDownloadViaPlaywright(captureOptions(restarted, outputRoot));
-      const connected = await getPageForTargetId({
-        cdpUrl: restarted.cdpUrl,
-        targetId: restarted.targetId,
-      });
+      const connected = await getPageForTargetId(restarted);
       await expect.poll(() => ensurePageState(connected).downloadWaiterDepth).toBe(1);
       await restarted.page.locator("#download").click();
       return await pending;
@@ -654,12 +592,8 @@ describe.runIf(runChromiumProof)("managed Chromium action and download cancellat
     expect(firstDuplicate.suggestedFilename).toBe("duplicate.txt");
     expect(secondDuplicate.suggestedFilename).toBe("duplicate.txt");
     expect(firstDuplicate.path).not.toBe(secondDuplicate.path);
-    await expect(fs.readFile(firstDuplicate.path, "utf8")).resolves.toBe(
-      successorPayload.toString("utf8"),
-    );
-    await expect(fs.readFile(secondDuplicate.path, "utf8")).resolves.toBe(
-      successorPayload.toString("utf8"),
-    );
+    await expect(fs.readFile(firstDuplicate.path)).resolves.toEqual(successorPayload);
+    await expect(fs.readFile(secondDuplicate.path)).resolves.toEqual(successorPayload);
     expect((await fs.readdir(outputRoot)).some((name) => name.endsWith(".part"))).toBe(false);
 
     await closePlaywrightBrowserConnection({ cdpUrl: restarted.cdpUrl });

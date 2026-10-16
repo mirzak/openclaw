@@ -78,37 +78,45 @@ describe("Playwright download capture cancellation", () => {
     f.expectReleased();
   });
 
-  it.each(["explicit", "passive"] as const)(
-    "enforces the %s download deadline after its event arrives",
+  it.each(["explicit", "passive", "caller cancellation"] as const)(
+    "prevents saving after %s interrupts delayed validation",
     async (mode) => {
-      vi.useFakeTimers();
+      const deadline = mode !== "caller cancellation";
+      if (deadline) {
+        vi.useFakeTimers();
+      }
       const controller = new AbortController();
+      const reason = new Error("download request aborted");
       const validation = Promise.withResolvers<void>();
+      const beforeSave = vi.fn(async () => {
+        await validation.promise;
+      });
       const timeoutMessage =
         mode === "passive"
           ? "Timeout waiting for navigation download"
           : "Timeout waiting for download";
       const f = makeCapture({
-        mode,
+        mode: deadline ? mode : undefined,
         signal: controller.signal,
         timeoutMessage,
-        beforeSave: async () => {
-          await validation.promise;
-        },
-        timeout: 25,
+        beforeSave,
+        timeout: deadline ? 25 : 1_000,
       });
 
       try {
         f.emit();
-        await vi.advanceTimersByTimeAsync(25);
-
-        await expect(pendingOr(f.outcome)).resolves.toMatchObject({
-          message: timeoutMessage,
-        });
+        expect(beforeSave).toHaveBeenCalledOnce();
+        if (deadline) {
+          await vi.advanceTimersByTimeAsync(25);
+          await expect(pendingOr(f.outcome)).resolves.toMatchObject({ message: timeoutMessage });
+        } else {
+          controller.abort(reason);
+          await nextTurn();
+          expect(await pendingOr(f.outcome)).toBe(reason);
+        }
         expect(f.cancel).toHaveBeenCalledOnce();
         validation.resolve();
-        await vi.advanceTimersByTimeAsync(0);
-
+        await (deadline ? vi.advanceTimersByTimeAsync(0) : nextTurn());
         expect(f.saveAs).not.toHaveBeenCalled();
         f.expectReleased();
       } finally {
@@ -119,34 +127,6 @@ describe("Playwright download capture cancellation", () => {
       }
     },
   );
-
-  it("cancels a captured download before delayed validation can save bytes", async () => {
-    const controller = new AbortController();
-    const reason = new Error("download request aborted");
-    const validation = Promise.withResolvers<void>();
-    const beforeSave = vi.fn(async () => {
-      await validation.promise;
-    });
-    const f = makeCapture({ beforeSave, signal: controller.signal });
-
-    try {
-      f.emit();
-      expect(beforeSave).toHaveBeenCalledOnce();
-      controller.abort(reason);
-      await nextTurn();
-
-      expect(f.cancel).toHaveBeenCalledOnce();
-      expect(await pendingOr(f.outcome)).toBe(reason);
-      validation.resolve();
-      await nextTurn();
-
-      expect(f.saveAs).not.toHaveBeenCalled();
-      f.expectReleased();
-    } finally {
-      validation.resolve();
-      await f.outcome;
-    }
-  });
 
   it.for(["caller cancellation", "download deadline"] as const)(
     "discards an in-progress staged download on %s",

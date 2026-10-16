@@ -3,11 +3,11 @@ import path from "node:path";
 import { extractOriginalFilename } from "openclaw/plugin-sdk/media-runtime";
 import { createTempHomeEnv, type TempHomeEnv } from "openclaw/plugin-sdk/test-env";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { BROWSER_PROXY_MAX_FILE_BYTES } from "../browser-proxy-envelope.js";
+import { BROWSER_PROXY_MAX_FILE_BYTES as MAX_FILE_BYTES } from "../browser-proxy-envelope.js";
 import { persistBrowserProxyResultFiles } from "./proxy-files.js";
 
-const BROWSER_PROXY_MAX_FILES = 256;
-const BROWSER_PROXY_MAX_TOTAL_FILE_BYTES = 16 * 1024 * 1024;
+const MAX_TOTAL_FILE_BYTES = 16 * 1024 * 1024;
+const BINARY_MIME = "application/octet-stream";
 const file = (filePath: string, contents: string | Buffer = "", mimeType?: string) => ({
   path: filePath,
   base64: Buffer.from(contents).toString("base64"),
@@ -21,9 +21,7 @@ describe("persistBrowserProxyResultFiles", () => {
     tempHome = await createTempHomeEnv("openclaw-browser-proxy-files-");
   });
 
-  afterEach(async () => {
-    await tempHome.restore();
-  });
+  afterEach(() => tempHome.restore());
 
   async function expectRejected(result: unknown, files: unknown, message: string) {
     const persisting = persistBrowserProxyResultFiles(result, files);
@@ -50,11 +48,8 @@ describe("persistBrowserProxyResultFiles", () => {
   });
 
   it("persists legitimate empty browser proxy downloads", async () => {
-    const sourcePath = "/tmp/empty-browser-download.bin";
-    const result = { path: sourcePath };
-    await persistBrowserProxyResultFiles(result, [
-      file(sourcePath, "", "application/octet-stream"),
-    ]);
+    const result = { path: "/tmp/empty-browser-download.bin" };
+    await persistBrowserProxyResultFiles(result, [file(result.path, "", BINARY_MIME)]);
 
     const savedPath = result.path;
     expect(typeof savedPath).toBe("string");
@@ -63,27 +58,21 @@ describe("persistBrowserProxyResultFiles", () => {
   });
 
   it("rejects an oversized aggregate before persisting any files", async () => {
-    const first = Buffer.alloc(BROWSER_PROXY_MAX_FILE_BYTES, 0x41);
-    const second = Buffer.alloc(
-      BROWSER_PROXY_MAX_TOTAL_FILE_BYTES - BROWSER_PROXY_MAX_FILE_BYTES + 1,
-      0x42,
-    );
+    const first = Buffer.alloc(MAX_FILE_BYTES, 0x41);
+    const second = Buffer.alloc(MAX_TOTAL_FILE_BYTES - MAX_FILE_BYTES + 1, 0x42);
 
     await expectRejected(
       { downloads: [{ path: "/tmp/first.bin" }, { path: "/tmp/second.bin" }] },
-      [
-        file("/tmp/first.bin", first, "application/octet-stream"),
-        file("/tmp/second.bin", second, "application/octet-stream"),
-      ],
+      [file("/tmp/first.bin", first, BINARY_MIME), file("/tmp/second.bin", second, BINARY_MIME)],
       "browser proxy files exceed 16 MiB aggregate limit",
     );
   });
 
   it("rejects a file above the proxy per-file limit", async () => {
-    const oversized = Buffer.alloc(BROWSER_PROXY_MAX_FILE_BYTES + 1, 0x41);
+    const oversized = Buffer.alloc(MAX_FILE_BYTES + 1, 0x41);
     await expectRejected(
       { path: "/tmp/oversized.bin" },
-      [file("/tmp/oversized.bin", oversized, "application/octet-stream")],
+      [file("/tmp/oversized.bin", oversized, BINARY_MIME)],
       "browser proxy file exceeds 10 MiB limit",
     );
   });
@@ -105,8 +94,8 @@ describe("persistBrowserProxyResultFiles", () => {
   });
 
   it("rejects too many files before persisting any", async () => {
-    const files = Array.from({ length: BROWSER_PROXY_MAX_FILES + 1 }, (_, index) =>
-      file(`/tmp/file-${index}.bin`, "", "application/octet-stream"),
+    const files = Array.from({ length: 257 }, (_, index) =>
+      file(`/tmp/file-${index}.bin`, "", BINARY_MIME),
     );
 
     await expectRejected(
