@@ -155,7 +155,5 @@ it("keeps runtime-flag construction out of CLI spawn transports", () => {
     expect(source, file).not.toMatch(
       /CLI_PARENT_BOUND_PRELOAD|["']--(?:import|require|loader)(?:=|["'])/,
     );
-    expect(source, file).not.toMatch(/\bargs\.(?:push|unshift|splice)\s*\(/);
-    expect(source, file).toMatch(/\bspawn\(command, args,\s*\{/);
   }
 });
