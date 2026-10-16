@@ -13,6 +13,7 @@ import { captureCronSchedulerWakeForTest } from "../cron/service/scheduler-actor
 import { saveCronJobsStore } from "../cron/store.js";
 import { cronStoreKey } from "../cron/store/key.js";
 import { loadCronRows, loadedCronStoreFromRows } from "../cron/store/row-codec.js";
+import type { CronJob } from "../cron/types.js";
 import { runInitialConfigWriteHealth } from "../flows/doctor-health-contribution-runners.config.js";
 import { mintCronStandingGrantLocked } from "../gateway/operator-approval-standing-grants.worker.js";
 import * as sqliteSnapshot from "../infra/sqlite-snapshot.js";
@@ -59,30 +60,50 @@ function sourceConfig(storePath?: string) {
 }
 
 async function seedJobs(storePath: string) {
-  await saveCronJobsStore(storePath, {
-    version: 1,
-    jobs: [
-      makeCronJob({
-        id: "historical",
-        enabled: false,
-        state: { lastRunAtMs: 123, lastRunStatus: "ok" },
-      }),
-      makeCronJob({ id: "explicit", agentId: "research", enabled: false }),
-      makeCronJob({ id: "session", sessionKey: "agent:research:main", enabled: false }),
-      makeCronJob({ id: "sql-owner", enabled: false }),
-    ],
-  });
-  const db = openOpenClawStateDatabase().db;
-  db.prepare(
+  await saveJobs(
+    storePath,
+    { id: "historical", enabled: false, state: { lastRunAtMs: 123, lastRunStatus: "ok" } },
+    { id: "explicit", agentId: "research", enabled: false },
+    { id: "session", sessionKey: "agent:research:main", enabled: false },
+    { id: "sql-owner", enabled: false },
+  );
+  runSql(
     "UPDATE cron_jobs SET agent_id = 'research' WHERE store_key = ? AND job_id = 'sql-owner'",
-  ).run(cronStoreKey(storePath));
-  db.prepare(
+    cronStoreKey(storePath),
+  );
+  runSql(
     "UPDATE cron_jobs SET job_json = json_set(job_json, '$.authoredNote', 'keep me') WHERE store_key = ? AND job_id = 'historical'",
-  ).run(cronStoreKey(storePath));
+    cronStoreKey(storePath),
+  );
 }
+
+const saveJobs = (storePath: string, ...jobs: Partial<CronJob>[]) =>
+  saveCronJobsStore(storePath, { version: 1, jobs: jobs.map(makeCronJob) });
 
 function rows(storePath: string) {
   return loadCronRows(openOpenClawStateDatabase().db, cronStoreKey(storePath));
+}
+
+const definitions = (stored: ReturnType<typeof rows>) =>
+  stored.map(({ job_id, job_json, agent_id }) => ({ job_id, job_json, agent_id }));
+const jobRow = (storePath: string, id: string) => rows(storePath).find((row) => row.job_id === id);
+const storedState = async (state: OpenClawTestState, storePath: string) => ({
+  jobs: rows(storePath),
+  config: await readText(state.configPath),
+  backups: await backups(),
+});
+
+function backupRows(backupPath: string, storePath: string, verify = false) {
+  const backup = new DatabaseSync(backupPath, { readOnly: true });
+  try {
+    if (verify) {
+      expect(backup.prepare("PRAGMA integrity_check").get()?.integrity_check).toBe("ok");
+      expect(backup.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    }
+    return loadCronRows(backup, cronStoreKey(storePath));
+  } finally {
+    backup.close();
+  }
 }
 
 async function backups() {
@@ -92,20 +113,30 @@ async function backups() {
     .map((name) => path.join(path.dirname(databasePath), name));
 }
 
-async function withSeededState(
+async function withState(
   label: string,
   run: (state: OpenClawTestState, storePath: string) => Promise<void>,
+  config: Parameters<OpenClawTestState["writeConfig"]>[0] = sourceConfig(),
 ) {
   return withOpenClawTestState(
     { label, env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" } },
     async (state) => {
-      await state.writeConfig(sourceConfig());
-      const storePath = state.statePath("cron", "jobs.json");
-      await seedJobs(storePath);
-      await run(state, storePath);
+      await state.writeConfig(config);
+      await run(state, state.statePath("cron", "jobs.json"));
     },
   );
 }
+
+const withSeededState = (label: string, run: Parameters<typeof withState>[1]) =>
+  withState(label, async (state, storePath) => {
+    await seedJobs(storePath);
+    await run(state, storePath);
+  });
+
+const repairLegacy = (ctx: Awaited<ReturnType<typeof prepareDoctorContext>>) =>
+  withDoctorConfigMaintenance(() =>
+    maybeRepairLegacyCronStore({ cfg: ctx.cfg, options: ctx.options, prompter: ctx.prompter }),
+  );
 
 async function repair(state: OpenClawTestState) {
   return withDoctorConfigMaintenance(async () => {
@@ -134,27 +165,29 @@ function createCron(storePath: string, defaultAgentId?: string) {
   return { cron, state, scheduler, execute, clock };
 }
 
+async function withCron(
+  storePath: string,
+  run: (service: ReturnType<typeof createCron>) => Promise<void>,
+  defaultAgentId?: string,
+) {
+  const service = createCron(storePath, defaultAgentId);
+  try {
+    await run(service);
+  } finally {
+    service.cron.stop();
+    await service.scheduler.stop();
+  }
+}
+
 it.each(["retains", "removes"])(
   "refuses an ordinary roster write that %s the historical agent without changing its jobs",
   async (agentChange) => {
-    await withOpenClawTestState(
-      { label: "cron-owner-config-refusal", env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" } },
-      async (state) => {
-        const config = sourceConfig();
-        await state.writeConfig({
-          ...config,
-          agents: {
-            ...config.agents,
-            defaults: {
-              ...config.agents.defaults,
-              ...(agentChange === "removes" ? { authInheritance: { agentId: "research" } } : {}),
-            },
-          },
-        });
-        const storePath = state.statePath("cron", "jobs.json");
+    const config = sourceConfig();
+    await withState(
+      "cron-owner-config-refusal",
+      async (state, storePath) => {
         await seedJobs(storePath);
-        const beforeRows = rows(storePath);
-        const beforeConfig = await readText(state.configPath);
+        const before = await storedState(state, storePath);
         const write = transformConfigFile({
           transform: (current) => {
             const canonical = createCanonicalAgentConfigFixture(current).config;
@@ -177,9 +210,17 @@ it.each(["retains", "removes"])(
           refusal: "cron-owner-safety",
         });
         await expect(write).rejects.toThrow("openclaw doctor --fix");
-        expect(rows(storePath)).toEqual(beforeRows);
-        expect(await readText(state.configPath)).toBe(beforeConfig);
-        expect(await backups()).toEqual([]);
+        expect(await storedState(state, storePath)).toEqual({ ...before, backups: [] });
+      },
+      {
+        ...config,
+        agents: {
+          ...config.agents,
+          defaults: {
+            ...config.agents.defaults,
+            ...(agentChange === "removes" ? { authInheritance: { agentId: "research" } } : {}),
+          },
+        },
       },
     );
   },
@@ -189,8 +230,7 @@ it.each(["update", "remove"])(
   "refuses an operator %s before changing an unresolved historical job",
   async (operation) => {
     await withSeededState("cron-owner-mutation-refusal", async (_state, storePath) => {
-      const { cron } = createCron(storePath);
-      try {
+      await withCron(storePath, async ({ cron }) => {
         expect(
           (await cron.list({ includeDisabled: true })).some((job) => job.id === "historical"),
         ).toBe(true);
@@ -202,53 +242,38 @@ it.each(["update", "remove"])(
         await expect(operationResult).rejects.toThrow(CRON_AGENT_SELECTION_REQUIRED_MESSAGE);
         expect(rows(storePath)).toEqual(beforeRows);
         expect(await backups()).toEqual([]);
-      } finally {
-        cron.stop();
-      }
+      });
     });
   },
 );
 
 it("preserves historical and explicit jobs when agent deletion needs Doctor", async () => {
-  await withOpenClawTestState(
-    { label: "cron-owner-agent-deletion", env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" } },
-    async (state) => {
-      await state.writeConfig(sourceConfig());
-      const storePath = state.statePath("cron", "jobs.json");
-      await saveCronJobsStore(storePath, {
-        version: 1,
-        jobs: [
-          makeCronJob({ id: "historical", enabled: false }),
-          makeCronJob({ id: "research", agentId: "research", enabled: false }),
-        ],
-      });
-      const { cron } = createCron(storePath);
-      try {
-        await cron.list({ includeDisabled: true });
-        const beforeRows = rows(storePath);
-        const beforeConfig = await readText(state.configPath);
-        await expect(
-          cron.removeAgentJobsTransactional("research", () =>
-            transformConfigFile({
-              transform: (current) => ({
-                nextConfig: pruneAgentConfig(
-                  createCanonicalAgentConfigFixture(current).config,
-                  "research",
-                ).config,
-              }),
-              writeOptions: { allowedAgentRosterRemovals: ["research"] },
-              afterWrite: { mode: "none", reason: "test agent deletion" },
+  await withState("cron-owner-agent-deletion", async (state, storePath) => {
+    await saveJobs(
+      storePath,
+      { id: "historical", enabled: false },
+      { id: "research", agentId: "research", enabled: false },
+    );
+    await withCron(storePath, async ({ cron }) => {
+      await cron.list({ includeDisabled: true });
+      const before = await storedState(state, storePath);
+      await expect(
+        cron.removeAgentJobsTransactional("research", () =>
+          transformConfigFile({
+            transform: (current) => ({
+              nextConfig: pruneAgentConfig(
+                createCanonicalAgentConfigFixture(current).config,
+                "research",
+              ).config,
             }),
-          ),
-        ).rejects.toMatchObject({ code: "CONFIG_WRITE_REJECTED", refusal: "cron-owner-safety" });
-        expect(rows(storePath)).toEqual(beforeRows);
-        expect(await readText(state.configPath)).toBe(beforeConfig);
-        expect(await backups()).toEqual([]);
-      } finally {
-        cron.stop();
-      }
-    },
-  );
+            writeOptions: { allowedAgentRosterRemovals: ["research"] },
+            afterWrite: { mode: "none", reason: "test agent deletion" },
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "CONFIG_WRITE_REJECTED", refusal: "cron-owner-safety" });
+      expect(await storedState(state, storePath)).toEqual({ ...before, backups: [] });
+    });
+  });
 });
 
 it("preserves malformed cron bytes and the historical marker when Doctor cannot verify ownership", async () => {
@@ -257,12 +282,9 @@ it("preserves malformed cron bytes and the historical marker when Doctor cannot 
       "UPDATE cron_jobs SET job_json = '{malformed' WHERE store_key = ? AND job_id = 'historical'",
       cronStoreKey(storePath),
     );
-    const before = rows(storePath);
-    const beforeConfig = await readText(state.configPath);
+    const before = await storedState(state, storePath);
     await expect(repair(state)).rejects.toThrow("Cannot verify ownership of malformed cron job");
-    expect(rows(storePath)).toEqual(before);
-    expect(await readText(state.configPath)).toBe(beforeConfig);
-    expect(await backups()).toEqual([]);
+    expect(await storedState(state, storePath)).toEqual({ ...before, backups: [] });
   });
 });
 
@@ -275,67 +297,49 @@ it("leaves SQLite owners unchanged on ordinary cron startup", async () => {
       "UPDATE cron_jobs SET state_json = json_set(state_json, '$.nextRunAtMs', 123), job_json = json_set(job_json, '$.notify', json('true')) WHERE store_key = ? AND job_id = 'sql-owner'",
       cronStoreKey(storePath),
     );
-    const beforeDefinitions = rows(storePath).map(({ job_id, job_json, agent_id }) => ({
-      job_id,
-      job_json,
-      agent_id,
-    }));
-    const { cron, scheduler, execute } = createCron(storePath);
-    try {
+    const beforeDefinitions = definitions(rows(storePath));
+    await withCron(storePath, async ({ cron, execute }) => {
       await cron.start();
       expect(
-        rows(storePath).map(({ job_id, job_json, agent_id }) => ({ job_id, job_json, agent_id })),
+        definitions(rows(storePath)),
         "Gateway startup must not repair stored cron ownership",
       ).toEqual(beforeDefinitions);
       expect(
         JSON.parse(
-          expectDefined(
-            rows(storePath).find((row) => row.job_id === "sql-owner"),
-            "SQL-owned job after runtime maintenance",
-          ).state_json,
+          expectDefined(jobRow(storePath, "sql-owner"), "SQL-owned job after runtime maintenance")
+            .state_json,
         ).nextRunAtMs,
       ).toBeUndefined();
       expect(execute).not.toHaveBeenCalled();
       expect(await backups()).toEqual([]);
-    } finally {
-      cron.stop();
-      await scheduler.stop();
-    }
+    });
   });
 });
 
 it("preserves a due legacy one-shot through Doctor ownership repair, then runs it once", async () => {
-  await withOpenClawTestState(
-    { label: "cron-owner-one-shot", env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" } },
-    async (state) => {
-      await state.writeConfig(sourceConfig());
-      const storePath = state.statePath("cron", "jobs.json");
-      const dueAt = Date.now() - 1_000;
-      await saveCronJobsStore(storePath, {
-        version: 1,
-        jobs: [
-          makeCronJob({
-            id: "pending-one-shot",
-            enabled: true,
-            deleteAfterRun: false,
-            schedule: { kind: "at", at: new Date(dueAt).toISOString() },
-            payload: { kind: "agentTurn", message: "Run after owner repair", toolsAllow: [] },
-            state: { nextRunAtMs: dueAt },
-          }),
-        ],
-      });
-      const original = rows(storePath);
-      expect((await readConfigFileSnapshot()).valid).toBe(false);
-      expect(rows(storePath)).toEqual(original);
-      const readReceipts = () =>
-        allSql(
-          "SELECT status FROM cron_run_receipts WHERE job_id = 'pending-one-shot' ORDER BY started_at_ms",
-        );
-      expect(readReceipts()).toEqual([]);
-      await repair(state);
-      expect(await backups()).toHaveLength(1);
-      const repaired = createCron(storePath, "research");
-      try {
+  await withState("cron-owner-one-shot", async (state, storePath) => {
+    const dueAt = Date.now() - 1_000;
+    await saveJobs(storePath, {
+      id: "pending-one-shot",
+      enabled: true,
+      deleteAfterRun: false,
+      schedule: { kind: "at", at: new Date(dueAt).toISOString() },
+      payload: { kind: "agentTurn", message: "Run after owner repair", toolsAllow: [] },
+      state: { nextRunAtMs: dueAt },
+    });
+    const original = rows(storePath);
+    expect((await readConfigFileSnapshot()).valid).toBe(false);
+    expect(rows(storePath)).toEqual(original);
+    const readReceipts = () =>
+      allSql(
+        "SELECT status FROM cron_run_receipts WHERE job_id = 'pending-one-shot' ORDER BY started_at_ms",
+      );
+    expect(readReceipts()).toEqual([]);
+    await repair(state);
+    expect(await backups()).toHaveLength(1);
+    await withCron(
+      storePath,
+      async (repaired) => {
         const { wake } = await captureCronSchedulerWakeForTest(() => repaired.cron.start());
         expect(repaired.execute).not.toHaveBeenCalled();
         expect(readReceipts()).toEqual([]);
@@ -358,12 +362,10 @@ it("preserves a due legacy one-shot through Doctor ownership repair, then runs i
         await repaired.cron.start();
         expect(repaired.execute).toHaveBeenCalledOnce();
         expect(readReceipts()).toEqual([{ status: "ok" }]);
-      } finally {
-        repaired.cron.stop();
-        await repaired.scheduler.stop();
-      }
-    },
-  );
+      },
+      "research",
+    );
+  });
 });
 
 it.each([
@@ -374,118 +376,81 @@ it.each([
 ])(
   "keeps $name delivery visible and requires Doctor before execution",
   async ({ mode, expected }) => {
-    await withOpenClawTestState(
-      { label: "cron-delivery-doctor", env: { OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" } },
-      async (state) => {
-        await state.writeConfig(sourceConfig());
-        const storePath = state.statePath("cron", "jobs.json");
-        await saveCronJobsStore(storePath, {
-          version: 1,
-          jobs: [
-            makeCronJob({
-              id: "delivery-repair",
-              agentId: "ops",
-              schedule: { kind: "every", everyMs: 60_000, anchorMs: Date.now() },
-              payload: { kind: "agentTurn", message: "synthetic delivery repair", toolsAllow: [] },
-              delivery: { mode: "announce" },
-              state: { lastRunAtMs: 123, lastRunStatus: "ok" },
-            }),
-          ],
-        });
-        const db = openOpenClawStateDatabase().db;
-        const definition = JSON.parse(rows(storePath)[0]!.job_json);
-        definition.delivery = {
-          ...(mode === undefined ? {} : { mode }),
-          to: expected === "webhook" ? "https://example.invalid/hook" : "synthetic-target",
-          ...(expected === "webhook" ? {} : { channel: "telegram" }),
-        };
-        definition.authoredNote = "preserve this definition";
-        db.prepare("UPDATE cron_jobs SET job_json = ? WHERE store_key = ? AND job_id = ?").run(
-          JSON.stringify(definition),
-          cronStoreKey(storePath),
-          "delivery-repair",
+    await withState("cron-delivery-doctor", async (state, storePath) => {
+      await saveJobs(storePath, {
+        id: "delivery-repair",
+        agentId: "ops",
+        schedule: { kind: "every", everyMs: 60_000, anchorMs: Date.now() },
+        payload: { kind: "agentTurn", message: "synthetic delivery repair", toolsAllow: [] },
+        delivery: { mode: "announce" },
+        state: { lastRunAtMs: 123, lastRunStatus: "ok" },
+      });
+      const definition = JSON.parse(rows(storePath)[0]!.job_json);
+      definition.delivery = {
+        ...(mode === undefined ? {} : { mode }),
+        to: expected === "webhook" ? "https://example.invalid/hook" : "synthetic-target",
+        ...(expected === "webhook" ? {} : { channel: "telegram" }),
+      };
+      definition.authoredNote = "preserve this definition";
+      runSql(
+        "UPDATE cron_jobs SET job_json = ? WHERE store_key = ? AND job_id = ?",
+        JSON.stringify(definition),
+        cronStoreKey(storePath),
+        "delivery-repair",
+      );
+      const original = rows(storePath);
+      await withCron(storePath, async ({ cron, execute }) => {
+        await cron.start();
+        expect(cron.getJob("delivery-repair")?.delivery).toEqual(definition.delivery);
+        await expect(cron.run("delivery-repair", "force")).rejects.toThrow(
+          "delivery requires an explicit mode",
         );
-        const original = rows(storePath);
-        const { cron, scheduler, execute } = createCron(storePath);
-        try {
-          await cron.start();
-          expect(cron.getJob("delivery-repair")?.delivery).toEqual(definition.delivery);
-          await expect(cron.run("delivery-repair", "force")).rejects.toThrow(
-            "delivery requires an explicit mode",
-          );
-          expect(execute).not.toHaveBeenCalled();
-          expect(rows(storePath).map(({ job_json, agent_id }) => ({ job_json, agent_id }))).toEqual(
-            original.map(({ job_json, agent_id }) => ({ job_json, agent_id })),
-          );
-          expect(await backups()).toEqual([]);
-          cron.stop();
-          await cron.waitForIdle();
-          const beforeDoctor = rows(storePath);
+        expect(execute).not.toHaveBeenCalled();
+        expect(definitions(rows(storePath))).toEqual(definitions(original));
+        expect(await backups()).toEqual([]);
+        cron.stop();
+        await cron.waitForIdle();
+        const beforeDoctor = rows(storePath);
 
-          const ctx = await repair(state);
-          if (mode === undefined) {
-            const snapshot = vi
-              .spyOn(sqliteSnapshot, "createVerifiedSqliteSnapshot")
-              .mockRejectedValueOnce(new Error("synthetic backup failure"));
-            try {
-              await withDoctorConfigMaintenance(() =>
-                maybeRepairLegacyCronStore({
-                  cfg: ctx.cfg,
-                  options: ctx.options,
-                  prompter: ctx.prompter,
-                }),
-              );
-              expect(snapshot).toHaveBeenCalledOnce();
-              expect(rows(storePath)).toEqual(beforeDoctor);
-              expect(await backups()).toEqual([]);
-            } finally {
-              snapshot.mockRestore();
-            }
-          }
-          await withDoctorConfigMaintenance(() =>
-            maybeRepairLegacyCronStore({
-              cfg: ctx.cfg,
-              options: ctx.options,
-              prompter: ctx.prompter,
-            }),
-          );
-          const repaired = rows(storePath)[0]!;
-          expect(JSON.parse(repaired.job_json)).toMatchObject({
-            agentId: "ops",
-            authoredNote: "preserve this definition",
-            delivery: { ...definition.delivery, mode: expected },
-          });
-          expect(repaired.state_json).toBe(beforeDoctor[0]!.state_json);
-          expect(repaired.sort_order).toBe(original[0]!.sort_order);
-          const savedBackups = await backups();
-          expect(savedBackups).toHaveLength(1);
-          const backup = new DatabaseSync(savedBackups[0]!, { readOnly: true });
+        const ctx = await repair(state);
+        if (mode === undefined) {
+          const snapshot = vi
+            .spyOn(sqliteSnapshot, "createVerifiedSqliteSnapshot")
+            .mockRejectedValueOnce(new Error("synthetic backup failure"));
           try {
-            expect(loadCronRows(backup, cronStoreKey(storePath))).toEqual(beforeDoctor);
+            await repairLegacy(ctx);
+            expect(snapshot).toHaveBeenCalledOnce();
+            expect(rows(storePath)).toEqual(beforeDoctor);
+            expect(await backups()).toEqual([]);
           } finally {
-            backup.close();
+            snapshot.mockRestore();
           }
-          await withDoctorConfigMaintenance(() =>
-            maybeRepairLegacyCronStore({
-              cfg: ctx.cfg,
-              options: ctx.options,
-              prompter: ctx.prompter,
-            }),
-          );
-          expect(rows(storePath)).toEqual([repaired]);
-          await cron.start();
-          expect(cron.getJob("delivery-repair")?.delivery?.mode).toBe(expected);
-          await expect(cron.run("delivery-repair", "force")).resolves.toEqual({
-            ok: true,
-            ran: true,
-          });
-          expect(execute).toHaveBeenCalledOnce();
-        } finally {
-          cron.stop();
-          await scheduler.stop();
         }
-      },
-    );
+        await repairLegacy(ctx);
+        const repaired = rows(storePath)[0]!;
+        expect(JSON.parse(repaired.job_json)).toMatchObject({
+          agentId: "ops",
+          authoredNote: "preserve this definition",
+          delivery: { ...definition.delivery, mode: expected },
+        });
+        expect(repaired).toMatchObject({
+          state_json: beforeDoctor[0]!.state_json,
+          sort_order: original[0]!.sort_order,
+        });
+        const savedBackups = await backups();
+        expect(savedBackups).toHaveLength(1);
+        expect(backupRows(savedBackups[0]!, storePath)).toEqual(beforeDoctor);
+        await repairLegacy(ctx);
+        expect(rows(storePath)).toEqual([repaired]);
+        await cron.start();
+        expect(cron.getJob("delivery-repair")?.delivery?.mode).toBe(expected);
+        await expect(cron.run("delivery-repair", "force")).resolves.toEqual({
+          ok: true,
+          ran: true,
+        });
+        expect(execute).toHaveBeenCalledOnce();
+      });
+    });
   },
 );
 
@@ -571,10 +536,7 @@ it.each([
       }
       const otherStorePath = state.statePath("other-cron", "jobs.json");
       if (machineStore) {
-        await saveCronJobsStore(otherStorePath, {
-          version: 1,
-          jobs: [makeCronJob({ id: "other-ownerless", enabled: false })],
-        });
+        await saveJobs(otherStorePath, { id: "other-ownerless", enabled: false });
       }
       const readOtherRows = () =>
         allSql(
@@ -638,8 +600,7 @@ it.each([
         if (!customStore && id !== "sql-owner") {
           expect(row).toEqual(before);
         } else {
-          expect(row?.state_json).toBe(before?.state_json);
-          expect(row?.agent_id).toBe(before?.agent_id);
+          expect(row).toMatchObject({ state_json: before?.state_json, agent_id: before?.agent_id });
         }
       }
       expect(
@@ -651,17 +612,7 @@ it.each([
       }
       const savedBackups = await backups();
       expect(savedBackups).toHaveLength(1);
-      const backedUpRows = savedBackups.map((backupPath) => {
-        const backup = new DatabaseSync(backupPath, { readOnly: true });
-        try {
-          expect(backup.prepare("PRAGMA integrity_check").get()?.integrity_check).toBe("ok");
-          expect(backup.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
-          return loadCronRows(backup, cronStoreKey(storePath));
-        } finally {
-          backup.close();
-        }
-      });
-      expect(backedUpRows).toEqual([original]);
+      expect(backupRows(savedBackups[0]!, storePath, true)).toEqual(original);
       const repairedDefinitions = rows(storePath);
       await repair(state);
       expect(rows(storePath)).toEqual(repairedDefinitions);
@@ -690,7 +641,7 @@ it("retains the marker and a verified backup when SQL ownership changes after in
     await expect(repair(state)).rejects.toThrow("Cron ownership changed during Doctor repair");
     snapshot.mockRestore();
     expect(await readText(state.configPath)).toBe(originalConfig);
-    const historical = rows(storePath).find((row) => row.job_id === "historical");
+    const historical = jobRow(storePath, "historical");
     expect(historical?.agent_id).toBe("research");
     expect(JSON.parse(historical?.job_json ?? "null")).not.toHaveProperty("agentId");
     expect(await backups()).toHaveLength(1);

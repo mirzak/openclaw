@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveConfiguredModelFallbacks } from "../agents/model-selection-resolve.js";
 import { retainLegacyDefaultAgentId } from "../config/legacy.default-agent-owner.js";
 import {
@@ -20,6 +20,13 @@ import {
 const noteMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../../packages/terminal-core/src/note.js", () => ({ note: noteMock }));
+beforeEach(() => noteMock.mockClear());
+
+function expectContains(message: unknown, fragments: string[]) {
+  for (const fragment of fragments) {
+    expect(message).toContain(fragment);
+  }
+}
 
 function collectWarnings(run: () => void): string[] {
   noteMock.mockClear();
@@ -37,7 +44,6 @@ describe("doctor config analysis helpers", () => {
   it.each(["missing", "pending"] as const)(
     "reports %s hook credentials with guidance without exposing or rewriting the token",
     (kind) => {
-      noteMock.mockClear();
       const cfg: OpenClawConfig = {
         hooks: { enabled: true, token: "synthetic-private-hook-value" },
       };
@@ -50,16 +56,17 @@ describe("doctor config analysis helpers", () => {
       );
       noteDoctorHookConfigWarnings(cfg, "/virtual/.openclaw/openclaw.json");
       const message = String(noteMock.mock.calls[0]?.[0]);
-      expect(message).toContain("hooks.token has an unresolved environment reference");
-      expect(message).toContain("CLI and service environments may differ");
-      expect(message).toContain("openclaw config set hooks.enabled false");
+      expectContains(message, [
+        "hooks.token has an unresolved environment reference",
+        "CLI and service environments may differ",
+        "openclaw config set hooks.enabled false",
+      ]);
       expect(message).not.toContain("synthetic-private-hook-value");
       expect(cfg.hooks?.token).toBe("synthetic-private-hook-value");
     },
   );
 
   it.each([true, false])("does not warn about literal hook tokens (enabled=%s)", (enabled) => {
-    noteMock.mockClear();
     noteDoctorHookConfigWarnings(
       { hooks: { enabled, token: "synthetic-literal-hook-value" } },
       "/virtual/.openclaw/openclaw.json",
@@ -68,28 +75,22 @@ describe("doctor config analysis helpers", () => {
   });
 
   it("warns when hooks transformsDir points outside the hook transforms root", () => {
-    noteMock.mockClear();
+    const transformsDir = "/virtual/.openclaw/workspace/skills/linear-webhook";
     noteDoctorHookConfigWarnings(
-      {
-        hooks: {
-          enabled: true,
-          token: "hook-secret",
-          transformsDir: "/virtual/.openclaw/workspace/skills/linear-webhook",
-        },
-      },
+      { hooks: { enabled: true, token: "hook-secret", transformsDir } },
       "/virtual/.openclaw/openclaw.json",
     );
 
     expect(noteMock).toHaveBeenCalledExactlyOnceWith(expect.any(String), "Doctor warnings");
-    const warning = String(noteMock.mock.calls[0]?.[0]);
-    expect(warning).toContain("hooks.transformsDir:");
-    expect(warning).toContain("/virtual/.openclaw/workspace/skills/linear-webhook");
-    expect(warning).toContain("/virtual/.openclaw/hooks/transforms");
-    expect(warning).toContain("move custom transforms there or remove hooks.transformsDir");
+    expectContains(noteMock.mock.calls[0]?.[0], [
+      "hooks.transformsDir:",
+      transformsDir,
+      "/virtual/.openclaw/hooks/transforms",
+      "move custom transforms there or remove hooks.transformsDir",
+    ]);
   });
 
   it("requires a durable default designation despite retained migration provenance", () => {
-    noteMock.mockClear();
     const cfg = retainLegacyDefaultAgentId(
       {
         agents: { ownership: "explicit", entries: { ops: {}, research: {} } },
@@ -106,20 +107,13 @@ describe("doctor config analysis helpers", () => {
   });
 
   it("classifies external OpenCode overrides only while their plugins are active", () => {
-    noteMock.mockClear();
-
-    const provider = (baseUrl: string) => ({
-      baseUrl,
+    const provider = {
+      baseUrl: "https://opencode.ai/zen/v1",
       api: "openai-completions" as const,
       models: [],
-    });
+    };
     const cfg: OpenClawConfig = {
-      models: {
-        providers: {
-          opencode: provider("https://opencode.ai/zen/v1"),
-          "opencode-go": provider("https://opencode.ai/zen/go/v1"),
-        },
-      },
+      models: { providers: { opencode: provider, "opencode-go": provider } },
     };
 
     noteOpencodeProviderOverrides(cfg);
@@ -137,21 +131,19 @@ describe("doctor config analysis helpers", () => {
     );
   });
 
-  it("strips unknown array-entry fields and reports their indexed paths", () => {
-    const result = stripUnknownConfigKeys({
-      hooks: { mappings: [{ id: "example", unexpected: true }] },
-    } as never);
-
-    expect(result.removed).toEqual(["hooks.mappings[0].unexpected"]);
-    expect(result.config).toEqual({ hooks: { mappings: [{ id: "example" }] } });
-  });
-
-  it("preserves include syntax at agent defaults while stripping unknown keys", () => {
-    const agents = { defaults: { $include: "./agent-defaults.json5" } };
-    const result = stripUnknownConfigKeys({ agents, unexpected: true } as never);
-
-    expect(result.removed).toEqual(["unexpected"]);
-    expect(result.config).toEqual({ agents });
+  it.each([
+    [
+      { hooks: { mappings: [{ id: "example", unexpected: true }] } },
+      { hooks: { mappings: [{ id: "example" }] } },
+      "hooks.mappings[0].unexpected",
+    ],
+    [
+      { agents: { defaults: { $include: "./agent-defaults.json5" } }, unexpected: true },
+      { agents: { defaults: { $include: "./agent-defaults.json5" } } },
+      "unexpected",
+    ],
+  ])("strips unknown keys but preserves include syntax in %j", (input, config, removed) => {
+    expect(stripUnknownConfigKeys(input as never)).toEqual({ config, removed: [removed] });
   });
 
   it("returns input unchanged when OPENCLAW_UPDATE_IN_PROGRESS=true", () => {
@@ -177,55 +169,37 @@ describe("collectImplicitFallbackClobberWarnings", () => {
     expect(resolveConfiguredModelFallbacks({ cfg, agentId: "ops" })).toEqual([]);
     const warnings = collectImplicitFallbackClobberWarnings(cfg);
     expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain("agents.entries.ops.model");
-    expect(warnings[0]).toContain("leaving the agent with no fallbacks");
-    expect(warnings[0]).toContain('add "fallbacks": [...]');
+    expectContains(warnings[0], [
+      "agents.entries.ops.model",
+      "leaving the agent with no fallbacks",
+      'add "fallbacks": [...]',
+    ]);
   });
 
-  function buildConfig(overrides: { defaults?: unknown; list?: unknown[] }) {
-    return {
-      agents: {
-        defaults: { model: overrides.defaults },
-        list: overrides.list,
-      },
-    };
-  }
-
-  it("returns empty when defaults has no fallbacks", () => {
-    const cfg = buildConfig({
-      defaults: { primary: "openai/gpt-5.5" },
-      list: [{ id: "ops", model: "openai/gpt-5.3" }],
-    });
-    expect(collectImplicitFallbackClobberWarnings(cfg)).toEqual([]);
-  });
-
-  it("returns empty when no per-agent model is configured", () => {
-    const cfg = buildConfig({
-      defaults,
-      list: [{ id: "ops" }, { id: "researcher" }],
-    });
-    expect(collectImplicitFallbackClobberWarnings(cfg)).toEqual([]);
-  });
-
-  it("returns empty when agents.list is malformed", () => {
-    const cfg = {
-      agents: {
-        defaults: { model: defaults },
-        list: { ops: { id: "ops", model: "openai/gpt-5.3" } },
-      },
-    };
-
-    expect(collectImplicitFallbackClobberWarnings(cfg)).toEqual([]);
+  it.each([
+    [
+      "defaults has no fallbacks",
+      { primary: "openai/gpt-5.5" },
+      [{ id: "ops", model: "openai/gpt-5.3" }],
+    ],
+    ["no per-agent model is configured", defaults, [{ id: "ops" }, { id: "researcher" }]],
+    ["agents.list is malformed", defaults, { ops: { id: "ops", model: "openai/gpt-5.3" } }],
+  ])("returns empty when %s", (_name, model, list) => {
+    expect(
+      collectImplicitFallbackClobberWarnings({ agents: { defaults: { model }, list } }),
+    ).toEqual([]);
   });
 
   it("warns for each offending agent independently", () => {
-    const cfg = buildConfig({
-      defaults,
-      list: [
-        { id: "ops", model: "openai/gpt-5.3" },
-        { id: "researcher", model: { primary: "openai/gpt-5.4" } },
-      ],
-    });
+    const cfg = {
+      agents: {
+        defaults: { model: defaults },
+        list: [
+          { id: "ops", model: "openai/gpt-5.3" },
+          { id: "researcher", model: { primary: "openai/gpt-5.4" } },
+        ],
+      },
+    };
     const warnings = collectImplicitFallbackClobberWarnings(cfg);
     expect(warnings).toStrictEqual([
       [
@@ -240,76 +214,42 @@ describe("collectImplicitFallbackClobberWarnings", () => {
   });
 });
 
-describe("noteSandboxOriginProxyWarning", () => {
-  function warningsFor(cfg: OpenClawConfig): string[] {
-    return collectWarnings(() => noteSandboxOriginProxyWarning(cfg));
-  }
-
-  it("warns for trusted-proxy gateways without a sandbox origin", () => {
-    const warnings = warningsFor({
-      gateway: { auth: { mode: "trusted-proxy" } },
-    } as OpenClawConfig);
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain("mcp.apps.sandboxOrigin is not set");
-    expect(warnings[0]).toContain("sandbox listener");
+describe("origin warnings", () => {
+  const server = (identity?: "shared" | "per-requester") => ({
+    url: "https://mcp.example.com",
+    auth: "oauth" as const,
+    ...(identity ? { oauth: { identity } } : {}),
   });
-
-  it("stays silent when a sandbox origin is configured", () => {
-    const warnings = warningsFor({
-      gateway: { auth: { mode: "trusted-proxy" } },
-      mcp: { apps: { sandboxOrigin: "https://widgets.example.com" } },
-    } as OpenClawConfig);
-    expect(warnings).toHaveLength(0);
-  });
-});
-
-describe("noteMcpOriginWarning", () => {
-  const perRequester: OpenClawConfig["mcp"] = {
-    servers: {
-      docs: {
-        url: "https://mcp.example.com",
-        auth: "oauth",
-        oauth: { identity: "per-requester" },
+  const mcp = { servers: { docs: server("per-requester") } };
+  it.each<[(cfg: OpenClawConfig) => void, OpenClawConfig, string[]]>([
+    [
+      noteSandboxOriginProxyWarning,
+      { gateway: { auth: { mode: "trusted-proxy" } } },
+      ["mcp.apps.sandboxOrigin is not set", "sandbox listener"],
+    ],
+    [
+      noteSandboxOriginProxyWarning,
+      {
+        gateway: { auth: { mode: "trusted-proxy" } },
+        mcp: { apps: { sandboxOrigin: "https://widgets.example.com" } },
       },
-    },
-  };
-  function warningsFor(cfg: OpenClawConfig): string[] {
-    return collectWarnings(() => noteMcpOriginWarning(cfg));
-  }
-
-  it("warns for per-requester MCP OAuth without a public Gateway origin", () => {
-    const warnings = warningsFor({
-      mcp: perRequester,
-    });
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain("gateway.publicOrigin is not set");
-    expect(warnings[0]).toContain("senders can complete MCP sign-in");
-  });
-
-  it("stays silent when the public origin is configured", () => {
-    expect(
-      warningsFor({
-        gateway: { publicOrigin: "https://gateway.example.com" },
-        mcp: perRequester,
-      }),
-    ).toHaveLength(0);
-  });
-
-  it("stays silent for shared or absent MCP OAuth identity", () => {
-    expect(
-      warningsFor({
-        mcp: {
-          servers: {
-            shared: {
-              url: "https://shared.example.com",
-              auth: "oauth",
-              oauth: { identity: "shared" },
-            },
-            implicit: { url: "https://implicit.example.com", auth: "oauth" },
-          },
-        },
-      }),
-    ).toHaveLength(0);
-    expect(warningsFor({})).toHaveLength(0);
+      [],
+    ],
+    [
+      noteMcpOriginWarning,
+      { mcp },
+      ["gateway.publicOrigin is not set", "senders can complete MCP sign-in"],
+    ],
+    [noteMcpOriginWarning, { mcp, gateway: { publicOrigin: "https://gateway.example.com" } }, []],
+    [
+      noteMcpOriginWarning,
+      { mcp: { servers: { shared: server("shared"), implicit: server() } } },
+      [],
+    ],
+    [noteMcpOriginWarning, {}, []],
+  ])("%s for %j", (warn, cfg, fragments) => {
+    const warnings = collectWarnings(() => warn(cfg));
+    expect(warnings).toHaveLength(fragments.length ? 1 : 0);
+    expectContains(warnings[0], fragments);
   });
 });
