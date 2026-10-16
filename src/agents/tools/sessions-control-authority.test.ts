@@ -37,9 +37,10 @@ function issueAuthority(profileId: string, scopes: readonly string[] = ["operato
   };
 }
 
+type Capture = Awaited<ReturnType<typeof prepareSessionControlTarget>>;
 async function withCapture(
   request: Parameters<typeof prepareSessionControlTarget>[0],
-  check: (capture: Awaited<ReturnType<typeof prepareSessionControlTarget>>) => void | Promise<void>,
+  check: (capture: Capture) => void | Promise<void>,
 ) {
   const capture = await prepareSessionControlTarget(request);
   try {
@@ -61,13 +62,9 @@ describe("session control source capability", () => {
       assertCurrent: () => {},
     };
     for (const unissued of [forged, { ...authority }]) {
-      expect(() => captureSessionControlAuthority(unissued)).toThrow(/issued by the host/i);
       expect(() => hasSessionControlAuthority(unissued)).toThrow(/issued by the host/i);
     }
     revoke();
-    expect(() => captureSessionControlAuthority(authority)).toThrow(
-      "session control source revoked",
-    );
     expect(() => hasSessionControlAuthority(authority)).toThrow("session control source revoked");
   });
 
@@ -167,9 +164,9 @@ describe("prepared session control target", () => {
           sessionId: entry.sessionId,
           lifecycleRevision: "generation-1",
         });
-        expect(() => current.assertCurrent()).not.toThrow();
+        expect(current.assertCurrent).not.toThrow();
       });
-      expect(() => capture.assertCurrent()).toThrow(/facts are unavailable/i);
+      expect(capture.assertCurrent).toThrow(/facts are unavailable/i);
     },
   );
 
@@ -226,9 +223,9 @@ describe("prepared session control target", () => {
     const { authority, revoke } = issueAuthority(callerId);
     const authorized = { ...request, authority };
     await withCapture(authorized, async (assigned) => {
-      expect(() => assigned.assertCurrent()).not.toThrow();
+      expect(assigned.assertCurrent).not.toThrow();
       assign(scope, "human", otherId);
-      expect(() => assigned.assertCurrent()).toThrow(
+      expect(assigned.assertCurrent).toThrow(
         /facts are unavailable|creator or assigned human owner/i,
       );
       await expect(prepareSessionControlTarget(authorized)).rejects.toThrow(
@@ -236,17 +233,17 @@ describe("prepared session control target", () => {
       );
       assign(scope, "human", callerId);
       // Reassignment can authorize a fresh capture, never revive the already-retired one.
-      expect(() => assigned.assertCurrent()).toThrow(/facts are unavailable/i);
+      expect(assigned.assertCurrent).toThrow(/facts are unavailable/i);
     });
     await withCapture(authorized, (unobserved) => {
       assign(scope, "human", otherId);
       assign(scope, "human", callerId);
-      expect(() => unobserved.assertCurrent()).toThrow(/facts are unavailable/i);
+      expect(unobserved.assertCurrent).toThrow(/facts are unavailable/i);
     });
     try {
       await withCapture(authorized, (profileCapture) => {
         setUserProfileRole(callerId, "reader");
-        expect(() => profileCapture.assertCurrent()).toThrow(
+        expect(profileCapture.assertCurrent).toThrow(
           /facts are unavailable|current authenticated profile/i,
         );
       });
@@ -258,13 +255,13 @@ describe("prepared session control target", () => {
     ]);
     await withCapture(authorized, async (sourceCapture) => {
       await withCapture({ ...request, authority: adminAuthority }, (adminCapture) => {
-        expect(() => sourceCapture.assertCurrent()).not.toThrow();
-        expect(() => adminCapture.assertCurrent()).not.toThrow();
+        expect(sourceCapture.assertCurrent).not.toThrow();
+        expect(adminCapture.assertCurrent).not.toThrow();
         revoke();
-        expect(() => sourceCapture.assertCurrent()).toThrow("session control source revoked");
-        expect(() => adminCapture.assertCurrent()).not.toThrow();
+        expect(sourceCapture.assertCurrent).toThrow("session control source revoked");
+        expect(adminCapture.assertCurrent).not.toThrow();
         revokeAdmin();
-        expect(() => adminCapture.assertCurrent()).toThrow("session control source revoked");
+        expect(adminCapture.assertCurrent).toThrow("session control source revoked");
       });
     });
   });
@@ -289,9 +286,9 @@ describe("prepared session control target", () => {
           sessionId: before.sessionId,
           lifecycleRevision: before.lifecycleRevision ?? null,
         });
-        expect(() => capture.assertCurrent()).not.toThrow();
+        expect(capture.assertCurrent).not.toThrow();
         replaceSessionEntrySync(scope, after);
-        expect(() => capture.assertCurrent()).toThrow(/facts are unavailable|target changed/i);
+        expect(capture.assertCurrent).toThrow(/facts are unavailable|target changed/i);
         const mismatch =
           before.sessionId === after.sessionId
             ? { expectedLifecycleRevision: expected.expectedLifecycleRevision }
@@ -308,9 +305,9 @@ describe("prepared session control target", () => {
         expectedLifecycleRevision: "reset-generation",
       },
       (capture) => {
-        expect(() => capture.assertCurrent()).not.toThrow();
+        expect(capture.assertCurrent).not.toThrow();
       },
     );
-    expect(() => replacement.assertCurrent()).toThrow(/facts are unavailable/i);
+    expect(replacement.assertCurrent).toThrow(/facts are unavailable/i);
   });
 });

@@ -144,7 +144,6 @@ async function withInventory(
       append(scope, index ? "Still-visible reply" : bufferedText);
     }
     const client = identifiedClient(viewer.id);
-    client.connect.scopes = ["operator.read"];
     const context = requestContext(cfg);
     context.getRuntimeConfig = () => cfg;
     context.trackExecution = async (operation) => await operation();

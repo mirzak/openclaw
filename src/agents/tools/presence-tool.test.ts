@@ -23,6 +23,16 @@ import {
 import { withGatewayToolCallerIdentity } from "./gateway-caller-context.js";
 import { createPresenceTool } from "./presence-tool.js";
 
+const adaPresence = { people: [{ name: "Ada" }] };
+
+function readerAuthority(scopes: string[], assertCurrent = () => {}) {
+  return createAdmittedRunOperatorAuthority({
+    profileId: ensureProfileForEmail("presence-reader@example.test").id,
+    scopes,
+    assertCurrent,
+  });
+}
+
 function fixture(locationHandler?: GatewayRequestHandler) {
   const context = createContext();
   const snapshot = vi.fn(() => [
@@ -109,16 +119,14 @@ describe("presence tool source authority", () => {
           : undefined,
         () => current,
       )!;
-      await run(undefined, async () => {
-        await runWithCronCreatorAuthorityCapability(capability, async () => {
+      await run(undefined, () =>
+        runWithCronCreatorAuthorityCapability(capability, async () => {
           const tool = createPresenceTool({ runId: "presence-channel-run" });
-          expect((await tool.execute("owner", {})).details).toMatchObject({
-            people: [{ name: "Ada" }],
-          });
+          expect((await tool.execute("owner", {})).details).toMatchObject(adaPresence);
           current = false;
           await expect(tool.execute("revoked-owner", {})).rejects.toThrow(/authority|source/i);
-        });
-      });
+        }),
+      );
       expect(snapshot).toHaveBeenCalledOnce();
     },
   );
@@ -133,16 +141,15 @@ describe("presence tool source authority", () => {
           const tool = createPresenceTool();
           const pending = tool.execute("scheduled", {});
           if (source === "operator-schedule") {
-            expect((await pending).details).toMatchObject({ people: [{ name: "Ada" }] });
+            expect((await pending).details).toMatchObject(adaPresence);
             close();
             await expect(tool.execute("expired-schedule", {})).rejects.toThrow(/authority|source/i);
-            expect(snapshot).toHaveBeenCalledOnce();
           } else {
             await expect(pending).rejects.toThrow(
               "Presence requires authenticated Gateway read access",
             );
-            expect(snapshot).not.toHaveBeenCalled();
           }
+          expect(snapshot).toHaveBeenCalledTimes(source === "operator-schedule" ? 1 : 0);
         },
         source,
       );
@@ -157,41 +164,29 @@ describe("presence tool source authority", () => {
     { scopes: [], allowed: false },
   ])("uses the original non-owner scopes $scopes", async ({ scopes, allowed }) => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
-      const authority = scopes
-        ? createAdmittedRunOperatorAuthority({
-            profileId: ensureProfileForEmail("presence-reader@example.test").id,
-            scopes,
-            assertCurrent: () => {},
-          })
-        : undefined;
+      const authority = scopes ? readerAuthority(scopes) : undefined;
       const { run, snapshot } = fixture();
       const pending = run(authority, () => createPresenceTool().execute("reader", {}));
       if (allowed) {
-        expect((await pending).details).toMatchObject({ people: [{ name: "Ada" }] });
-        expect(snapshot).toHaveBeenCalledOnce();
+        expect((await pending).details).toMatchObject(adaPresence);
       } else {
         await expect(pending).rejects.toThrow(
           scopes
             ? /operator\.read|presence.*authority/i
             : /presence.*authority|presence.*authenticated|presence.*operator/i,
         );
-        expect(snapshot).not.toHaveBeenCalled();
       }
+      expect(snapshot).toHaveBeenCalledTimes(allowed ? 1 : 0);
     });
   });
 
   it("withholds a delayed location result after the original operator is revoked", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
-      const profile = ensureProfileForEmail("presence-reader@example.test");
       let current = true;
-      const authority = createAdmittedRunOperatorAuthority({
-        profileId: profile.id,
-        scopes: ["operator.read"],
-        assertCurrent: () => {
-          if (!current) {
-            throw new Error("presence reader revoked");
-          }
-        },
+      const authority = readerAuthority(["operator.read"], () => {
+        if (!current) {
+          throw new Error("presence reader revoked");
+        }
       });
       const entered = createDeferred();
       const release = createDeferred();

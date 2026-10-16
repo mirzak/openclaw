@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Value } from "typebox/value";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 import {
   ChatHistoryParamsSchema,
   ChatPendingInputsPageSchema,
@@ -140,474 +140,450 @@ function childHistoryFixture(name: string, replace = false) {
   return { ...fixture, targetSessionKey };
 }
 
-describe("sessions_history", () => {
-  beforeAll(() => {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-sessions-history-redact-"));
-  });
+beforeAll(() => {
+  tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-sessions-history-redact-"));
+});
 
-  afterAll(() => {
-    if (tempDir) {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    }
-  });
+afterAll(() => {
+  if (tempDir) {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
 
-  it("declares complete success and closed error contracts", async () => {
-    const tool = createHistoryToolWithMessage("hello");
-    const result = await tool.execute("contract", { sessionKey: "main" });
-    const linkedResult = await createHistoryToolWithMessage("hello", SESSION_LINK_BASE).execute(
-      "linked-contract",
-      { sessionKey: "main" },
-    );
+it("declares complete success and closed error contracts", async () => {
+  const tool = createHistoryToolWithMessage("hello");
+  const result = await tool.execute("contract", { sessionKey: "main" });
+  const linkedResult = await createHistoryToolWithMessage("hello", SESSION_LINK_BASE).execute(
+    "linked-contract",
+    { sessionKey: "main" },
+  );
 
-    expect(tool.outputSchema).toBeDefined();
-    expect(Value.Check(tool.parameters, { sessionKey: "main", limit: 1000 })).toBe(true);
-    expect(Value.Check(tool.parameters, { sessionKey: "main", limit: 1001 })).toBe(false);
-    expect(Value.Check(ChatHistoryParamsSchema, { sessionKey: "main", limit: 1001 })).toBe(false);
-    expect(Value.Check(tool.outputSchema!, result.details)).toBe(true);
-    expect(result.details).not.toHaveProperty("sessionLinkRule");
-    expect(linkedResult.details).toHaveProperty("sessionLinkRule", SESSION_LINK_RULE);
-    expect(Value.Check(tool.outputSchema!, { status: "error", error: "missing" })).toBe(true);
-    expect(
-      Value.Check(tool.outputSchema!, { status: "forbidden", error: "hidden", extra: true }),
-    ).toBe(false);
-    const pendingInputs = {
-      items: [
-        {
-          id: "pending-1",
-          runId: "run-1",
-          message: { role: "user", content: "next" },
-          acceptedAt: 1,
-          state: "queued",
-          queued: true,
-        },
-      ],
-      total: 1,
-      queuedCount: 1,
-    };
-    expect(Value.Check(ChatPendingInputsPageSchema, pendingInputs)).toBe(true);
-    expect(Value.Check(tool.outputSchema!, { ...readHistoryDetails(result), pendingInputs })).toBe(
-      true,
-    );
-    expect(compactToolOutputHint(tool.outputSchema)).toBe(
-      '{ bytes: number; contentRedacted: boolean; contentTruncated: boolean; droppedMessages: boolean; messages: Array<unknown>; sessionKey: string; truncated: boolean; hasMore?: boolean; nextOffset?: number; offset?: number; pendingInputs?: { items: Array<{ acceptedAt: number; id: string; message: unknown; state: "queued" | "cancelled" | "interrupted"; queued?: true; runId?: string }>; total: number; nextBefore?: number; queuedCount?: number }; sessionLinkRule?: string; totalMessages?: number; windowReset?: boolean } | { error: string; status: "error" | "forbidden" }',
-    );
-  });
+  expect(tool.outputSchema).toBeDefined();
+  expect(Value.Check(tool.parameters, { sessionKey: "main", limit: 1000 })).toBe(true);
+  expect(Value.Check(tool.parameters, { sessionKey: "main", limit: 1001 })).toBe(false);
+  expect(Value.Check(ChatHistoryParamsSchema, { sessionKey: "main", limit: 1001 })).toBe(false);
+  expect(Value.Check(tool.outputSchema!, result.details)).toBe(true);
+  expect(result.details).not.toHaveProperty("sessionLinkRule");
+  expect(linkedResult.details).toHaveProperty("sessionLinkRule", SESSION_LINK_RULE);
+  expect(Value.Check(tool.outputSchema!, { status: "error", error: "missing" })).toBe(true);
+  expect(
+    Value.Check(tool.outputSchema!, { status: "forbidden", error: "hidden", extra: true }),
+  ).toBe(false);
+  const pendingInputs = {
+    items: [
+      {
+        id: "pending-1",
+        runId: "run-1",
+        message: { role: "user", content: "next" },
+        acceptedAt: 1,
+        state: "queued",
+        queued: true,
+      },
+    ],
+    total: 1,
+    queuedCount: 1,
+  };
+  expect(Value.Check(ChatPendingInputsPageSchema, pendingInputs)).toBe(true);
+  expect(Value.Check(tool.outputSchema!, { ...readHistoryDetails(result), pendingInputs })).toBe(
+    true,
+  );
+  expect(compactToolOutputHint(tool.outputSchema)).toBe(
+    '{ bytes: number; contentRedacted: boolean; contentTruncated: boolean; droppedMessages: boolean; messages: Array<unknown>; sessionKey: string; truncated: boolean; hasMore?: boolean; nextOffset?: number; offset?: number; pendingInputs?: { items: Array<{ acceptedAt: number; id: string; message: unknown; state: "queued" | "cancelled" | "interrupted"; queued?: true; runId?: string }>; total: number; nextBefore?: number; queuedCount?: number }; sessionLinkRule?: string; totalMessages?: number; windowReset?: boolean } | { error: string; status: "error" | "forbidden" }',
+  );
+});
 
-  it("returns not-found for an unknown explicit key without reading history", async () => {
+it.each(["all", "self"] as const)(
+  "conceals missing keys according to %s visibility",
+  async (visibility) => {
     const sessionKey = "agent:main:missing";
     const { tool, requests } = historyFixture(
-      (request) => {
-        if (request.method === "sessions.resolve") {
-          throw new Error(`No session found: ${sessionKey}`);
-        }
-        return { messages: [] };
-      },
-      { config: { tools: { sessions: { visibility: "all" } } } },
-    );
-
-    const result = await tool.execute("missing-explicit-key", { sessionKey });
-
-    expect(result.details).toEqual({
-      status: "error",
-      error: `No session found: ${sessionKey}`,
-    });
-    expect(requests.map((request) => request.method)).toEqual(["sessions.resolve"]);
-  });
-
-  it("conceals missing explicit keys denied by session visibility", async () => {
-    const { tool, requests } = historyFixture(
       () => {
-        throw new Error("No session found: agent:main:missing");
+        throw new Error(`No session found: ${sessionKey}`);
       },
       {
-        agentSessionKey: "agent:main:main",
-        config: { tools: { sessions: { visibility: "self" } } },
+        config: { tools: { sessions: { visibility } } },
+        ...(visibility === "self" ? { agentSessionKey: "agent:main:main" } : {}),
       },
     );
-
-    const result = await tool.execute("hidden-missing-key", {
-      sessionKey: "agent:main:missing",
-    });
-
-    expect(result.details).toMatchObject({ status: "forbidden" });
+    const result = await tool.execute("missing-explicit-key", { sessionKey });
+    if (visibility === "all") {
+      expect(result.details).toEqual({ status: "error", error: `No session found: ${sessionKey}` });
+    } else {
+      expect(result.details).toMatchObject({ status: "forbidden" });
+    }
     expect(requests.map((request) => request.method)).toEqual(["sessions.resolve"]);
+  },
+);
+
+it("returns an empty history for an existing explicit key", async () => {
+  const sessionKey = "agent:main:empty";
+  const { tool, requests } = historyFixture(
+    (request) => (request.method === "sessions.resolve" ? { key: sessionKey } : { messages: [] }),
+    { config: { tools: { sessions: { visibility: "all" } } } },
+  );
+
+  const result = await tool.execute("existing-empty-key", { sessionKey });
+
+  expect(result.details).toMatchObject({
+    sessionKey,
+    messages: [],
+    bytes: 2,
+  });
+  expect(requests.map((request) => request.method)).toEqual(["sessions.resolve", "chat.history"]);
+});
+
+it("does not apply log redaction patterns to recalled session text", async () => {
+  useLoggingConfig("custom-patterns.json", {
+    redactSensitive: "off",
+    redactPatterns: [String.raw`\binternal-ticket-[A-Za-z0-9]+\b`],
+  });
+  const tool = createHistoryToolWithMessage("follow up on internal-ticket-AbC12345");
+
+  const result = await tool.execute("call-1", { sessionKey: "main" });
+  const serialized = JSON.stringify(result.details);
+
+  expect(serialized).toContain("internal-ticket-AbC12345");
+  expect(serialized).toContain("intern");
+  expect((result.details as { contentRedacted?: unknown }).contentRedacted).toBe(false);
+});
+
+it("preserves recalled secret-shaped session text", async () => {
+  const tool = createHistoryToolWithMessage("OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789");
+
+  const result = await tool.execute("call-1", { sessionKey: "main" });
+  const serialized = JSON.stringify(result.details);
+
+  expect(serialized).toContain("sk-or-v1-abcdef0123456789");
+  expect(serialized).toContain("OPENROUTER_API_KEY=");
+  expect(result.details).toMatchObject({
+    contentRedacted: false,
+    contentTruncated: false,
+    truncated: false,
+  });
+});
+
+it("keeps accepted inputs separate, bounded, and addressable by their own cursor", async () => {
+  const items = Array.from({ length: 20 }, (_, index) => ({
+    id: `00000000-0000-0000-0000-${String(index).padStart(12, "0")}`,
+    runId: "do-not-expose-correlation",
+    state: "interrupted",
+    acceptedAt: 1_700_000_000_000,
+    message: {
+      role: "user",
+      content: `OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789 ${"queued input ".repeat(1000)}`,
+    },
+  }));
+  const { tool, requests } = historyFixture({
+    messages: [{ role: "assistant", content: "Canonical reply" }],
+    pendingInputs: { items, total: 23, nextBefore: 4 },
+  });
+  const result = await tool.execute("pending-cursor", { sessionKey: "main", pendingBefore: 24 });
+  const details = result.details as {
+    messages: unknown[];
+    pendingInputs: { items: unknown[]; total: number; nextBefore: number };
+    contentRedacted: boolean;
+    bytes: number;
+  };
+  expect(requireGatewayRequest(requests, "chat.history").params).toMatchObject({
+    pendingBefore: 24,
+  });
+  expect(details.messages).toEqual([{ role: "assistant", content: "Canonical reply" }]);
+  expect(details.pendingInputs).toMatchObject({ total: 23, nextBefore: 4 });
+  expect(details.pendingInputs.items).toHaveLength(20);
+  expect(Buffer.byteLength(JSON.stringify(details.pendingInputs))).toBeLessThanOrEqual(4096);
+  expect(JSON.stringify(details.pendingInputs)).not.toContain("sk-or-v1-abcdef0123456789");
+  expect(JSON.stringify(details.pendingInputs)).not.toContain("do-not-expose-correlation");
+  expect(details.contentRedacted).toBe(false);
+  expect(details.bytes).toBeLessThanOrEqual(80 * 1024);
+  expect(Value.Check(tool.outputSchema!, details)).toBe(true);
+});
+
+it.each([
+  { args: { limit: 0 }, error: "limit must be a positive integer" },
+  { args: { offset: "1abc" }, error: "offset must be a non-negative integer" },
+  { args: { sessionId: "session-1" }, error: "sessionId requires messageId" },
+])("rejects invalid history arguments: $error", async ({ args, error }) => {
+  const { tool, requests } = historyFixture({ messages: [] });
+  await expect(tool.execute("call-1", { sessionKey: "main", ...args })).rejects.toThrow(error);
+  expect(requests).toEqual([]);
+});
+
+it("requests explicit offset pages and returns continuation metadata", async () => {
+  const { tool, requests } = historyFixture({
+    messages: [
+      { role: "user", content: "newer" },
+      { role: "assistant", content: "latest" },
+    ],
+    offset: 0,
+    nextOffset: 2,
+    hasMore: true,
+    totalMessages: 4,
   });
 
-  it("returns an empty history for an existing explicit key", async () => {
-    const sessionKey = "agent:main:empty";
-    const { tool, requests } = historyFixture(
-      (request) => (request.method === "sessions.resolve" ? { key: sessionKey } : { messages: [] }),
-      { config: { tools: { sessions: { visibility: "all" } } } },
-    );
+  const result = await tool.execute("call-1", { sessionKey: "main", limit: 2, offset: 0 });
 
-    const result = await tool.execute("existing-empty-key", { sessionKey });
+  expect(requireGatewayRequest(requests, "chat.history")).toMatchObject({
+    method: "chat.history",
+    params: { sessionKey: "main", limit: 2, offset: 0 },
+  });
+  expect(result.details).toMatchObject({
+    offset: 0,
+    nextOffset: 2,
+    hasMore: true,
+    totalMessages: 4,
+  });
+});
 
-    expect(result.details).toMatchObject({
-      sessionKey,
-      messages: [],
-      bytes: 2,
-    });
-    expect(requests.map((request) => request.method)).toEqual(["sessions.resolve", "chat.history"]);
+it("requests history around a search result message id", async () => {
+  const { tool, requests } = historyFixture({
+    messages: [
+      { role: "user", content: "before" },
+      { role: "assistant", content: "matching message" },
+      { role: "user", content: "after" },
+    ],
   });
 
-  it("preserves recalled secret-shaped session text", async () => {
-    const tool = createHistoryToolWithMessage("OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789");
+  const originalArgs = {
+    sessionKey: "main",
+    limit: 3,
+    offset: 4,
+    messageId: "matching-message",
+    sessionId: "matching-session",
+  };
+  const args = { ...originalArgs };
+  const result = await tool.execute("call-1", args);
 
-    const result = await tool.execute("call-1", { sessionKey: "main" });
-    const serialized = JSON.stringify(result.details);
-
-    expect(serialized).toContain("sk-or-v1-abcdef0123456789");
-    expect(serialized).toContain("OPENROUTER_API_KEY=");
-    expect(result.details).toMatchObject({
-      contentRedacted: false,
-      contentTruncated: false,
-      truncated: false,
-    });
-  });
-
-  it("keeps accepted inputs separate, bounded, and addressable by their own cursor", async () => {
-    const items = Array.from({ length: 20 }, (_, index) => ({
-      id: `00000000-0000-0000-0000-${String(index).padStart(12, "0")}`,
-      runId: "do-not-expose-correlation",
-      state: "interrupted",
-      acceptedAt: 1_700_000_000_000,
-      message: {
-        role: "user",
-        content: `OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789 ${"queued input ".repeat(1000)}`,
-      },
-    }));
-    const { tool, requests } = historyFixture({
-      messages: [{ role: "assistant", content: "Canonical reply" }],
-      pendingInputs: { items, total: 23, nextBefore: 4 },
-    });
-    const result = await tool.execute("pending-cursor", { sessionKey: "main", pendingBefore: 24 });
-    const details = result.details as {
-      messages: unknown[];
-      pendingInputs: { items: unknown[]; total: number; nextBefore: number };
-      contentRedacted: boolean;
-      bytes: number;
-    };
-    expect(requireGatewayRequest(requests, "chat.history").params).toMatchObject({
-      pendingBefore: 24,
-    });
-    expect(details.messages).toEqual([{ role: "assistant", content: "Canonical reply" }]);
-    expect(details.pendingInputs).toMatchObject({ total: 23, nextBefore: 4 });
-    expect(details.pendingInputs.items).toHaveLength(20);
-    expect(Buffer.byteLength(JSON.stringify(details.pendingInputs))).toBeLessThanOrEqual(4096);
-    expect(JSON.stringify(details.pendingInputs)).not.toContain("sk-or-v1-abcdef0123456789");
-    expect(JSON.stringify(details.pendingInputs)).not.toContain("do-not-expose-correlation");
-    expect(details.contentRedacted).toBe(false);
-    expect(details.bytes).toBeLessThanOrEqual(80 * 1024);
-    expect(Value.Check(tool.outputSchema!, details)).toBe(true);
-  });
-
-  it("does not apply log redaction patterns to recalled session text", async () => {
-    useLoggingConfig("custom-patterns.json", {
-      redactSensitive: "off",
-      redactPatterns: [String.raw`\binternal-ticket-[A-Za-z0-9]+\b`],
-    });
-    const tool = createHistoryToolWithMessage("follow up on internal-ticket-AbC12345");
-
-    const result = await tool.execute("call-1", { sessionKey: "main" });
-    const serialized = JSON.stringify(result.details);
-
-    expect(serialized).toContain("internal-ticket-AbC12345");
-    expect(serialized).toContain("intern");
-    expect((result.details as { contentRedacted?: unknown }).contentRedacted).toBe(false);
-  });
-
-  it.each([
-    { args: { limit: 0 }, error: "limit must be a positive integer" },
-    { args: { offset: "1abc" }, error: "offset must be a non-negative integer" },
-    { args: { sessionId: "session-1" }, error: "sessionId requires messageId" },
-  ])("rejects invalid history arguments: $error", async ({ args, error }) => {
-    const { tool, requests } = historyFixture({ messages: [] });
-    await expect(tool.execute("call-1", { sessionKey: "main", ...args })).rejects.toThrow(error);
-    expect(requests).toEqual([]);
-  });
-
-  it("requests explicit offset pages and returns continuation metadata", async () => {
-    const { tool, requests } = historyFixture({
-      messages: [
-        { role: "user", content: "newer" },
-        { role: "assistant", content: "latest" },
-      ],
-      offset: 0,
-      nextOffset: 2,
-      hasMore: true,
-      totalMessages: 4,
-    });
-
-    const result = await tool.execute("call-1", { sessionKey: "main", limit: 2, offset: 0 });
-
-    expect(requireGatewayRequest(requests, "chat.history")).toMatchObject({
-      method: "chat.history",
-      params: { sessionKey: "main", limit: 2, offset: 0 },
-    });
-    expect(result.details).toMatchObject({
-      offset: 0,
-      nextOffset: 2,
-      hasMore: true,
-      totalMessages: 4,
-    });
-  });
-
-  it("requests history around a search result message id", async () => {
-    const { tool, requests } = historyFixture({
-      messages: [
-        { role: "user", content: "before" },
-        { role: "assistant", content: "matching message" },
-        { role: "user", content: "after" },
-      ],
-    });
-
-    const args = {
+  expect(requireGatewayRequest(requests, "chat.history")).toMatchObject({
+    method: "chat.history",
+    params: {
       sessionKey: "main",
       limit: 3,
-      offset: 4,
       messageId: "matching-message",
       sessionId: "matching-session",
-    };
-    const result = await tool.execute("call-1", args);
+    },
+  });
+  expect(result.details).toMatchObject({
+    messages: [{ content: "before" }, { content: "matching message" }, { content: "after" }],
+  });
+  expect(requireGatewayRequest(requests, "chat.history").params).not.toHaveProperty("offset");
+  expect(result.details).not.toHaveProperty("offset");
+  expect(args).toEqual(originalArgs);
+});
 
-    expect(requireGatewayRequest(requests, "chat.history")).toMatchObject({
-      method: "chat.history",
-      params: {
+it("keeps the anchored message when the history byte cap trims neighbors", async () => {
+  const anchorId = "message-10";
+  const messages = Array.from({ length: 30 }, (_, index) => ({
+    role: index % 2 === 0 ? "user" : "assistant",
+    content: `message-${index + 1} ${"x".repeat(4_000)}`,
+    __openclaw: { id: `message-${index + 1}`, seq: index + 1 },
+  }));
+  const { tool } = historyFixture({ messages, offset: 0, totalMessages: messages.length });
+
+  const result = await tool.execute("call-1", {
+    sessionKey: "main",
+    messageId: anchorId,
+  });
+  const details = readHistoryDetails(result);
+  const returnedMessages = details.messages as unknown[];
+
+  expect(returnedMessages.length).toBeLessThan(messages.length);
+  expect(returnedMessages.some((message) => readMessageId(message) === anchorId)).toBe(true);
+  expect(details).toMatchObject({ truncated: true, droppedMessages: true });
+  expect(details.offset).toBeUndefined();
+  expect(details.nextOffset).toBeUndefined();
+  expect(details.hasMore).toBeUndefined();
+});
+
+it("paginates history with default filtering and explicit tool inclusion", async () => {
+  const visibleMessages = [
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "visible" },
+        { type: "toolCall", id: "outer-call", name: "read", arguments: {} },
+      ],
+      __openclaw: { seq: 7 },
+    },
+    { role: "custom", customType: "notice", content: "visible notice", __openclaw: { seq: 8 } },
+    {
+      role: "assistant",
+      content: "latest <tool_result>embedded tool text</tool_result>",
+      __openclaw: { seq: 9 },
+    },
+  ];
+  const messages = [
+    { role: "tool", content: "hidden", __openclaw: { seq: 4 } },
+    { role: "toolResult", content: "also hidden", __openclaw: { seq: 5 } },
+    {
+      role: "custom",
+      customType: "openclaw.nested-tool.v1",
+      display: true,
+      content: [
+        { type: "toolCall", id: "nested-call", name: "read", arguments: {} },
+        {
+          type: "toolResult",
+          role: "toolResult",
+          toolCallId: "nested-call",
+          content: [{ type: "text", text: "nested output" }],
+        },
+      ],
+      __openclaw: { seq: 6 },
+    },
+    ...visibleMessages,
+  ];
+  const { tool } = historyFixture({
+    messages,
+    offset: 0,
+    nextOffset: 7,
+    hasMore: true,
+    totalMessages: 10,
+  });
+
+  for (const includeTools of [undefined, false]) {
+    const details = readHistoryDetails(
+      await tool.execute("without-tools", {
         sessionKey: "main",
-        limit: 3,
-        messageId: "matching-message",
-        sessionId: "matching-session",
-      },
-    });
-    expect(result.details).toMatchObject({
-      messages: [{ content: "before" }, { content: "matching message" }, { content: "after" }],
-    });
-    expect(requireGatewayRequest(requests, "chat.history").params).not.toHaveProperty("offset");
-    expect(result.details).not.toHaveProperty("offset");
-    expect(args).toEqual({
-      sessionKey: "main",
-      limit: 3,
-      offset: 4,
-      messageId: "matching-message",
-      sessionId: "matching-session",
-    });
-  });
-
-  it("keeps the anchored message when the history byte cap trims neighbors", async () => {
-    const anchorId = "message-10";
-    const messages = Array.from({ length: 30 }, (_, index) => ({
-      role: index % 2 === 0 ? "user" : "assistant",
-      content: `message-${index + 1} ${"x".repeat(4_000)}`,
-      __openclaw: { id: `message-${index + 1}`, seq: index + 1 },
-    }));
-    const { tool } = historyFixture({ messages, offset: 0, totalMessages: messages.length });
-
-    const result = await tool.execute("call-1", {
-      sessionKey: "main",
-      messageId: anchorId,
-    });
-    const details = readHistoryDetails(result);
-    const returnedMessages = details.messages as unknown[];
-
-    expect(returnedMessages.length).toBeLessThan(messages.length);
-    expect(returnedMessages.some((message) => readMessageId(message) === anchorId)).toBe(true);
-    expect(details).toMatchObject({ truncated: true, droppedMessages: true });
-    expect(details.offset).toBeUndefined();
-    expect(details.nextOffset).toBeUndefined();
-    expect(details.hasMore).toBeUndefined();
-  });
-
-  it("paginates history with default filtering and explicit tool inclusion", async () => {
-    const visibleMessages = [
-      {
-        role: "assistant",
-        content: [
-          { type: "text", text: "visible" },
-          { type: "toolCall", id: "outer-call", name: "read", arguments: {} },
-        ],
-        __openclaw: { seq: 7 },
-      },
-      { role: "custom", customType: "notice", content: "visible notice", __openclaw: { seq: 8 } },
-      {
-        role: "assistant",
-        content: "latest <tool_result>embedded tool text</tool_result>",
-        __openclaw: { seq: 9 },
-      },
-    ];
-    const messages = [
-      { role: "tool", content: "hidden", __openclaw: { seq: 4 } },
-      { role: "toolResult", content: "also hidden", __openclaw: { seq: 5 } },
-      {
-        role: "custom",
-        customType: "openclaw.nested-tool.v1",
-        display: true,
-        content: [
-          { type: "toolCall", id: "nested-call", name: "read", arguments: {} },
-          {
-            type: "toolResult",
-            role: "toolResult",
-            toolCallId: "nested-call",
-            content: [{ type: "text", text: "nested output" }],
-          },
-        ],
-        __openclaw: { seq: 6 },
-      },
-      ...visibleMessages,
-    ];
-    const { tool } = historyFixture({
-      messages,
+        offset: 0,
+        ...(includeTools === undefined ? {} : { includeTools }),
+      }),
+    );
+    expect(details.messages).toEqual(visibleMessages);
+    expect(details).toMatchObject({
       offset: 0,
-      nextOffset: 7,
+      nextOffset: 4,
       hasMore: true,
       totalMessages: 10,
     });
+  }
 
-    for (const includeTools of [undefined, false]) {
-      const details = readHistoryDetails(
-        await tool.execute("without-tools", {
-          sessionKey: "main",
-          offset: 0,
-          ...(includeTools === undefined ? {} : { includeTools }),
-        }),
-      );
-      expect(details.messages).toEqual(visibleMessages);
-      expect(details).toMatchObject({
-        offset: 0,
-        nextOffset: 4,
-        hasMore: true,
-        totalMessages: 10,
-      });
-    }
+  const withTools = readHistoryDetails(
+    await tool.execute("with-tools", { sessionKey: "main", offset: 0, includeTools: true }),
+  );
+  expect(withTools.messages).toEqual(messages);
+  expect(withTools.nextOffset).toBe(7);
+});
 
-    const withTools = readHistoryDetails(
-      await tool.execute("with-tools", { sessionKey: "main", offset: 0, includeTools: true }),
-    );
-    expect(withTools.messages).toEqual(messages);
-    expect(withTools.nextOffset).toBe(7);
+it.each([
+  {
+    name: "projected siblings from the same row",
+    offset: 0,
+    nextOffset: 2,
+    messages: [
+      { role: "assistant", content: "projected sibling", __openclaw: { seq: 8 } },
+      { role: "assistant", content: "latest", __openclaw: { seq: 9 } },
+    ],
+  },
+  {
+    name: "advancing past an already-returned row",
+    offset: 4,
+    nextOffset: 5,
+    messages: [{ role: "assistant", content: "visible", __openclaw: { seq: 7 } }],
+  },
+])("preserves the Gateway replay cursor: $name", async ({ messages, offset, nextOffset }) => {
+  const pagination = { offset, nextOffset, hasMore: true, totalMessages: 10 };
+  const { tool } = historyFixture({
+    messages,
+    ...pagination,
+  });
+  const result = await tool.execute("cursor-progress", { sessionKey: "main", offset });
+  expect(result.details).toMatchObject(pagination);
+});
+
+it("reads an old child from its exact durable lineage row", async () => {
+  const { tool, requests, targetSessionKey } = childHistoryFixture("old-child");
+
+  const result = await tool.execute("old-child-history", {
+    sessionKey: targetSessionKey,
+    limit: 1,
   });
 
-  it.each([
-    {
-      name: "projected siblings from the same row",
-      offset: 0,
-      nextOffset: 2,
-      messages: [
-        { role: "assistant", content: "projected sibling", __openclaw: { seq: 8 } },
-        { role: "assistant", content: "latest", __openclaw: { seq: 9 } },
-      ],
-    },
-    {
-      name: "advancing past an already-returned row",
-      offset: 4,
-      nextOffset: 5,
-      messages: [{ role: "assistant", content: "visible", __openclaw: { seq: 7 } }],
-    },
-  ])("preserves the Gateway replay cursor: $name", async ({ messages, offset, nextOffset }) => {
-    const pagination = { offset, nextOffset, hasMore: true, totalMessages: 10 };
-    const { tool } = historyFixture({
-      messages,
-      ...pagination,
-    });
-    const result = await tool.execute("cursor-progress", { sessionKey: "main", offset });
-    expect(result.details).toMatchObject(pagination);
+  expect(result.details).toMatchObject({
+    sessionKey: targetSessionKey,
+    messages: [{ role: "assistant", content: "durable child history" }],
   });
+  expect(requests.map((request) => request.method)).toEqual([
+    "sessions.resolve",
+    "sessions.describe",
+    "chat.history",
+  ]);
+});
 
-  it("reads an old child from its exact durable lineage row", async () => {
-    const { tool, requests, targetSessionKey } = childHistoryFixture("old-child");
+it("rejects a durable history grant when the target incarnation changes", async () => {
+  const { tool, requests, targetSessionKey } = childHistoryFixture("old-child-race", true);
 
-    const result = await tool.execute("old-child-history", {
-      sessionKey: targetSessionKey,
-      limit: 1,
-    });
+  await expect(
+    tool.execute("old-child-history-race", { sessionKey: targetSessionKey }),
+  ).rejects.toThrow(`Session "${targetSessionKey}" changed after access was granted.`);
+  expect(requests.some((request) => request.method === "chat.history")).toBe(false);
+});
+
+it("honors a scoped incarnation grant through the sandbox visibility clamp", async () => {
+  const { tool, requests, unregister, targetSessionKey } = scopedHistoryFixture("scoped-grant");
+  try {
+    const result = await tool.execute("scoped-grant", { sessionKey: targetSessionKey });
 
     expect(result.details).toMatchObject({
       sessionKey: targetSessionKey,
-      messages: [{ role: "assistant", content: "durable child history" }],
+      messages: [{ role: "assistant", content: "visible" }],
     });
-    expect(requests.map((request) => request.method)).toEqual([
-      "sessions.resolve",
-      "sessions.describe",
-      "chat.history",
-    ]);
-  });
+    expect(requests.map((request) => request.method)).toEqual(["chat.history"]);
+  } finally {
+    unregister();
+  }
+});
 
-  it("rejects a durable history grant when the target incarnation changes", async () => {
-    const { tool, requests, targetSessionKey } = childHistoryFixture("old-child-race", true);
-
+it.each([
+  { name: "incarnation", patch: { sessionId: "replacement-incarnation", updatedAt: 2 } },
+  { name: "archived", patch: { sessionId: "main-incarnation", updatedAt: 2, archivedAt: 2 } },
+])("rejects a scoped grant when the target is $name before the read", async ({ name, patch }) => {
+  const { tool, requests, unregister, targetSessionKey } = scopedHistoryFixture(
+    `scoped-grant-${name}-race`,
+    (storePath) => replaceSessionEntrySync({ storePath, sessionKey: "agent:main:main" }, patch),
+  );
+  try {
     await expect(
-      tool.execute("old-child-history-race", { sessionKey: targetSessionKey }),
+      tool.execute("scoped-grant-race", { sessionKey: targetSessionKey }),
     ).rejects.toThrow(`Session "${targetSessionKey}" changed after access was granted.`);
     expect(requests.some((request) => request.method === "chat.history")).toBe(false);
-  });
+  } finally {
+    unregister();
+  }
+});
 
-  it("honors a scoped incarnation grant through the sandbox visibility clamp", async () => {
-    const { tool, requests, unregister, targetSessionKey } = scopedHistoryFixture("scoped-grant");
-    try {
-      const result = await tool.execute("scoped-grant", { sessionKey: targetSessionKey });
-
-      expect(result.details).toMatchObject({
-        sessionKey: targetSessionKey,
-        messages: [{ role: "assistant", content: "visible" }],
-      });
-      expect(requests.map((request) => request.method)).toEqual(["chat.history"]);
-    } finally {
-      unregister();
-    }
-  });
-
-  it.each([
-    { name: "incarnation", patch: { sessionId: "replacement-incarnation", updatedAt: 2 } },
-    { name: "archived", patch: { sessionId: "main-incarnation", updatedAt: 2, archivedAt: 2 } },
-  ])("rejects a scoped grant when the target is $name before the read", async ({ name, patch }) => {
-    const { tool, requests, unregister, targetSessionKey } = scopedHistoryFixture(
-      `scoped-grant-${name}-race`,
-      (storePath) => replaceSessionEntrySync({ storePath, sessionKey: "agent:main:main" }, patch),
-    );
-    try {
-      await expect(
-        tool.execute("scoped-grant-race", { sessionKey: targetSessionKey }),
-      ).rejects.toThrow(`Session "${targetSessionKey}" changed after access was granted.`);
-      expect(requests.some((request) => request.method === "chat.history")).toBe(false);
-    } finally {
-      unregister();
-    }
-  });
-
-  it.each([
-    { requested: "global", requester: "global", agentId: "ops", resolved: "global" },
-    {
-      requested: "current",
-      requester: "agent:research:main",
-      agentId: "research",
-      resolved: "agent:research:main",
-    },
-  ])(
-    "resolves $requested history under $agentId",
-    async ({ requested, requester, agentId, resolved }) => {
-      const { tool, requests } = historyFixture(
-        { messages: [] },
-        {
-          agentSessionKey: requester,
-          ...(requested === "current" ? { requesterAgentIdOverride: "research" } : {}),
-          config: {
-            session: { store: path.join(tempDir!, `owned-${requested}.sqlite`), scope: "global" },
-            agents: {
-              ownership: "explicit",
-              defaults: { sessionStore: { agentId: "ops" } },
-              entries: { ops: {}, research: {} },
-            },
+it.each([
+  { requested: "global", requester: "global", agentId: "ops", resolved: "global" },
+  {
+    requested: "current",
+    requester: "agent:research:main",
+    agentId: "research",
+    resolved: "agent:research:main",
+  },
+])(
+  "resolves $requested history under $agentId",
+  async ({ requested, requester, agentId, resolved }) => {
+    const { tool, requests } = historyFixture(
+      { messages: [] },
+      {
+        agentSessionKey: requester,
+        ...(requested === "current" ? { requesterAgentIdOverride: "research" } : {}),
+        config: {
+          session: { store: path.join(tempDir!, `owned-${requested}.sqlite`), scope: "global" },
+          agents: {
+            ownership: "explicit",
+            defaults: { sessionStore: { agentId: "ops" } },
+            entries: { ops: {}, research: {} },
           },
         },
-      );
+      },
+    );
 
-      await tool.execute("owned-history", { sessionKey: requested });
-      expect(requests).toContainEqual({
-        method: "chat.history",
-        params: expect.objectContaining({ sessionKey: resolved, agentId }),
-      });
-      if (requested === "current") {
-        expect(requests.some((request) => request.method === "sessions.resolve")).toBe(false);
-      }
-    },
-  );
-});
+    await tool.execute("owned-history", { sessionKey: requested });
+    expect(requests).toContainEqual({
+      method: "chat.history",
+      params: expect.objectContaining({ sessionKey: resolved, agentId }),
+    });
+    if (requested === "current") {
+      expect(requests.some((request) => request.method === "sessions.resolve")).toBe(false);
+    }
+  },
+);
