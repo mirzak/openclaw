@@ -18,15 +18,32 @@ const identity = {
   sessionId: "session-1",
   generation: 1,
 };
-function fixture() {
+const snapshot = {
+  version: 1 as const,
+  gatewayNamespace: identity.gatewayNamespace,
+  controllerId: "controller",
+  sequence: 1,
+  retain: [],
+};
+function fixture(folders: string[] | undefined = ["~/projects"]) {
   const home = tempDirs.make("device-folder-");
   const allowed = path.join(home, "projects");
   const folder = path.join(allowed, "project");
   const root = path.join(home, "state", "node-host");
   fs.mkdirSync(folder, { recursive: true });
   const env = { ...process.env, HOME: home, USERPROFILE: home };
-  const runtime = new NodeWorkerWorkspaceRuntime({ root, env, folders: ["~/projects"] });
-  return { home, allowed, folder, root, env, runtime };
+  const runtime = new NodeWorkerWorkspaceRuntime({ root, env, folders });
+  const request = {
+    workspaceDir: folder,
+    gatewayNamespace: identity.gatewayNamespace,
+    environmentId: identity.environmentId,
+    sessionId: identity.sessionId,
+    sessionKey: "session-1",
+    ownerEpoch: 1,
+  };
+  const exec = (argv: string[], extra: Partial<Parameters<typeof runtime.exec>[0]> = {}) =>
+    runtime.exec({ ...identity, deviceFolder: folder, argv, ...extra });
+  return { home, allowed, folder, root, env, runtime, request, exec };
 }
 
 describe("device folder consent", () => {
@@ -71,29 +88,19 @@ describe("device folder consent", () => {
   });
 
   it("does not reinterpret an unbound legacy worker cwd as a device folder", async () => {
-    const { folder, runtime } = fixture();
-    await expect(
-      runtime.acquirePreparedWorkspace({
-        workspaceDir: folder,
-        gatewayNamespace: identity.gatewayNamespace,
-        environmentId: identity.environmentId,
-        sessionId: identity.sessionId,
-        ownerEpoch: 1,
-      }),
-    ).resolves.toBeUndefined();
+    const {
+      request: { sessionKey: _sessionKey, ...legacy },
+      runtime,
+    } = fixture();
+    await expect(runtime.acquirePreparedWorkspace(legacy)).resolves.toBeUndefined();
   });
 
   it("disables device-folder validation with an explicit empty list", async () => {
-    const { folder, root, env } = fixture();
-    const runtime = new NodeWorkerWorkspaceRuntime({ root, env, folders: [] });
+    const { folder, runtime, exec } = fixture([]);
     expect(() => runtime.validateDeviceFolder(folder)).toThrow("sessions are disabled");
-    await expect(
-      runtime.exec({
-        ...identity,
-        deviceFolder: folder,
-        argv: [NODE_WORKSPACE_VALIDATE_DEVICE_FOLDER_COMMAND],
-      }),
-    ).rejects.toThrow("sessions are disabled");
+    await expect(exec([NODE_WORKSPACE_VALIDATE_DEVICE_FOLDER_COMMAND])).rejects.toThrow(
+      "sessions are disabled",
+    );
   });
 
   it("revalidates a symlink on every operation and does not provision on validation", async () => {
@@ -119,26 +126,17 @@ describe("device folder consent", () => {
   });
 
   it("executes and inspects in place with private HOME, and leaves user files after retention", async () => {
-    const { folder, root, runtime } = fixture();
+    const { folder, root, runtime, request, exec } = fixture();
     fs.writeFileSync(path.join(folder, "user.txt"), "original");
-    const result = await runtime.exec({
-      ...identity,
-      deviceFolder: folder,
-      argv: [
-        "node",
-        "-e",
-        "console.log(JSON.stringify({ cwd: process.cwd(), home: process.env.HOME }))",
-      ],
-      nativeProcessOwner: true,
-    });
+    const result = await exec(
+      ["node", "-e", "console.log(JSON.stringify({ cwd: process.cwd(), home: process.env.HOME }))"],
+      { nativeProcessOwner: true },
+    );
     expect(result.code).toBe(0);
     const output = JSON.parse(result.stdout) as { cwd: string; home: string };
     expect(output.cwd).toBe(folder);
     expect(output.home.startsWith(root + path.sep)).toBe(true);
-    const inspected = await runtime.exec({
-      ...identity,
-      deviceFolder: folder,
-      argv: [WORKSPACE_INSPECTION_COMMAND],
+    const inspected = await exec([WORKSPACE_INSPECTION_COMMAND], {
       input: JSON.stringify({
         operation: "get",
         sessionKey: "session-1",
@@ -147,27 +145,11 @@ describe("device folder consent", () => {
       }),
     });
     expect(inspected.stdout).toContain("original");
-    const acquired = await runtime.acquireManagedWorkspaceAsync({
-      workspaceDir: folder,
-      gatewayNamespace: identity.gatewayNamespace,
-      environmentId: identity.environmentId,
-      sessionId: identity.sessionId,
-      sessionKey: "session-1",
-      ownerEpoch: 1,
-    });
+    const acquired = await runtime.acquireManagedWorkspaceAsync(request);
     expect(acquired.workspaceDir).toBe(folder);
     fs.writeFileSync(path.join(acquired.homeDir!, "private.txt"), "private state");
     acquired.release();
-    await runtime.applyRetainSnapshot(
-      {
-        version: 1,
-        gatewayNamespace: identity.gatewayNamespace,
-        controllerId: "controller",
-        sequence: 1,
-        retain: [],
-      },
-      async () => [],
-    );
+    await runtime.applyRetainSnapshot(snapshot, async () => []);
     expect(fs.existsSync(acquired.homeDir!)).toBe(false);
     expect(fs.existsSync(output.home)).toBe(false);
     expect(acquired.homeDir).toBe(output.home);
@@ -176,16 +158,9 @@ describe("device folder consent", () => {
   });
 
   it("retains private homes by gateway and generation, including acquired and recovered owners", async () => {
-    const { folder, root, env, runtime } = fixture();
+    const { folder, root, env, runtime, request } = fixture();
     fs.writeFileSync(path.join(folder, "user.txt"), "original");
-    const request = {
-      workspaceDir: folder,
-      gatewayNamespace: identity.gatewayNamespace,
-      environmentId: identity.environmentId,
-      sessionId: identity.sessionId,
-      sessionKey: "session-1",
-      ownerEpoch: 1,
-    };
+
     const first = await runtime.acquirePreparedWorkspace(request);
     const second = await runtime.acquirePreparedWorkspace({ ...request, ownerEpoch: 2 });
     const otherGateway = await runtime.acquirePreparedWorkspace({
@@ -197,13 +172,7 @@ describe("device folder consent", () => {
     for (const acquired of [first!, second!, otherGateway!]) {
       fs.writeFileSync(path.join(acquired.homeDir!, "private.txt"), "private state");
     }
-    const snapshot = {
-      version: 1 as const,
-      gatewayNamespace: request.gatewayNamespace,
-      controllerId: "controller",
-      sequence: 1,
-      retain: [],
-    };
+
     await runtime.applyRetainSnapshot(snapshot, async () => []);
     expect(fs.existsSync(first!.homeDir!)).toBe(true);
     expect(fs.existsSync(second!.homeDir!)).toBe(true);
@@ -235,31 +204,22 @@ describe("device folder consent", () => {
   });
 
   it("drains the logical operation queue after the user folder disappears", async () => {
-    const { folder, runtime } = fixture();
+    const { folder, exec } = fixture();
     fs.renameSync(folder, `${folder}-moved`);
-    await expect(
-      runtime.exec({
-        ...identity,
-        deviceFolder: folder,
-        argv: [NODE_WORKSPACE_DRAIN_COMMAND],
-      }),
-    ).resolves.toMatchObject({ code: 0, stdout: "drained\n" });
+    await expect(exec([NODE_WORKSPACE_DRAIN_COMMAND])).resolves.toMatchObject({
+      code: 0,
+      stdout: "drained\n",
+    });
     expect(fs.existsSync(folder)).toBe(false);
   });
 
   it("binds an acquisition to the exact directory, not just an allowed path", () => {
-    const { folder, allowed, root, env } = fixture();
+    const { folder, allowed, root, env, request } = fixture();
     const acquired = new NodeWorkerDeviceFolders({
       env,
       folders: [allowed],
       privateRoots: [root],
-    }).acquire({
-      workspaceDir: folder,
-      environmentId: "environment-1",
-      sessionId: "session-1",
-      sessionKey: "session-1",
-      ownerEpoch: 1,
-    });
+    }).acquire(request);
     acquired.assertCurrent();
     fs.renameSync(folder, `${folder}-original`);
     fs.mkdirSync(folder);

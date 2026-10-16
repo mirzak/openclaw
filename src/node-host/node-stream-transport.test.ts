@@ -17,6 +17,77 @@ import { flushLogger, resetLogger, setLoggerOverride } from "../logging/logger.j
 import { createDiagnosticLogRecordCapture } from "../logging/test-helpers/diagnostic-log-capture.js";
 import { runNodeStreamTransport } from "./node-stream-transport.js";
 
+type StreamOptions = Parameters<typeof runNodeStreamTransport>[0];
+function runStream(
+  options: Pick<StreamOptions, "gatewayUrl" | "target" | "signal"> & Partial<StreamOptions>,
+) {
+  return runNodeStreamTransport({
+    attachPath: "/node-desktop/attach",
+    expectedAttachPath: "/node-desktop/attach",
+    metadata: { ok: true },
+    streamName: "desktop",
+    ...options,
+  });
+}
+async function listenServer(server: net.Server) {
+  await new Promise<void>((resolve) => {
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  return (server.address() as AddressInfo).port;
+}
+async function close(server: net.Server | WebSocketServer) {
+  await new Promise<void>((resolve) => {
+    server.close(() => resolve());
+  });
+}
+function targetStream() {
+  return new Duplex({
+    read() {},
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
+  });
+}
+// Raw peers deliberately leave the websocket/TCP close handshake incomplete.
+function rawGateway(onFrame: (socket: net.Socket) => void, onPeer?: (socket: net.Socket) => void) {
+  return net.createServer({ allowHalfOpen: Boolean(onPeer) }, (socket) => {
+    onPeer?.(socket);
+    socket.on("error", () => undefined);
+    let buffer = Buffer.alloc(0);
+    let upgraded = false;
+    socket.on("data", (chunk: Buffer) => {
+      if (upgraded) {
+        onFrame(socket);
+        return;
+      }
+      buffer = Buffer.concat([buffer, chunk]);
+      const headerEnd = buffer.indexOf("\r\n\r\n");
+      if (headerEnd === -1) {
+        return;
+      }
+      const key = /^Sec-WebSocket-Key: ([^\r\n]+)/m
+        .exec(buffer.subarray(0, headerEnd).toString("latin1"))?.[1]
+        ?.trim();
+      if (!key) {
+        socket.destroy();
+        return;
+      }
+      const accept = createHash("sha1")
+        .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+        .digest("base64");
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
+          accept +
+          "\r\n\r\n",
+      );
+      upgraded = true;
+      if (!onPeer && buffer.length > headerEnd + 4) {
+        onFrame(socket);
+      }
+    });
+  });
+}
+
 const fingerprint = new X509Certificate(TEST_TLS_CERT_PEM).fingerprint256;
 const ticket = "1".repeat(48);
 const logPaths = createSuiteLogPathTracker("node-stream-diagnostics-");
@@ -126,7 +197,7 @@ describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) =>
         : undefined;
       const controller = new AbortController();
       let failure: unknown;
-      const running = runNodeStreamTransport({
+      const running = runStream({
         gatewayUrl: `${tls ? "wss" : "ws"}://127.0.0.1:${gatewayPort}`,
         gatewayTlsFingerprint: correctPin ? fingerprint : "ab".repeat(32),
         gatewayCloudflareAccess: {
@@ -144,7 +215,6 @@ describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) =>
                   socket.once("error", reject);
                 }),
               },
-        metadata: { ok: true },
         streamName,
         signal: controller.signal,
       }).catch((error: unknown) => {
@@ -222,13 +292,9 @@ describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) =>
         for (const socket of sockets) {
           socket.destroy();
         }
-        await new Promise<void>((resolve) => {
-          wss.close(() => resolve());
-        });
+        await close(wss);
         for (const server of servers.toReversed()) {
-          await new Promise<void>((resolve) => {
-            server.close(() => resolve());
-          });
+          await close(server);
         }
       }
     },
@@ -247,9 +313,7 @@ describe("node stream startup ownership", () => {
   ])("closes its connected target when %s fails", async (_name, override) => {
     const peerClosed = createDeferred();
     const local = net.createServer((peer) => peer.once("close", () => peerClosed.resolve()));
-    await new Promise<void>((resolve) => {
-      local.listen(0, "127.0.0.1", resolve);
-    });
+    await listenServer(local);
     const port = (local.address() as AddressInfo).port;
     const socket = await new Promise<net.Socket>((resolve, reject) => {
       const connected = net.connect(port, "127.0.0.1", () => resolve(connected));
@@ -257,13 +321,10 @@ describe("node stream startup ownership", () => {
     });
     try {
       await expect(
-        runNodeStreamTransport({
+        runStream({
           gatewayUrl: "ws://127.0.0.1:1",
-          attachPath: "/node-desktop/attach",
-          expectedAttachPath: "/node-desktop/attach",
           target: { stream: socket },
           metadata: { auth: "vnc-password" },
-          streamName: "desktop",
           signal: new AbortController().signal,
           ...override,
         }),
@@ -272,9 +333,7 @@ describe("node stream startup ownership", () => {
       await peerClosed.promise;
     } finally {
       socket.destroy();
-      await new Promise<void>((resolve) => {
-        local.close(() => resolve());
-      });
+      await close(local);
     }
   });
 });
@@ -307,17 +366,14 @@ describe("node stream EOF with inbound backpressure", () => {
         }
       });
     });
-    await new Promise<void>((resolve) => {
-      gateway.listen(0, "127.0.0.1", resolve);
-    });
+    await listenServer(gateway);
     const controller = new AbortController();
     let settled = false;
-    const running = runNodeStreamTransport({
+    const running = runStream({
       gatewayUrl: `ws://127.0.0.1:${(gateway.address() as AddressInfo).port}`,
       attachPath: `/node-${streamName}/attach`,
       expectedAttachPath: `/node-${streamName}/attach`,
       target: { stream: target },
-      metadata: { ok: true },
       streamName,
       signal: controller.signal,
     }).then(() => {
@@ -338,12 +394,8 @@ describe("node stream EOF with inbound backpressure", () => {
       for (const client of wss.clients) {
         client.terminate();
       }
-      await new Promise<void>((resolve) => {
-        wss.close(() => resolve());
-      });
-      await new Promise<void>((resolve) => {
-        gateway.close(() => resolve());
-      });
+      await close(wss);
+      await close(gateway);
     }
   });
 });
@@ -353,51 +405,14 @@ describe("node stream close acknowledgement", () => {
     const logCapture = createDiagnosticLogRecordCapture();
     logCaptures.push(logCapture);
     const gotFrame = createDeferred();
-    const gateway = net.createServer((socket) => {
-      let buffer = Buffer.alloc(0);
-      let upgraded = false;
-      socket.on("data", (chunk: Buffer) => {
-        if (upgraded) {
-          gotFrame.resolve();
-          return;
-        }
-        buffer = Buffer.concat([buffer, chunk]);
-        const headerEnd = buffer.indexOf("\r\n\r\n");
-        if (headerEnd === -1) {
-          return;
-        }
-        const header = buffer.subarray(0, headerEnd).toString("latin1");
-        const key = /^Sec-WebSocket-Key: ([^\r\n]+)/m.exec(header)?.[1]?.trim();
-        if (!key) {
-          socket.destroy();
-          return;
-        }
-        const accept = createHash("sha1")
-          .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-          .digest("base64");
-        socket.write(
-          "HTTP/1.1 101 Switching Protocols\r\n" +
-            "Upgrade: websocket\r\n" +
-            "Connection: Upgrade\r\n" +
-            `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
-        );
-        upgraded = true;
-        if (buffer.length > headerEnd + 4) {
-          gotFrame.resolve();
-        }
-      });
-    });
-    await new Promise<void>((resolve) => {
-      gateway.listen(0, "127.0.0.1", resolve);
-    });
+    const gateway = rawGateway(() => gotFrame.resolve());
+    await listenServer(gateway);
     const gatewayPort = (gateway.address() as AddressInfo).port;
     let targetPeer: net.Socket | undefined;
     const targetServer = net.createServer((peer) => {
       targetPeer = peer;
     });
-    await new Promise<void>((resolve) => {
-      targetServer.listen(0, "127.0.0.1", resolve);
-    });
+    await listenServer(targetServer);
     const targetPort = (targetServer.address() as AddressInfo).port;
     const closedLog = createDeferred();
     const stopClosedLog = onInternalDiagnosticEvent((event) => {
@@ -412,13 +427,10 @@ describe("node stream close acknowledgement", () => {
     const ackArmed = new Promise<void>((resolve) => {
       markAckArmed = resolve;
     });
-    const running = runNodeStreamTransport({
+    const running = runStream({
       gatewayUrl: `ws://127.0.0.1:${gatewayPort}`,
       attachPath: `/node-desktop/attach?ticket=${ticket}`,
-      expectedAttachPath: "/node-desktop/attach",
       target: { port: targetPort },
-      metadata: { ok: true },
-      streamName: "desktop",
       signal: controller.signal,
       closeAckMs: 40,
       scheduleCloseAck: (callback, delayMs) => {
@@ -457,12 +469,8 @@ describe("node stream close acknowledgement", () => {
       controller.abort();
       await running;
       targetPeer?.destroy();
-      await new Promise<void>((resolve) => {
-        targetServer.close(() => resolve());
-      });
-      await new Promise<void>((resolve) => {
-        gateway.close(() => resolve());
-      });
+      await close(targetServer);
+      await close(gateway);
       stopClosedLog();
     }
   });
@@ -492,25 +500,17 @@ describe("node stream close acknowledgement", () => {
         }
       });
     });
-    await new Promise<void>((resolve) => {
-      gateway.listen(0, "127.0.0.1", resolve);
-    });
+    await listenServer(gateway);
     const connected = createDeferred<net.Socket>();
     const targetServer = net.createServer((peer) => {
       connected.resolve(peer);
     });
-    await new Promise<void>((resolve) => {
-      targetServer.listen(0, "127.0.0.1", resolve);
-    });
+    await listenServer(targetServer);
     const delays: number[] = [];
     const controller = new AbortController();
-    const running = runNodeStreamTransport({
+    const running = runStream({
       gatewayUrl: `ws://127.0.0.1:${(gateway.address() as AddressInfo).port}`,
-      attachPath: "/node-desktop/attach",
-      expectedAttachPath: "/node-desktop/attach",
       target: { port: (targetServer.address() as AddressInfo).port },
-      metadata: { ok: true },
-      streamName: "desktop",
       signal: controller.signal,
       closeAckMs: 40,
       scheduleCloseAck: (callback, delayMs) => {
@@ -539,18 +539,12 @@ describe("node stream close acknowledgement", () => {
       controller.abort();
       await running;
       targetPeer?.destroy();
-      await new Promise<void>((resolve) => {
-        targetServer.close(() => resolve());
-      });
+      await close(targetServer);
       for (const client of wss.clients) {
         client.terminate();
       }
-      await new Promise<void>((resolve) => {
-        wss.close(() => resolve());
-      });
-      await new Promise<void>((resolve) => {
-        gateway.close(() => resolve());
-      });
+      await close(wss);
+      await close(gateway);
     }
   }
 
@@ -569,27 +563,16 @@ describe("node stream close acknowledgement", () => {
     wss.on("connection", (ws) => {
       gatewaySocket = ws;
     });
-    await new Promise<void>((resolve) => {
-      gateway.listen(0, "127.0.0.1", resolve);
-    });
-    const target = new Duplex({
-      read() {},
-      write(_chunk, _encoding, callback) {
-        callback();
-      },
-    });
+    await listenServer(gateway);
+    const target = targetStream();
     const delays: number[] = [];
     const cleanups: Array<() => void> = [];
     const controller = new AbortController();
     try {
       await expect(
-        runNodeStreamTransport({
+        runStream({
           gatewayUrl: `ws://127.0.0.1:${(gateway.address() as AddressInfo).port}`,
-          attachPath: "/node-desktop/attach",
-          expectedAttachPath: "/node-desktop/attach",
           target: { stream: target },
-          metadata: { ok: true },
-          streamName: "desktop",
           signal: controller.signal,
           emitStatus: async (status) => {
             if (status.includes("attached")) {
@@ -613,12 +596,8 @@ describe("node stream close acknowledgement", () => {
       for (const client of wss.clients) {
         client.terminate();
       }
-      await new Promise<void>((resolve) => {
-        wss.close(() => resolve());
-      });
-      await new Promise<void>((resolve) => {
-        gateway.close(() => resolve());
-      });
+      await close(wss);
+      await close(gateway);
     }
   });
 
@@ -628,26 +607,15 @@ describe("node stream close acknowledgement", () => {
     wss.on("connection", (ws) => {
       ws.on("message", () => undefined);
     });
-    await new Promise<void>((resolve) => {
-      gateway.listen(0, "127.0.0.1", resolve);
-    });
-    const target = new Duplex({
-      read() {},
-      write(_chunk, _encoding, callback) {
-        callback();
-      },
-    });
+    await listenServer(gateway);
+    const target = targetStream();
     target.on("end", () => target.destroy());
     const delays: number[] = [];
     const controller = new AbortController();
     try {
-      await runNodeStreamTransport({
+      await runStream({
         gatewayUrl: `ws://127.0.0.1:${(gateway.address() as AddressInfo).port}`,
-        attachPath: "/node-desktop/attach",
-        expectedAttachPath: "/node-desktop/attach",
         target: { stream: target },
-        metadata: { ok: true },
-        streamName: "desktop",
         signal: controller.signal,
         emitStatus: async (status) => {
           if (status.includes("attached")) {
@@ -669,74 +637,34 @@ describe("node stream close acknowledgement", () => {
       for (const client of wss.clients) {
         client.terminate();
       }
-      await new Promise<void>((resolve) => {
-        wss.close(() => resolve());
-      });
-      await new Promise<void>((resolve) => {
-        gateway.close(() => resolve());
-      });
+      await close(wss);
+      await close(gateway);
     }
   });
 
   it("rejects a protocol error without a node handshake timer", async () => {
     let peer: net.Socket | undefined;
-    const gateway = net.createServer({ allowHalfOpen: true }, (socket) => {
-      peer = socket;
-      socket.on("error", () => undefined);
-      let buffer = Buffer.alloc(0);
-      let upgraded = false;
-      let sentInvalidFrame = false;
-      socket.on("data", (chunk: Buffer) => {
-        if (!upgraded) {
-          buffer = Buffer.concat([buffer, chunk]);
-          const headerEnd = buffer.indexOf("\r\n\r\n");
-          if (headerEnd === -1) {
-            return;
-          }
-          const header = buffer.subarray(0, headerEnd).toString("latin1");
-          const key = /^Sec-WebSocket-Key: ([^\r\n]+)/m.exec(header)?.[1]?.trim();
-          if (!key) {
-            socket.destroy();
-            return;
-          }
-          const accept = createHash("sha1")
-            .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-            .digest("base64");
-          socket.write(
-            "HTTP/1.1 101 Switching Protocols\r\n" +
-              "Upgrade: websocket\r\n" +
-              "Connection: Upgrade\r\n" +
-              `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
-          );
-          upgraded = true;
-          return;
-        }
+    let sentInvalidFrame = false;
+    const gateway = rawGateway(
+      (socket) => {
         if (!sentInvalidFrame) {
           sentInvalidFrame = true;
           socket.write(Buffer.from([0x83, 0x00]));
         }
-      });
-    });
-    await new Promise<void>((resolve) => {
-      gateway.listen(0, "127.0.0.1", resolve);
-    });
-    const target = new Duplex({
-      read() {},
-      write(_chunk, _encoding, callback) {
-        callback();
       },
-    });
+      (socket) => {
+        peer = socket;
+      },
+    );
+    await listenServer(gateway);
+    const target = targetStream();
     const controller = new AbortController();
     const started = Date.now();
     try {
       await expect(
-        runNodeStreamTransport({
+        runStream({
           gatewayUrl: `ws://127.0.0.1:${(gateway.address() as AddressInfo).port}`,
-          attachPath: "/node-desktop/attach",
-          expectedAttachPath: "/node-desktop/attach",
           target: { stream: target },
-          metadata: { ok: true },
-          streamName: "desktop",
           signal: controller.signal,
         }),
       ).rejects.toThrow(/invalid opcode 3/);
@@ -745,74 +673,35 @@ describe("node stream close acknowledgement", () => {
       controller.abort();
       target.destroy();
       peer?.destroy();
-      await new Promise<void>((resolve) => {
-        gateway.close(() => resolve());
-      });
+      await close(gateway);
     }
   });
 
   it("closes the client when a gateway close withholds TCP FIN", async () => {
     let peer: net.Socket | undefined;
     const receivedFin = createDeferred();
-    const gateway = net.createServer({ allowHalfOpen: true }, (socket) => {
-      peer = socket;
-      socket.on("error", () => undefined);
-      socket.once("end", () => receivedFin.resolve());
-      let buffer = Buffer.alloc(0);
-      let upgraded = false;
-      let sentClose = false;
-      socket.on("data", (chunk: Buffer) => {
-        if (!upgraded) {
-          buffer = Buffer.concat([buffer, chunk]);
-          const headerEnd = buffer.indexOf("\r\n\r\n");
-          if (headerEnd === -1) {
-            return;
-          }
-          const header = buffer.subarray(0, headerEnd).toString("latin1");
-          const key = /^Sec-WebSocket-Key: ([^\r\n]+)/m.exec(header)?.[1]?.trim();
-          if (!key) {
-            socket.destroy();
-            return;
-          }
-          const accept = createHash("sha1")
-            .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-            .digest("base64");
-          socket.write(
-            "HTTP/1.1 101 Switching Protocols\r\n" +
-              "Upgrade: websocket\r\n" +
-              "Connection: Upgrade\r\n" +
-              `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
-          );
-          upgraded = true;
-          return;
-        }
+    let sentClose = false;
+    const gateway = rawGateway(
+      (socket) => {
         if (!sentClose) {
           sentClose = true;
-          // Close code 1000. Leave the TCP connection half-open.
           socket.write(Buffer.from([0x88, 0x02, 0x03, 0xe8]));
         }
-      });
-    });
-    await new Promise<void>((resolve) => {
-      gateway.listen(0, "127.0.0.1", resolve);
-    });
-    const target = new Duplex({
-      read() {},
-      write(_chunk, _encoding, callback) {
-        callback();
       },
-    });
+      (socket) => {
+        peer = socket;
+        socket.once("end", () => receivedFin.resolve());
+      },
+    );
+    await listenServer(gateway);
+    const target = targetStream();
     const closeSpy = vi.spyOn(WebSocket.prototype, "close");
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const controller = new AbortController();
     let failure: unknown;
-    const running = runNodeStreamTransport({
+    const running = runStream({
       gatewayUrl: `ws://127.0.0.1:${(gateway.address() as AddressInfo).port}`,
-      attachPath: "/node-desktop/attach",
-      expectedAttachPath: "/node-desktop/attach",
       target: { stream: target },
-      metadata: { ok: true },
-      streamName: "desktop",
       signal: controller.signal,
     }).catch((error: unknown) => {
       failure = error;
@@ -837,9 +726,7 @@ describe("node stream close acknowledgement", () => {
       await running;
       closeSpy.mockRestore();
       vi.useRealTimers();
-      await new Promise<void>((resolve) => {
-        gateway.close(() => resolve());
-      });
+      await close(gateway);
     }
   });
 });

@@ -1,6 +1,6 @@
 import { PassThrough } from "node:stream";
 import { finished } from "node:stream/promises";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { createAwaitedDecodedOutput, onDecodedOutput } from "../process/decoded-output.js";
 import type { ProcessExtinctionResult } from "../process/supervisor/types.js";
@@ -118,6 +118,9 @@ function observationHarness(
         dispose();
       }
     })());
+  onTestFinished(async () => {
+    await close();
+  });
   return {
     stdout,
     stopped: stopped.promise,
@@ -204,22 +207,18 @@ describe("node worker output framing", () => {
     },
   ])("delivers $name after journaling", async ({ chunks, frames, result }) => {
     const harness = observationHarness();
-    try {
-      await harness.releaseJournal();
-      for (const chunk of chunks.slice(0, -1)) {
-        harness.stdout.write(chunk);
-      }
-      expect(harness.frames).toEqual([]);
-      harness.stdout.write(chunks.at(-1)!);
-      expect(await harness.close()).toEqual({
-        state: "completed",
-        resultJson: JSON.stringify(result),
-      });
-      expect(harness.frames).toEqual(frames);
-      expect(harness.kill).not.toHaveBeenCalled();
-    } finally {
-      await harness.close();
+    await harness.releaseJournal();
+    for (const chunk of chunks.slice(0, -1)) {
+      harness.stdout.write(chunk);
     }
+    expect(harness.frames).toEqual([]);
+    harness.stdout.write(chunks.at(-1)!);
+    expect(await harness.close()).toEqual({
+      state: "completed",
+      resultJson: JSON.stringify(result),
+    });
+    expect(harness.frames).toEqual(frames);
+    expect(harness.kill).not.toHaveBeenCalled();
   });
 
   it.each([false, true])(
@@ -262,54 +261,46 @@ describe("node worker output framing", () => {
 
   it("delivers an earlier frame before rejecting a later oversized frame in the same chunk", async () => {
     const harness = observationHarness();
-    try {
-      await harness.releaseJournal();
-      harness.stdout.write(
-        Buffer.concat([encodeResult("first"), Buffer.alloc(NODE_WORKER_STDOUT_MAX_BYTES + 1, 120)]),
-      );
-      await harness.firstChunkConsumed;
+    await harness.releaseJournal();
+    harness.stdout.write(
+      Buffer.concat([encodeResult("first"), Buffer.alloc(NODE_WORKER_STDOUT_MAX_BYTES + 1, 120)]),
+    );
+    await harness.firstChunkConsumed;
 
-      expect(harness.frames).toEqual([resultFrame("first")]);
-      expect(await harness.close()).toMatchObject({
-        state: "failed",
-        errorText: `worker stdout exceeded ${NODE_WORKER_STDOUT_MAX_BYTES} bytes`,
-      });
-      expect(harness.kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
-    } finally {
-      await harness.close();
-    }
+    expect(harness.frames).toEqual([resultFrame("first")]);
+    expect(await harness.close()).toMatchObject({
+      state: "failed",
+      errorText: `worker stdout exceeded ${NODE_WORKER_STDOUT_MAX_BYTES} bytes`,
+    });
+    expect(harness.kill).toHaveBeenCalledExactlyOnceWith("SIGKILL");
   });
 
   it.each([0, 1])(
     "bounds aggregate output including delimiters at cap + %i before journal readiness",
     async (delta) => {
       const harness = observationHarness();
-      try {
-        harness.stdout.write(
-          Buffer.concat([
-            sizedResult("first", NODE_WORKER_STDOUT_MAX_BYTES / 2),
-            sizedResult("second", NODE_WORKER_STDOUT_MAX_BYTES / 2 + delta),
-          ]),
-        );
-        await harness.firstChunkConsumed;
+      harness.stdout.write(
+        Buffer.concat([
+          sizedResult("first", NODE_WORKER_STDOUT_MAX_BYTES / 2),
+          sizedResult("second", NODE_WORKER_STDOUT_MAX_BYTES / 2 + delta),
+        ]),
+      );
+      await harness.firstChunkConsumed;
 
+      expect(harness.frames).toEqual([]);
+      expect(harness.kill).toHaveBeenCalledTimes(delta > 0 ? 1 : 0);
+      const outcome = await harness.close();
+      if (delta > 0) {
+        expect(outcome).toMatchObject({
+          state: "failed",
+          errorText: `worker stdout exceeded ${NODE_WORKER_STDOUT_MAX_BYTES} bytes`,
+        });
         expect(harness.frames).toEqual([]);
-        expect(harness.kill).toHaveBeenCalledTimes(delta > 0 ? 1 : 0);
-        const outcome = await harness.close();
-        if (delta > 0) {
-          expect(outcome).toMatchObject({
-            state: "failed",
-            errorText: `worker stdout exceeded ${NODE_WORKER_STDOUT_MAX_BYTES} bytes`,
-          });
-          expect(harness.frames).toEqual([]);
-        } else {
-          expect(outcome).toMatchObject({ state: "completed" });
-          expect(
-            harness.frames.map((frame) => ("turnId" in frame ? frame.turnId : undefined)),
-          ).toEqual(["first", "second"]);
-        }
-      } finally {
-        await harness.close();
+      } else {
+        expect(outcome).toMatchObject({ state: "completed" });
+        expect(
+          harness.frames.map((frame) => ("turnId" in frame ? frame.turnId : undefined)),
+        ).toEqual(["first", "second"]);
       }
     },
   );
@@ -324,18 +315,14 @@ describe("node worker output framing", () => {
     },
   ])("rejects EOF with $name", async ({ wire, frames }) => {
     const harness = observationHarness();
-    try {
-      await harness.releaseJournal();
-      harness.stdout.write(wire);
+    await harness.releaseJournal();
+    harness.stdout.write(wire);
 
-      expect(await harness.close()).toMatchObject({
-        state: "failed",
-        errorText: "worker exited without a complete turn result",
-      });
-      expect(harness.frames).toHaveLength(frames);
-    } finally {
-      await harness.close();
-    }
+    expect(await harness.close()).toMatchObject({
+      state: "failed",
+      errorText: "worker exited without a complete turn result",
+    });
+    expect(harness.frames).toHaveLength(frames);
   });
 });
 
@@ -354,28 +341,24 @@ describe("node worker cleanup observation", () => {
       waitForExtinction: async () => extinction,
       expectedKind: kind,
     });
-    try {
-      await harness.releaseJournal();
-      harness.stdout.write(encodeResult("first"));
-      const outcome = await harness.close();
+    await harness.releaseJournal();
+    harness.stdout.write(encodeResult("first"));
+    const outcome = await harness.close();
 
-      if (kind === "deferred") {
-        expect(outcome).toMatchObject({
-          state: "failed",
-          errorText: expect.stringContaining("cleanup"),
-        });
-        expect(outcome.errorText).not.toContain("framing-fixture-token");
-        expect(outcome.resultJson).toBeUndefined();
-      } else {
-        expect(outcome).toEqual({
-          state: "completed",
-          resultJson: JSON.stringify(resultFrame("first").result),
-        });
-      }
-      expect(harness.frames).toEqual([resultFrame("first")]);
-    } finally {
-      await harness.close();
+    if (kind === "deferred") {
+      expect(outcome).toMatchObject({
+        state: "failed",
+        errorText: expect.stringContaining("cleanup"),
+      });
+      expect(outcome.errorText).not.toContain("framing-fixture-token");
+      expect(outcome.resultJson).toBeUndefined();
+    } else {
+      expect(outcome).toEqual({
+        state: "completed",
+        resultJson: JSON.stringify(resultFrame("first").result),
+      });
     }
+    expect(harness.frames).toEqual([resultFrame("first")]);
   });
 
   it.each([true, false])(
