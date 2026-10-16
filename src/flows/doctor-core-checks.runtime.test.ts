@@ -3,6 +3,7 @@ import { createMcpProofPluginRegistry } from "../agents/mcp-connection-resolver.
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import { collectGatewayHealthFindings } from "../commands/doctor-gateway-health.js";
 import { createSqliteWalHealth } from "../commands/sqlite-wal-health.test-support.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { withPluginRuntimeRegistryScope } from "../plugins/runtime/gateway-request-scope.js";
 import { setPluginToolMeta } from "../plugins/tool-metadata.js";
 import { createCoreHealthChecks } from "./doctor-core-checks.js";
@@ -27,7 +28,6 @@ const mocks = vi.hoisted(() => ({
   resolveDefaultModelForAgent: vi.fn(() => ({ provider: "openai", model: "gpt-5.5" })),
   metadataScopes: [] as AsyncDisposable[],
 }));
-
 vi.mock("../commands/doctor/shared/plugin-metadata-snapshot-scope.js", async (importOriginal) => {
   const actual =
     await importOriginal<
@@ -114,6 +114,37 @@ const { collectRuntimeToolSchemaFindings } = await import("./doctor-tool-schema-
 const objectSchema = { type: "object", properties: {} };
 const arraySchema = { type: "array", items: { type: "number" } };
 const runtime = { log() {}, error() {}, exit() {} };
+const localConfig: OpenClawConfig = { gateway: { mode: "local" } };
+const invalidMcpSchema = 'tools[0].inputSchema.type: Invalid input: expected "object"';
+
+function agentConfig(...ids: string[]) {
+  return {
+    agents: {
+      entries: Object.fromEntries(ids.map((id) => [id, { workspace: `/tmp/${id}-workspace` }])),
+    },
+  };
+}
+
+function gatewayHealth(cfg: OpenClawConfig = localConfig) {
+  return collectGatewayHealthFindings({ cfg });
+}
+
+function gatewayDaemon() {
+  return collectGatewayDaemonFindings({ cfg: localConfig });
+}
+
+function expectBundleCall(expected: Record<string, unknown>) {
+  expect(mocks.createBundleMcpToolRuntime).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining(expected),
+  );
+}
+
+function expectNoText(value: unknown, ...privateValues: string[]) {
+  const serialized = JSON.stringify(value);
+  for (const privateValue of privateValues) {
+    expect(serialized).not.toContain(privateValue);
+  }
+}
 
 function tool(name: string, parameters: unknown): AnyAgentTool {
   return {
@@ -147,7 +178,7 @@ function mockBundleDiagnostic(serverName = "fuzzplugin") {
         serverName,
         safeServerName: serverName,
         launchSummary: "node fuzzplugin-mcp.mjs",
-        message: 'tools[0].inputSchema.type: Invalid input: expected "object"',
+        message: invalidMcpSchema,
       },
     ],
     dispose: mocks.disposeBundleRuntime,
@@ -309,7 +340,7 @@ describe("doctor runtime tool schema checks", () => {
     const findings = await collectRuntimeToolSchemaFindings(mcpConfig());
     expectSchemaError(findings, {
       path: "mcp.servers.fuzzplugin",
-      requirement: 'tools[0].inputSchema.type: Invalid input: expected "object"',
+      requirement: invalidMcpSchema,
     });
     expectSchemaError(findings, {
       path: "mcp.servers",
@@ -342,10 +373,9 @@ describe("doctor runtime tool schema checks", () => {
     expectSchemaError(
       await collectRuntimeToolSchemaFindings({
         agents: {
-          entries: {
-            main: { workspace: "/tmp/shared-workspace" },
-            worker: { workspace: "/tmp/shared-workspace" },
-          },
+          entries: Object.fromEntries(
+            ["main", "worker"].map((id) => [id, { workspace: "/tmp/shared-workspace" }]),
+          ),
         },
       }),
       {
@@ -392,35 +422,22 @@ describe("doctor runtime tool schema checks", () => {
     expect(mocks.createOpenClawCodingTools).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ agentId: "main" }),
     );
-    expect(mocks.createBundleMcpToolRuntime).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({
-        workspaceDir: expect.stringContaining("main-workspace"),
-      }),
-    );
+    expectBundleCall({ workspaceDir: expect.stringContaining("main-workspace") });
   });
 
   it("reuses one MCP probe for equivalent agent workspaces", async () => {
     mockBundleDiagnostic();
     const findings = await collectRuntimeToolSchemaFindings({
       ...mcpConfig(),
-      agents: {
-        entries: {
-          main: { workspace: "/tmp/main-workspace" },
-          worker: { workspace: "/tmp/worker-workspace" },
-        },
-      },
+      ...agentConfig("main", "worker"),
     });
     expect(findings).toEqual([
       findingMatching("runtime-tool-schemas", "error", {
         path: "mcp.servers.fuzzplugin",
-        requirement: 'tools[0].inputSchema.type: Invalid input: expected "object"',
+        requirement: invalidMcpSchema,
       }),
     ]);
-    expect(mocks.createBundleMcpToolRuntime).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({
-        workspaceDir: expect.stringContaining("main-workspace"),
-      }),
-    );
+    expectBundleCall({ workspaceDir: expect.stringContaining("main-workspace") });
     expect(mocks.disposeBundleRuntime).toHaveBeenCalledTimes(1);
   });
 
@@ -462,12 +479,7 @@ describe("doctor runtime tool schema checks", () => {
 
   it("defers shared OAuth without suppressing non-OAuth probes", async () => {
     const findings = await collectRuntimeToolSchemaFindings({
-      agents: {
-        entries: {
-          main: { workspace: "/tmp/main-workspace" },
-          worker: { workspace: "/tmp/worker-workspace" },
-        },
-      },
+      ...agentConfig("main", "worker"),
       mcp: {
         servers: {
           authenticated: {
@@ -489,11 +501,7 @@ describe("doctor runtime tool schema checks", () => {
         fixHint: expect.stringContaining("openclaw mcp probe"),
       }),
     ]);
-    expect(mocks.createBundleMcpToolRuntime).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({
-        excludeServerNames: new Set(["authenticated"]),
-      }),
-    );
+    expectBundleCall({ excludeServerNames: new Set(["authenticated"]) });
     expect(mocks.disposeBundleRuntime).toHaveBeenCalledTimes(1);
   });
 
@@ -508,28 +516,27 @@ describe("doctor runtime tool schema checks", () => {
   });
 
   it.each([
-    {
-      phase: "load",
-      toolName: "",
-      path: "agents.main.tools",
-      message: "Agent main runtime tool schema validation could not load the runtime tool set.",
-    },
-    {
-      phase: "normalize",
-      toolName: "fuzzplugin_move_angles",
-      path: "agents.main.tools",
-      message:
-        "Agent main runtime tool schema validation could not normalize the runtime tool set.",
-    },
-    {
-      phase: "normalize",
-      toolName: "fuzzplugin__move_angles",
-      path: "mcp.servers",
-      message: "Configured MCP tool schema validation could not normalize the runtime tool set.",
-    },
+    [
+      "load",
+      "",
+      "agents.main.tools",
+      "Agent main runtime tool schema validation could not load the runtime tool set.",
+    ],
+    [
+      "normalize",
+      "fuzzplugin_move_angles",
+      "agents.main.tools",
+      "Agent main runtime tool schema validation could not normalize the runtime tool set.",
+    ],
+    [
+      "normalize",
+      "fuzzplugin__move_angles",
+      "mcp.servers",
+      "Configured MCP tool schema validation could not normalize the runtime tool set.",
+    ],
   ])(
-    "reports $path $phase errors and disposes the runtime",
-    async ({ phase, toolName, path, message }) => {
+    "reports %s errors for %s at %s and disposes the runtime",
+    async (phase, toolName, path, message) => {
       const error = new Error(`fuzzplugin ${phase} failed`);
       if (phase === "load") {
         mocks.createOpenClawCodingTools.mockImplementationOnce(() => {
@@ -593,7 +600,7 @@ describe("doctor gateway runtime checks", () => {
   });
 
   it("projects SecretRef and SQLite warnings from one authenticated read-only status RPC", async () => {
-    const cfg = { gateway: { mode: "local" as const } };
+    const cfg = localConfig;
     const privateToken = "SYNTHETIC_PRIVATE_URL_TOKEN";
     mocks.buildGatewayProbeConnectionDetails.mockResolvedValueOnce({
       url: "wss://127.0.0.1:5829",
@@ -673,17 +680,12 @@ describe("doctor gateway runtime checks", () => {
     ]);
     expect(findings[1]?.message).toContain("tts.providers.elevenlabs.voiceId");
     const finding = findings[2];
-    const rendered = JSON.stringify(findings);
     expect(finding?.message).toContain("omitted");
     expect(finding?.message).toContain("secret resolution failed");
     expect(finding?.message.length).toBeLessThanOrEqual(700);
     expect(finding?.target?.length).toBeLessThanOrEqual(150);
     expect(finding?.path?.length).toBeLessThanOrEqual(180);
-    expect(rendered).not.toContain(privateToken);
-    expect(rendered).not.toContain("PRIVATE_REF_ID");
-    expect(rendered).not.toContain("not-this-check");
-    expect(rendered).not.toContain("\u001b");
-    expect(rendered).not.toContain("\u0007");
+    expectNoText(findings, privateToken, "PRIVATE_REF_ID", "not-this-check", "\u001b", "\u0007");
   });
 
   it.each([
@@ -708,7 +710,7 @@ describe("doctor gateway runtime checks", () => {
     mocks.callGateway.mockRejectedValueOnce(entry.error);
     mocks.isGatewayCredentialsRequiredError.mockReturnValueOnce(entry.credentialsRequired);
 
-    const findings = await collectGatewayHealthFindings({ cfg: { gateway: { mode: "local" } } });
+    const findings = await gatewayHealth();
 
     expect(findings).toEqual([
       findingMatching("gateway-health", "warning", {
@@ -718,8 +720,7 @@ describe("doctor gateway runtime checks", () => {
         fixHint: entry.fixHint,
       }),
     ]);
-    expect(JSON.stringify(findings)).not.toContain("SYNTHETIC_PRIVATE_TOKEN");
-    expect(JSON.stringify(findings)).not.toContain("PRIVATE_REF_ID");
+    expectNoText(findings, "SYNTHETIC_PRIVATE_TOKEN", "PRIVATE_REF_ID");
     expect(mocks.callGateway).toHaveBeenCalledOnce();
   });
 
@@ -730,7 +731,7 @@ describe("doctor gateway runtime checks", () => {
       ),
     );
 
-    const findings = await collectGatewayHealthFindings({ cfg: {} });
+    const findings = await gatewayHealth({});
 
     expect(findings).toEqual([
       expect.objectContaining({
@@ -739,7 +740,7 @@ describe("doctor gateway runtime checks", () => {
         path: "gateway",
       }),
     ]);
-    expect(JSON.stringify(findings)).not.toContain("SYNTHETIC_PRIVATE_TOKEN");
+    expectNoText(findings, "SYNTHETIC_PRIVATE_TOKEN");
     expect(mocks.callGateway).not.toHaveBeenCalled();
   });
 
@@ -763,7 +764,7 @@ describe("doctor gateway runtime checks", () => {
           "Rerun `openclaw doctor --lint --only core/doctor/gateway-health --allow-exec` to permit configured secret execution.",
       }),
     ]);
-    expect(JSON.stringify(findings)).not.toContain("PRIVATE_REF_ID");
+    expectNoText(findings, "PRIVATE_REF_ID");
     expect(mocks.buildGatewayProbeConnectionDetails).toHaveBeenCalledOnce();
     expect(mocks.callGateway).not.toHaveBeenCalled();
 
@@ -779,8 +780,8 @@ describe("doctor gateway runtime checks", () => {
     });
     mocks.callGateway.mockRejectedValueOnce(new Error("remote gateway did not answer"));
 
-    const findings = await collectGatewayHealthFindings({
-      cfg: { gateway: { mode: "remote", remote: { url: "wss://gateway.example.test/rpc" } } },
+    const findings = await gatewayHealth({
+      gateway: { mode: "remote", remote: { url: "wss://gateway.example.test/rpc" } },
     });
 
     expect(findings).toContainEqual({
@@ -791,8 +792,7 @@ describe("doctor gateway runtime checks", () => {
       target: "wss://***:***@gateway.example.test/rpc?token=***&safe=value",
       fixHint: "Verify the remote Gateway URL, network path, TLS settings, and credentials.",
     });
-    expect(JSON.stringify(findings)).not.toContain("user:pass");
-    expect(JSON.stringify(findings)).not.toContain("token=secret");
+    expectNoText(findings, "user:pass", "token=secret");
   });
 
   it.each([
@@ -836,9 +836,7 @@ describe("doctor gateway runtime checks", () => {
       runtime: { status: entry.runtimeStatus },
     });
 
-    await expect(
-      collectGatewayDaemonFindings({ cfg: { gateway: { mode: "local" } } }),
-    ).resolves.toEqual([
+    expect(await gatewayDaemon()).toEqual([
       {
         checkId: "core/doctor/gateway-daemon",
         severity: "warning",
@@ -869,9 +867,7 @@ describe("doctor gateway runtime checks", () => {
         ...(text ? { note: message } : { capabilityError: message }),
       });
 
-      await expect(
-        collectGatewayDaemonFindings({ cfg: { gateway: { mode: "local" } } }),
-      ).resolves.toEqual([
+      expect(await gatewayDaemon()).toEqual([
         expect.objectContaining({
           checkId: "core/doctor/gateway-daemon",
           severity,
@@ -886,9 +882,7 @@ describe("doctor gateway runtime checks", () => {
   it("skips host-service findings for a container without an OpenClaw service", async () => {
     mocks.isContainerEnvironment.mockReturnValue(true);
 
-    await expect(
-      collectGatewayDaemonFindings({ cfg: { gateway: { mode: "local" } } }),
-    ).resolves.toEqual([]);
+    expect(await gatewayDaemon()).toEqual([]);
 
     expect(mocks.readGatewayServiceState).not.toHaveBeenCalled();
   });
@@ -920,36 +914,22 @@ describe("doctor provider catalog projection checks", () => {
   });
 
   it.each([
-    {
-      name: "model name",
-      result: { provider: { models: [{ id: "mock-model", name: { label: "Mock" } }] } },
-      requirement: "model name must be a string when present",
-    },
-    {
-      name: "model list",
-      result: { provider: { models: {} } },
-      requirement: "models must be an array",
-    },
-    {
-      name: "missing provider containers",
-      result: { providers: undefined },
-      requirement: "result must include provider or providers object",
-    },
-    {
-      name: "provider key",
-      result: { providers: { " ": { models: [{ id: "mock-model" }] } } },
-      requirement: "provider key must be a non-empty trimmed string",
-    },
-    { name: "non-object result", result: false, requirement: "result must be an object" },
-    {
-      name: "present single-provider branch",
-      result: {
-        provider: undefined,
-        providers: { mockplugin: { models: [{ id: "mock-model" }] } },
-      },
-      requirement: "provider must be an object",
-    },
-  ])("reports an invalid $name", async ({ result, requirement }) => {
+    [
+      { provider: { models: [{ id: "mock-model", name: {} }] } },
+      "model name must be a string when present",
+    ],
+    [{ provider: { models: {} } }, "models must be an array"],
+    [{ providers: undefined }, "result must include provider or providers object"],
+    [
+      { providers: { " ": { models: [{ id: "mock-model" }] } } },
+      "provider key must be a non-empty trimmed string",
+    ],
+    [false, "result must be an object"],
+    [
+      { provider: undefined, providers: { mockplugin: { models: [{ id: "mock-model" }] } } },
+      "provider must be an object",
+    ],
+  ] as const)("rejects %j: %s", async (result, requirement) => {
     mockProviderCatalog({ order: "simple", run: async () => result });
     expectCatalogFinding(await collectProviderCatalogProjectionFindings({}), requirement);
   });

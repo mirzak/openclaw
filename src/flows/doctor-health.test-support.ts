@@ -11,9 +11,29 @@ import {
 } from "../infra/update-doctor-result.js";
 import type { OpenClawStateDatabase } from "../state/openclaw-state-db-contract.js";
 import { UpdateSchemaRefusalError } from "../state/openclaw-update-schema-refusal.js";
-import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import {
+  withOpenClawTestState,
+  type OpenClawTestState,
+} from "../test-utils/openclaw-test-state.js";
 import { createDoctorHealthContribution } from "./doctor-health-contribution.js";
 import type { DoctorHealthFlowContext } from "./doctor-health-contributions.js";
+
+export function stubDoctorEnv(values: Record<string, string | undefined>) {
+  for (const [name, value] of Object.entries(values)) {
+    vi.stubEnv(name, value);
+  }
+}
+
+export function createDoctorRuntime() {
+  return { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+}
+
+export function withDoctorState<T>(
+  run: (state: OpenClawTestState) => Promise<T>,
+  env?: Record<string, string | undefined>,
+) {
+  return withOpenClawTestState({ scenario: "minimal", env }, run);
+}
 
 export const postInstallAdvisory: NonNullable<DoctorHealthFlowContext["postInstallDoctorResult"]> =
   {
@@ -308,6 +328,11 @@ export function seedMaintenanceStartupFailure(openDatabase: () => OpenClawStateD
 export function registerDoctorConfigReceiptTests(
   runDoctorHealthFlow: typeof import("./doctor-health.js").runDoctorHealthFlow,
 ) {
+  const ipcResultPath = "/tmp/openclaw-update-doctor-result.json";
+  const resultRuntime = () => {
+    vi.stubEnv("OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH", ipcResultPath);
+    return createDoctorRuntime();
+  };
   it.each([
     "unchanged",
     "ok",
@@ -322,10 +347,10 @@ export function registerDoctorConfigReceiptTests(
   ] as const)(
     "reports the consumed input and last committed Doctor config hash before exiting (%s)",
     async (outcome) => {
-      await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      await withDoctorState(async (state) => {
         const resultPath = state.path("doctor-result.json");
         vi.stubEnv("OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH", resultPath);
-        const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+        const runtime = createDoctorRuntime();
         let expectedHash = "unchanged";
         const expectedInputHash = hashConfigRaw(
           fs.existsSync(state.configPath) ? fs.readFileSync(state.configPath, "utf8") : null,
@@ -458,16 +483,12 @@ export function registerDoctorConfigReceiptTests(
           ctx.postInstallDoctorResult = postInstallAdvisory;
         }
       });
-      const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
-      vi.stubEnv(
-        "OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH",
-        "/tmp/openclaw-update-doctor-result.json",
-      );
+      const runtime = resultRuntime();
 
       await runDoctorHealthFlow(runtime, {});
 
       expect(mocks.writeUpdatePostInstallDoctorResult).toHaveBeenCalledWith({
-        resultPath: "/tmp/openclaw-update-doctor-result.json",
+        resultPath: ipcResultPath,
         result: {
           ...(advisory ? postInstallAdvisory : { status: "ok" }),
           configHash: "unchanged",
@@ -488,11 +509,7 @@ export function registerDoctorConfigReceiptTests(
       ctx.configWriteRefusal = "cron-owner-safety";
       ctx.postInstallDoctorResult = postInstallAdvisory;
     });
-    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
-    vi.stubEnv(
-      "OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH",
-      "/tmp/openclaw-update-doctor-result.json",
-    );
+    const runtime = resultRuntime();
 
     try {
       await runDoctorHealthFlow(runtime, {});
@@ -505,7 +522,7 @@ export function registerDoctorConfigReceiptTests(
     expect(runtime.exit).toHaveBeenCalledWith(1);
     expect(runtime.exit).not.toHaveBeenCalledWith(86);
     expect(mocks.writeUpdatePostInstallDoctorResult).toHaveBeenCalledWith({
-      resultPath: "/tmp/openclaw-update-doctor-result.json",
+      resultPath: ipcResultPath,
       result: {
         status: "error",
         configHash: "unchanged",

@@ -71,25 +71,15 @@ vi.mock("../infra/deferred-plugin-migrations.js", async (importOriginal) => ({
   readDeferredPluginMigrationsAsync: mocks.pendingPluginMigrations,
 }));
 
-vi.mock("../cli/update-cli/update-command.js", () => ({
-  updateCommand: mocks.updateCommand,
-}));
-
+vi.mock("../cli/update-cli/update-command.js", () => ({ updateCommand: mocks.updateCommand }));
 vi.mock("../commands/doctor-update.js", () => ({
   maybeOfferUpdateBeforeDoctor: mocks.offerUpdate,
 }));
-
-vi.mock("../commands/triage.js", () => ({
-  triageCommand: mocks.triageCommand,
-}));
-
+vi.mock("../commands/triage.js", () => ({ triageCommand: mocks.triageCommand }));
 vi.mock("../commands/doctor-ui.js", () => ({
   maybeRepairUiProtocolFreshness: async () => undefined,
 }));
-
-vi.mock("../commands/doctor-install.js", () => ({
-  noteSourceInstallIssues: () => undefined,
-}));
+vi.mock("../commands/doctor-install.js", () => ({ noteSourceInstallIssues: () => undefined }));
 
 vi.mock("../commands/doctor/shared/plugin-runtime-symlinks.js", () => ({
   noteStalePluginRuntimeSymlinks: async () => undefined,
@@ -129,6 +119,31 @@ async function withResult(run: (state: OpenClawTestState, resultPath: string) =>
     }
   });
 }
+
+function migrationReceipt(
+  id: string,
+  outcome: LegacyStateMigrationStepReceipt["outcome"],
+  overrides: Partial<LegacyStateMigrationStepReceipt> = {},
+): LegacyStateMigrationStepReceipt {
+  return {
+    id,
+    outcome,
+    phase: "final",
+    source: [],
+    target: [],
+    requiredness: "required",
+    reversibility: "checkpoint-required",
+    changes: [],
+    warnings: [`${id}: run openclaw doctor --fix`],
+    ...overrides,
+  };
+}
+const createRuntime = () => ({
+  log: vi.fn(),
+  error: vi.fn(),
+  exit: vi.fn<(code: number) => void>(),
+});
+const runDoctor = () => runDoctorHealthFlow(createRuntime(), { nonInteractive: true });
 
 describe("runDoctorHealthFlow update outcomes", () => {
   const dirs = useAutoCleanupTempDirTracker(afterEach);
@@ -182,10 +197,7 @@ describe("runDoctorHealthFlow update outcomes", () => {
         }
       });
 
-      await runDoctorHealthFlow(
-        { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
-        { nonInteractive: true },
-      );
+      await runDoctor();
       const result = await consumeUpdatePostInstallDoctorResult(resultPath);
       expect(result).toMatchObject({ status: "ok", configHash: "unchanged" });
       expect(result?.configInputHash).toBeUndefined();
@@ -207,30 +219,18 @@ describe("runDoctorHealthFlow update outcomes", () => {
     "retains deferred inspection warnings in update IPC (refused=$refused, noisy=$noisy)",
     async ({ refused, noisy }) => {
       await withResult(async (_state, resultPath) => {
-        const receipt = (
-          id: string,
-          outcome: "warning" | "skipped" | "refused",
-        ): LegacyStateMigrationStepReceipt => ({
-          id,
-          phase: "final",
-          source: [],
-          target: [],
-          requiredness: "required",
-          reversibility: "checkpoint-required",
-          outcome,
-          changes: [],
-          warnings: [`${id}: run openclaw doctor --fix`],
-        });
-        mocks.stateMigrationReceipts.push(receipt("preflight cleanup", "warning"));
-        mocks.stateMigrationReceipts.push(receipt("skipped audit recovery", "skipped"));
+        mocks.stateMigrationReceipts.push(
+          migrationReceipt("preflight cleanup", "warning"),
+          migrationReceipt("skipped audit recovery", "skipped"),
+        );
         if (noisy) {
           mocks.stateMigrationReceipts.push(
             ...Array.from({ length: 30 }, (_, index) =>
-              receipt(`prior migration ${index}`, "warning"),
+              migrationReceipt(`prior migration ${index}`, "warning"),
             ),
           );
         }
-        const deferred = receipt("deferred cleanup", refused ? "refused" : "warning");
+        const deferred = migrationReceipt("deferred cleanup", refused ? "refused" : "warning");
         const refusalFact = {
           check: "plugin-doctor-post-session-state",
           code: "blocked-by-session-repair-failure",
@@ -245,6 +245,13 @@ describe("runDoctorHealthFlow update outcomes", () => {
         const refusal = new DoctorStateMigrationRefusalError([deferred]);
         const inspectionWarning =
           "core/doctor/auth-profiles [update-inspection-deferred]: Run openclaw doctor after activation.";
+        const finding = {
+          checkId: "core/doctor/auth-profiles",
+          severity: "warning" as const,
+          errorCode: "update-inspection-deferred",
+          requirement: "update-validation-budget",
+          message: "Run openclaw doctor after activation.",
+        };
         mocks.runContributions.mockImplementation(async (ctx) => {
           expect(mocks.disposeConfig).not.toHaveBeenCalled();
           ctx.updateWarnings = [inspectionWarning];
@@ -253,31 +260,17 @@ describe("runDoctorHealthFlow update outcomes", () => {
             inspectionDeadlineMs: Date.now(),
             phase: "activation",
             source: "activation-policy",
-            deferred: new Map([
-              [
-                "core/doctor/auth-profiles",
-                {
-                  checkId: "core/doctor/auth-profiles",
-                  severity: "warning",
-                  errorCode: "update-inspection-deferred",
-                  requirement: "update-validation-budget",
-                  message: "Run openclaw doctor after activation.",
-                },
-              ],
-            ]),
+            deferred: new Map([[finding.checkId, finding]]),
           };
           ctx.configResult.stateMigrationStepReceipts?.push(deferred);
           if (refused) {
             throw refusal;
           }
         });
-        const runtime = {
-          log: vi.fn(),
-          error: vi.fn(),
-          exit: vi.fn((code: number) => {
-            throw new ExitError(code);
-          }),
-        };
+        const runtime = createRuntime();
+        runtime.exit.mockImplementation((code: number) => {
+          throw new ExitError(code);
+        });
 
         if (refused) {
           await expect(runDoctorHealthFlow(runtime, { nonInteractive: true })).rejects.toBe(
@@ -317,17 +310,14 @@ describe("runDoctorHealthFlow update outcomes", () => {
         const [settled, stillPending] = [pending("acpx"), pending("codex")];
         // Config preflight reported both before post-session repair settled acpx.
         for (const plugin of [settled, stillPending]) {
-          mocks.stateMigrationReceipts.push({
-            id: `plugin:${plugin.pluginId}`,
-            phase: "final",
-            source: [{ kind: "owner", id: plugin.pluginId }],
-            target: [{ kind: "owner", id: plugin.pluginId }],
-            requiredness: "conditional",
-            reversibility: "checkpoint-required",
-            outcome: "deferred",
-            changes: [],
-            warnings: [formatDeferredPluginMigration(plugin)],
-          });
+          mocks.stateMigrationReceipts.push(
+            migrationReceipt(`plugin:${plugin.pluginId}`, "deferred", {
+              source: [{ kind: "owner", id: plugin.pluginId }],
+              target: [{ kind: "owner", id: plugin.pluginId }],
+              requiredness: "conditional",
+              warnings: [formatDeferredPluginMigration(plugin)],
+            }),
+          );
         }
         if (settlement === "unreadable") {
           mocks.pendingPluginMigrations.mockRejectedValue(
@@ -338,9 +328,7 @@ describe("runDoctorHealthFlow update outcomes", () => {
             settlement === "all" ? [] : [stillPending],
           );
         }
-        const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
-
-        await runDoctorHealthFlow(runtime, { nonInteractive: true });
+        await runDoctor();
         const result = await consumeUpdatePostInstallDoctorResult(resultPath);
         const expected =
           settlement === "unreadable"
@@ -394,8 +382,7 @@ describe("runDoctorHealthFlow update outcomes", () => {
               throw failure;
             }
           });
-          const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
-          const doctor = runDoctorHealthFlow(runtime);
+          const doctor = runDoctorHealthFlow(createRuntime());
           if (outcome === "pending") {
             await expect(doctor).rejects.toBe(failure);
           } else {
@@ -403,17 +390,21 @@ describe("runDoctorHealthFlow update outcomes", () => {
           }
           expect(mocks.updateCommand).toHaveBeenCalledOnce();
           expect(mocks.offerUpdate).toHaveBeenCalledOnce();
-          expect(mocks.confirmCustody).not.toHaveBeenCalled();
-          expect(beginMaintenance).not.toHaveBeenCalled();
-          expect(mocks.config).not.toHaveBeenCalled();
-          expect(mocks.runContributions).not.toHaveBeenCalled();
+          for (const check of [
+            mocks.confirmCustody,
+            beginMaintenance,
+            mocks.config,
+            mocks.runContributions,
+            mocks.triageCommand,
+          ]) {
+            expect(check).not.toHaveBeenCalled();
+          }
           expect(mocks.outro).not.toHaveBeenCalledWith("Doctor complete.");
           if (outcome === "ok") {
             expect(mocks.outro).toHaveBeenCalledWith(
               "Update completed (doctor already ran as part of the update).",
             );
           }
-          expect(mocks.triageCommand).not.toHaveBeenCalled();
         });
       } finally {
         if (stdinIsTty) {

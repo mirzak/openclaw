@@ -1,4 +1,3 @@
-// Exercise the registered Doctor check and real systemd-unit audit, not a synthetic finding.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -16,14 +15,29 @@ import {
 import { mockProcessPlatform } from "../test-utils/vitest-spies.js";
 import { CORE_HEALTH_CHECKS } from "./doctor-core-checks.js";
 
-function platformCheck() {
+function detect(
+  cfg: Parameters<NonNullable<(typeof CORE_HEALTH_CHECKS)[number]["detect"]>>[0]["cfg"] = {},
+) {
   const check = CORE_HEALTH_CHECKS.find(
     (entry) => entry.id === "core/doctor/gateway-services/platform-notes",
   );
   if (!check) {
     throw new Error("Missing registered gateway platform notes check");
   }
-  return check;
+  return check.detect({ mode: "lint", runtime, cfg });
+}
+
+const checkId = "core/doctor/gateway-services/platform-notes";
+const legacyUnit = "[Service]\nKillMode=control-group\n";
+const killModeWarning = {
+  severity: "warning",
+  message: expect.stringContaining("KillMode=mixed"),
+};
+
+function expectText(text: string, ...parts: string[]) {
+  for (const part of parts) {
+    expect(text).toContain(part);
+  }
 }
 
 function triage(
@@ -83,22 +97,15 @@ describe("registered gateway platform notes", () => {
     await fs.writeFile(unitPath, unit);
     expect(isDefaultInstallIdentity()).toBe(true);
 
-    const findings = await platformCheck().detect({
-      mode: "lint",
-      runtime,
-      cfg: { gateway: { mode: "local" } },
-    });
+    const findings = await detect({ gateway: { mode: "local" } });
     expect(findings).toEqual([
       expect.objectContaining({
-        severity: "warning",
-        message: expect.stringContaining("KillMode=mixed"),
+        ...killModeWarning,
         fixHint: expect.stringContaining("gateway install --force"),
       }),
     ]);
     const prompt = triage(findings);
-    expect(prompt).toContain("KillMode=mixed");
-    expect(prompt).toContain("gateway install --force");
-    expect(prompt).toContain("drop-ins");
+    expectText(prompt, "KillMode=mixed", "gateway install --force", "drop-ins");
     expect(prompt).not.toContain(home);
     expect(await fs.readFile(unitPath, "utf8")).toBe(unit);
   });
@@ -106,10 +113,10 @@ describe("registered gateway platform notes", () => {
     { name: "repaired effective setting", mode: "mixed", loadState: "loaded" },
     { name: "masked service", mode: "control-group", loadState: "masked" },
   ])("does not propose repairs for $name", async ({ mode, loadState }) => {
-    await fs.writeFile(unitPath, "[Service]\nKillMode=control-group\n");
+    await fs.writeFile(unitPath, legacyUnit);
     effectiveUnit(mode, loadState);
 
-    expect(await platformCheck().detect({ mode: "lint", runtime, cfg: {} })).toEqual([]);
+    expect(await detect()).toEqual([]);
     expect(resolveNodeRuntimeInfoMock).not.toHaveBeenCalled();
   });
 
@@ -128,10 +135,13 @@ describe("registered gateway platform notes", () => {
     effectiveUnit("control-group", "loaded");
     expect(isDefaultInstallIdentity()).toBe(true);
 
-    const findings = await platformCheck().detect({ mode: "lint", runtime, cfg: {} });
+    const findings = await detect();
     const prompt = triage(findings, ".openclaw-upgrade-proof");
-    expect(prompt).toContain("openclaw --profile upgrade-proof gateway install --force");
-    expect(prompt).toContain("drop-ins separately");
+    expectText(
+      prompt,
+      "openclaw --profile upgrade-proof gateway install --force",
+      "drop-ins separately",
+    );
     expect(execSystemctlUserMock.mock.calls[0]?.[1]).toContain(
       "openclaw-gateway-upgrade-proof.service",
     );
@@ -142,7 +152,7 @@ describe("registered gateway platform notes", () => {
   it.each(["remote", "nix", "relocated"] as const)(
     "does not inspect host service settings for a %s installation",
     async (scope) => {
-      await fs.writeFile(unitPath, "[Service]\nKillMode=control-group\n");
+      await fs.writeFile(unitPath, legacyUnit);
       if (scope === "nix") {
         vi.stubEnv("OPENCLAW_NIX_MODE", "1");
       }
@@ -150,18 +160,14 @@ describe("registered gateway platform notes", () => {
         vi.stubEnv("OPENCLAW_STATE_DIR", path.join(home, "other-state"));
       }
 
-      expect(
-        await platformCheck().detect({
-          mode: "lint",
-          runtime,
-          cfg: { gateway: { mode: scope === "remote" ? "remote" : "local" } },
-        }),
-      ).toEqual([]);
+      expect(await detect({ gateway: { mode: scope === "remote" ? "remote" : "local" } })).toEqual(
+        [],
+      );
       expect(execSystemctlUserMock).not.toHaveBeenCalled();
     },
   );
   it("reports the unit through Doctor JSON while keeping warnings nonblocking at the updater error threshold", async () => {
-    await fs.writeFile(unitPath, "[Service]\nKillMode=control-group\n");
+    await fs.writeFile(unitPath, legacyUnit);
     const stateDir = path.join(home, ".openclaw");
     await fs.mkdir(stateDir, { recursive: true });
     await fs.writeFile(
@@ -169,34 +175,16 @@ describe("registered gateway platform notes", () => {
       JSON.stringify({ gateway: { mode: "local" }, plugins: { enabled: false } }),
     );
     let output = "";
-    const outputSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+    vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
       output += String(chunk);
       return true;
     });
-    try {
-      const code = await runDoctorLintCli(runtime, {
-        json: true,
-        onlyIds: ["core/doctor/gateway-services/platform-notes"],
-      });
-      expect(code).toBe(1);
-      const report = JSON.parse(output);
-      expect(report.findings).toEqual([
-        expect.objectContaining({
-          severity: "warning",
-          message: expect.stringContaining("KillMode=mixed"),
-        }),
-      ]);
-      output = "";
-      expect(
-        await runDoctorLintCli(runtime, {
-          json: true,
-          onlyIds: ["core/doctor/gateway-services/platform-notes"],
-          severityMin: "error",
-        }),
-      ).toBe(0);
-      expect(JSON.parse(output)).toMatchObject({ ok: true });
-    } finally {
-      outputSpy.mockRestore();
-    }
+    const lint = (severityMin?: "error") =>
+      runDoctorLintCli(runtime, { json: true, onlyIds: [checkId], severityMin });
+    expect(await lint()).toBe(1);
+    expect(JSON.parse(output).findings).toEqual([expect.objectContaining(killModeWarning)]);
+    output = "";
+    expect(await lint("error")).toBe(0);
+    expect(JSON.parse(output)).toMatchObject({ ok: true });
   });
 });

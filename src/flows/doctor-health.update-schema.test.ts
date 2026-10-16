@@ -32,12 +32,28 @@ import {
   openOpenClawStateDatabase,
   repairOpenClawStateDatabaseSchema,
 } from "../state/openclaw-state-db.js";
-import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { VERSION } from "../version.js";
 import { runDoctorHealthFlow } from "./doctor-health.js";
 
-const { mocks } = await import("./doctor-health.test-support.js");
+const { mocks, createDoctorRuntime, withDoctorState, stubDoctorEnv } =
+  await import("./doctor-health.test-support.js");
 const repairOptions = { repair: true, nonInteractive: true };
+const readFiles = (files: string[]) => files.map((file) => fs.readFileSync(file));
+const backupPaths = (file: string, prefix: string) =>
+  fs
+    .readdirSync(path.dirname(file))
+    .filter((name) => name.startsWith(prefix))
+    .map((name) => path.join(path.dirname(file), name));
+
+async function closeDatabases() {
+  await closeOpenClawAgentDatabasesAsync();
+  await closeOpenClawStateDatabaseAsync();
+}
+
+function executeSql(file: string, sql: string) {
+  using db = new DatabaseSync(file);
+  db.exec(sql);
+}
 
 function setSchemaVersion(databasePath: string, version: number): void {
   using db = new DatabaseSync(databasePath);
@@ -84,16 +100,12 @@ describe("Doctor schema bumps under an updating parent", () => {
     "repairs only orphan windows before backing up a shared-state upgrade (%s)",
     async (damage) => {
       vi.stubEnv("OPENCLAW_UPDATE_IN_PROGRESS", "0");
-      await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      await withDoctorState(async (state) => {
         const shared = openOpenClawStateDatabase({ env: state.env }).path;
         const agent = openOpenClawAgentDatabase({ agentId: "main", env: state.env }).path;
-        await closeOpenClawAgentDatabasesAsync();
-        await closeOpenClawStateDatabaseAsync();
+        await closeDatabases();
         setSchemaVersion(shared, 19);
-        {
-          using db = new DatabaseSync(shared);
-          db.exec("ALTER TABLE cron_run_receipts DROP COLUMN delivery_attempt_state");
-        }
+        executeSql(shared, "ALTER TABLE cron_run_receipts DROP COLUMN delivery_attempt_state");
         const readRows = (db: DatabaseSync) => ({
           nodes: db.prepare("SELECT * FROM session_nodes ORDER BY session_key").all(),
           windows: db.prepare("SELECT * FROM session_windows ORDER BY session_id").all(),
@@ -127,19 +139,17 @@ describe("Doctor schema bumps under an updating parent", () => {
           }
           original = readRows(db);
         }
-        const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+        const runtime = createDoctorRuntime();
         const doctor = runDoctorHealthFlow(runtime, repairOptions);
         if (damage === "orphan") {
           await doctor;
           expect(readDatabase(shared).version).toBe(OPENCLAW_STATE_SCHEMA_VERSION);
-          const migrationBackup = fs
-            .readdirSync(path.dirname(shared))
-            .find(
-              (name) =>
-                name.startsWith("openclaw.sqlite.pre-startup-migration-") && name.endsWith(".bak"),
-            );
+          const migrationBackup = backupPaths(
+            shared,
+            "openclaw.sqlite.pre-startup-migration-",
+          ).find((name) => name.endsWith(".bak"));
           expect(migrationBackup).toBeDefined();
-          expect(readDatabase(path.join(path.dirname(shared), migrationBackup!)).version).toBe(19);
+          expect(readDatabase(migrationBackup!).version).toBe(19);
           expect(mocks.runContributions).toHaveBeenCalledOnce();
           expect(runtime.log).toHaveBeenCalledWith(
             expect.stringContaining("Removed 1 orphan session window(s)"),
@@ -160,15 +170,12 @@ describe("Doctor schema bumps under an updating parent", () => {
               }
             : original,
         );
-        const backups = fs
-          .readdirSync(path.dirname(agent))
-          .filter((name) => name.startsWith("openclaw-session-window-recovery-"));
+        const backups = backupPaths(agent, "openclaw-session-window-recovery-");
         expect(backups).toHaveLength(damage.includes("orphan") ? 1 : 0);
         if (backups[0]) {
-          using saved = new DatabaseSync(
-            path.join(path.dirname(agent), backups[0], "database.sqlite"),
-            { readOnly: true },
-          );
+          using saved = new DatabaseSync(path.join(backups[0], "database.sqlite"), {
+            readOnly: true,
+          });
           expect(readRows(saved)).toEqual(original);
         }
       });
@@ -176,38 +183,36 @@ describe("Doctor schema bumps under an updating parent", () => {
   );
 
   it.each([
-    { kind: "state", updaterVersion: "2026.9.2", missingMetadata: true },
-    { kind: "agent", updaterVersion: "2026.9.2", missingMetadata: false },
-    { kind: "agent", updaterVersion: "2026.9.2-rebuild.1", missingMetadata: false },
+    { kind: "state", updaterVersion: "2026.9.2", json: false },
+    { kind: "state", updaterVersion: "2026.9.2", json: true },
+    { kind: "agent", updaterVersion: "2026.9.2", json: false },
+    { kind: "agent", updaterVersion: "2026.9.2-rebuild.1", json: false },
   ])(
-    "refuses a $kind bump driven by $updaterVersion before changing database bytes, ledger, or config",
-    async ({ kind, updaterVersion, missingMetadata }) => {
-      await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    "refuses a $kind bump driven by $updaterVersion before changing database bytes, ledger, or config (json=$json)",
+    async ({ kind, updaterVersion, json }) => {
+      await withDoctorState(async (state) => {
         const shared = openOpenClawStateDatabase({ env: state.env }).path;
         const agent = openOpenClawAgentDatabase({ agentId: "main", env: state.env }).path;
         createUpdateRun({ trigger: "cli", before: { version: updaterVersion } });
-        await closeOpenClawAgentDatabasesAsync();
-        await closeOpenClawStateDatabaseAsync();
+        await closeDatabases();
         const target = kind === "state" ? shared : agent;
         const supported =
           kind === "state" ? OPENCLAW_STATE_SCHEMA_VERSION : OPENCLAW_AGENT_SCHEMA_VERSION;
         setSchemaVersion(target, supported - 1);
-        if (missingMetadata) {
-          const db = new DatabaseSync(shared);
-          db.exec("DROP TABLE config_machine_state");
-          db.close();
+        if (kind === "state") {
+          executeSql(shared, "DROP TABLE config_machine_state");
         }
         const before = readDatabase(shared);
         const quarantine = state.statePath("state", "openclaw-quarantine.sqlite");
         fs.writeFileSync(quarantine, "unreadable quarantine fixture");
         const files = [shared, agent, state.configPath, quarantine];
-        const bytes = files.map((file) => fs.readFileSync(file));
-        const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+        const bytes = readFiles(files);
+        const runtime = { ...createDoctorRuntime(), writeStdout: vi.fn(), writeJson: vi.fn() };
 
-        const failure = await runDoctorHealthFlow(runtime, repairOptions).catch(
+        const failure = await runDoctorHealthFlow(runtime, { ...repairOptions, json }).catch(
           (error: unknown) => error,
         );
-        expect(failure).toMatchObject({
+        const refusal = {
           code: "update-schema-bump-unfenced",
           updaterVersion,
           databases: [
@@ -219,8 +224,26 @@ describe("Doctor schema bumps under an updating parent", () => {
             "openclaw doctor --fix",
             "openclaw gateway start",
           ],
-        });
-        expect(files.map((file) => fs.readFileSync(file))).toEqual(bytes);
+        };
+        if (json) {
+          expect(failure).toMatchObject({ code: 1 });
+          expect(runtime.exit).toHaveBeenCalledWith(1);
+          expect(runtime.writeJson).toHaveBeenCalledWith(
+            {
+              ok: false,
+              error: expect.objectContaining({
+                code: refusal.code,
+                targetVersion: VERSION,
+                updaterVersion,
+                databases: [expect.objectContaining({ kind, foundVersion: supported - 1 })],
+              }),
+            },
+            2,
+          );
+        } else {
+          expect(failure).toMatchObject(refusal);
+        }
+        expect(readFiles(files)).toEqual(bytes);
         expect(readDatabase(shared)).toEqual(before);
         expect(mocks.runContributions).not.toHaveBeenCalled();
       });
@@ -233,12 +256,14 @@ describe("Doctor schema bumps under an updating parent", () => {
   ])(
     "admits debug capture only after schema publication for $driver",
     async ({ driver, deferred }) => {
-      await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      await withDoctorState(async (state) => {
         const captureSessionId = `doctor-readiness-${driver}`;
-        vi.stubEnv("OPENCLAW_DEBUG_PROXY_ENABLED", "1");
-        vi.stubEnv("OPENCLAW_DEBUG_PROXY_SESSION_ID", captureSessionId);
-        vi.stubEnv("OPENCLAW_DEBUG_PROXY_URL", undefined);
-        vi.stubEnv("OPENCLAW_DEBUG_PROXY_REQUIRE", "1");
+        stubDoctorEnv({
+          OPENCLAW_DEBUG_PROXY_ENABLED: "1",
+          OPENCLAW_DEBUG_PROXY_SESSION_ID: captureSessionId,
+          OPENCLAW_DEBUG_PROXY_URL: undefined,
+          OPENCLAW_DEBUG_PROXY_REQUIRE: "1",
+        });
         const shared = openOpenClawStateDatabase({ env: state.env }).path;
         const run = createUpdateRun({ trigger: "cli", before: { version: driver } });
         await closeOpenClawStateDatabaseAsync();
@@ -248,16 +273,17 @@ describe("Doctor schema bumps under an updating parent", () => {
           expect(result.warnings).toEqual([]);
           await initializeDebugProxyCaptureAsync("before-readiness");
         });
-        const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+        const runtime = createDoctorRuntime();
         try {
           await runDoctorHealthFlow(runtime, repairOptions);
         } finally {
           await finalizeActiveDebugProxyCaptures();
           await closeOpenClawStateDatabaseAsync();
         }
-        expect(readDatabase(shared).version).toBe(
-          OPENCLAW_STATE_SCHEMA_VERSION - (deferred ? 1 : 0),
-        );
+        expect(readDatabase(shared)).toMatchObject({
+          version: OPENCLAW_STATE_SCHEMA_VERSION - (deferred ? 1 : 0),
+          captureSessions: deferred ? [] : [{ id: captureSessionId, mode: "cli" }],
+        });
         if (deferred) {
           expect(readDatabase(shared).contentVersion).toBe(String(OPENCLAW_STATE_SCHEMA_VERSION));
           expect(runtime.log).toHaveBeenCalledWith(
@@ -266,53 +292,10 @@ describe("Doctor schema bumps under an updating parent", () => {
             ),
           );
         }
-        expect(readDatabase(shared).captureSessions).toEqual(
-          deferred ? [] : [{ id: captureSessionId, mode: "cli" }],
-        );
         expect(mocks.outro).toHaveBeenCalledWith("Doctor complete.");
       });
     },
   );
-
-  it("emits a structured refusal with a failure exit for the affected ledger writer", async () => {
-    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-      const shared = openOpenClawStateDatabase({ env: state.env }).path;
-      createUpdateRun({ trigger: "cli", before: { version: "2026.9.2" } });
-      await closeOpenClawStateDatabaseAsync();
-      setSchemaVersion(shared, OPENCLAW_STATE_SCHEMA_VERSION - 1);
-      const database = new DatabaseSync(shared);
-      database.exec("DROP TABLE config_machine_state");
-      database.close();
-      const runtime = {
-        log: vi.fn(),
-        error: vi.fn(),
-        exit: vi.fn(),
-        writeStdout: vi.fn(),
-        writeJson: vi.fn(),
-      };
-      await expect(
-        runDoctorHealthFlow(runtime, { repair: true, nonInteractive: true, json: true }),
-      ).rejects.toMatchObject({ code: 1 });
-      expect(runtime.exit).toHaveBeenCalledWith(1);
-      expect(runtime.writeJson).toHaveBeenCalledWith(
-        {
-          ok: false,
-          error: expect.objectContaining({
-            code: "update-schema-bump-unfenced",
-            targetVersion: VERSION,
-            updaterVersion: "2026.9.2",
-            databases: [
-              expect.objectContaining({
-                kind: "state",
-                foundVersion: OPENCLAW_STATE_SCHEMA_VERSION - 1,
-              }),
-            ],
-          }),
-        },
-        2,
-      );
-    });
-  });
 
   it.each([
     "owned",
@@ -323,7 +306,7 @@ describe("Doctor schema bumps under an updating parent", () => {
   ] as const)(
     "admits the real outer rehearsal only under current maintenance: %s",
     async (mode) => {
-      await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      await withDoctorState(async (state) => {
         const shared = openOpenClawStateDatabase({ env: state.env }).path;
         let agent = openOpenClawAgentDatabase({ agentId: "main", env: state.env }).path;
         const run = createUpdateRun({ trigger: "cli", before: { version: "2026.9.2" } });
@@ -337,8 +320,7 @@ describe("Doctor schema bumps under an updating parent", () => {
             status: "in_progress",
           });
         }
-        await closeOpenClawAgentDatabasesAsync();
-        await closeOpenClawStateDatabaseAsync();
+        await closeDatabases();
         // Frozen v24 storage preserves the exact input to the candidate schema migration.
         fs.unlinkSync(agent);
         {
@@ -372,23 +354,21 @@ describe("Doctor schema bumps under an updating parent", () => {
           await closeOpenClawStateDatabaseAsync();
         }
         const root = fs.realpathSync(state.stateDir);
-        for (const [key, value] of Object.entries({
+        stubDoctorEnv({
           ...buildUpdateDoctorEnv({
             allowGatewayServiceRepair: false,
             allowGatewayActivation: false,
             serviceRepairPolicy: "external",
           }),
           ...buildUpdateRehearsalPathEnv(root),
-        })) {
-          vi.stubEnv(key, value);
-        }
-        vi.stubEnv("OPENCLAW_UPDATE_IN_PROGRESS", "1");
-        vi.stubEnv("OPENCLAW_UPDATE_RUN_ID", undefined);
-        vi.stubEnv("OPENCLAW_COMPATIBILITY_HOST_VERSION", undefined);
+          OPENCLAW_UPDATE_IN_PROGRESS: "1",
+          OPENCLAW_UPDATE_RUN_ID: undefined,
+          OPENCLAW_COMPATIBILITY_HOST_VERSION: undefined,
+        });
         if (mode === "flag-only") {
           vi.stubEnv("TMPDIR", path.dirname(root));
         }
-        const before = [agent, state.configPath].map((filename) => fs.readFileSync(filename));
+        const before = readFiles([agent, state.configPath]);
         const snapshot = sqliteSnapshot.prepareSqliteReadOnlyLocation;
         const observe = vi
           .spyOn(sqliteSnapshot, "prepareSqliteReadOnlyLocation")
@@ -399,7 +379,7 @@ describe("Doctor schema bumps under an updating parent", () => {
             }
             return prepared;
           });
-        const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+        const runtime = createDoctorRuntime();
         // Observe the actual capture owner without replacing its implementation.
         const capture = vi.spyOn(originalCapture, "preserveDoctorOriginalState");
         mocks.runContributions.mockImplementation(async () => {

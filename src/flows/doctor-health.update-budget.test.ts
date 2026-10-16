@@ -9,11 +9,54 @@ import {
   createDoctorHealthContribution,
   recordDoctorHealthWarnings,
 } from "./doctor-health-contribution.js";
+import type { DoctorHealthFlowContext } from "./doctor-health-contributions.js";
 import {
   createDoctorHealthFlowContext,
   resolveDoctorHealthContributions,
   runDoctorHealthContributionList,
 } from "./doctor-health-contributions.test-support.js";
+
+const updateEnv = {
+  OPENCLAW_UPDATE_IN_PROGRESS: "1",
+  OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR: "0",
+  OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION: "0",
+};
+const doctorIds = (names: string) => new Set(names.split(" ").map((name) => `doctor:${name}`));
+const repairIds = doctorIds(
+  "auth-profiles structured-health-repairs session-transcripts write-config final-config-validation",
+);
+const deferredChecks = [
+  "core/doctor/hooks-model",
+  "core/doctor/provider-catalog-projection",
+  "core/doctor/runtime-tool-schemas",
+];
+const updateBudget = (phase: "validation" | "activation" = "activation") => ({
+  agentCount: 1,
+  phase,
+  inspectionDeadlineMs: Date.now() + 149_000,
+  source: "activation-policy" as const,
+  deferred: new Map(),
+});
+function selectContributions(...groups: Set<string>[]) {
+  const ids = new Set(groups.flatMap((group) => Array.from(group)));
+  const selected = resolveDoctorHealthContributions().filter((entry) => ids.has(entry.id));
+  expect(selected).toHaveLength(ids.size);
+  return selected;
+}
+function recordContributions(
+  groups: Set<string>[],
+  onRun?: (ctx: DoctorHealthFlowContext, id: string) => void,
+) {
+  const contributions = selectContributions(...groups);
+  const executed: string[] = [];
+  for (const contribution of contributions) {
+    vi.spyOn(contribution, "run").mockImplementation(async (ctx) => {
+      executed.push(contribution.id);
+      onRun?.(ctx, contribution.id);
+    });
+  }
+  return { contributions, executed };
+}
 
 const observed = vi.hoisted(() => ({ now: 0, events: [] as string[] }));
 vi.mock("../../packages/terminal-core/src/note.js", () => ({ note: vi.fn() }));
@@ -44,51 +87,28 @@ it.each(["rehearsal", "partial-markers"])(
   async (mode) => {
     const env = {
       ...buildUpdateRehearsalPathEnv("/synthetic/rehearsal"),
-      OPENCLAW_UPDATE_IN_PROGRESS: "1",
+      ...updateEnv,
       OPENCLAW_SERVICE_REPAIR_POLICY: "external",
-      OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR: "0",
-      OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION: "0",
       ...(mode === "partial-markers" ? { HOME: "/synthetic/operator" } : {}),
     };
-    const advisoryIds = new Set([
-      "doctor:security",
-      "doctor:runtime-tool-schemas",
-      "doctor:provider-catalog-projection",
-    ]);
+    const advisoryIds = doctorIds("security runtime-tool-schemas provider-catalog-projection");
     const retainedIds = new Set([
-      "doctor:auth-profiles",
-      "doctor:structured-health-repairs",
-      "doctor:skills",
-      "doctor:memory-search",
-      "doctor:session-transcripts",
-      "doctor:auth-profile-migration",
-      "doctor:write-config",
-      "doctor:final-config-validation",
+      ...repairIds,
+      ...doctorIds("skills memory-search auth-profile-migration"),
     ]);
-    const contributions = resolveDoctorHealthContributions().filter(
-      (entry) => advisoryIds.has(entry.id) || retainedIds.has(entry.id),
-    );
-    expect(contributions).toHaveLength(advisoryIds.size + retainedIds.size);
-    const executed: string[] = [];
     const priorWarnings = Array.from({ length: 31 }, (_, index) => `Repair warning ${index}`);
-    for (const contribution of contributions) {
-      vi.spyOn(contribution, "run").mockImplementation(async (ctx) => {
-        executed.push(contribution.id);
-        if (contribution.id === "doctor:write-config") {
+    const { contributions, executed } = recordContributions(
+      [advisoryIds, retainedIds],
+      (ctx, id) => {
+        if (id === "doctor:write-config") {
           recordDoctorHealthWarnings(ctx, [], ["Final repair warning"]);
         }
-      });
-    }
+      },
+    );
     const ctx = createDoctorHealthFlowContext({
       env,
       updateWarnings: priorWarnings,
-      updateBudget: {
-        agentCount: 1,
-        phase: mode === "rehearsal" ? "validation" : "activation",
-        inspectionDeadlineMs: Date.now() + 149_000,
-        source: "activation-policy",
-        deferred: new Map(),
-      },
+      updateBudget: updateBudget(mode === "rehearsal" ? "validation" : "activation"),
     });
     await runDoctorHealthContributionList(ctx, contributions);
     expect(new Set(executed)).toEqual(
@@ -109,46 +129,13 @@ it.each(["rehearsal", "partial-markers"])(
 it.each([true, false])(
   "defers lint-backed advisory inspections from an updater that runs them after restart (budget=%s)",
   async (hasBudget) => {
-    const deferredIds = new Set([
-      "doctor:runtime-tool-schemas",
-      "doctor:provider-catalog-projection",
-      "doctor:hooks-model",
-    ]);
+    const deferredIds = doctorIds("runtime-tool-schemas provider-catalog-projection hooks-model");
+    // Security gates readiness; ingress dead letters has no equivalent post-restart lint.
     const retainedIds = new Set([
-      "doctor:session-snapshots",
-      "doctor:workspace-status",
-      // Readiness lint gates on its security check; it stays before restart.
-      "doctor:security",
-      // No lint check can reproduce this after restart.
-      "doctor:channel-ingress-dead-letters",
-      "doctor:auth-profiles",
-      "doctor:structured-health-repairs",
-      "doctor:session-transcripts",
-      "doctor:write-config",
-      "doctor:final-config-validation",
+      ...repairIds,
+      ...doctorIds("session-snapshots workspace-status security channel-ingress-dead-letters"),
     ]);
-    const contributions = resolveDoctorHealthContributions().filter(
-      (entry) => deferredIds.has(entry.id) || retainedIds.has(entry.id),
-    );
-    expect(contributions).toHaveLength(deferredIds.size + retainedIds.size);
-    const executed: string[] = [];
-    for (const contribution of contributions) {
-      vi.spyOn(contribution, "run").mockImplementation(async () => {
-        executed.push(contribution.id);
-      });
-    }
-    const updateBudget = () => ({
-      agentCount: 1,
-      phase: "activation" as const,
-      inspectionDeadlineMs: Date.now() + 149_000,
-      source: "activation-policy" as const,
-      deferred: new Map(),
-    });
-    const updateEnv = {
-      OPENCLAW_UPDATE_IN_PROGRESS: "1",
-      OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR: "0",
-      OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION: "0",
-    };
+    const { contributions, executed } = recordContributions([deferredIds, retainedIds]);
     const ctx = createDoctorHealthFlowContext({
       env: {
         ...updateEnv,
@@ -158,18 +145,14 @@ it.each([true, false])(
     });
     await captureUpdateDoctorConfigWrites(ctx.configPath, async (capture) => {
       await runDoctorHealthContributionList(ctx, contributions);
-      expect(capture.deferredInspectionCheckIds).toEqual([
-        "core/doctor/hooks-model",
-        "core/doctor/provider-catalog-projection",
-        "core/doctor/runtime-tool-schemas",
-      ]);
+      expect(capture.deferredInspectionCheckIds).toEqual(deferredChecks);
     });
 
     expect(new Set(executed)).toEqual(retainedIds);
     expect(ctx.updateWarnings ?? []).toEqual([]);
     expect(ctx.runtime.log).toHaveBeenCalledWith(
       expect.stringContaining(
-        "Deferred advisory inspections until the restarted Gateway is ready: core/doctor/hooks-model, core/doctor/provider-catalog-projection, core/doctor/runtime-tool-schemas.",
+        `Deferred advisory inspections until the restarted Gateway is ready: ${deferredChecks.join(", ")}.`,
       ),
     );
 
@@ -252,10 +235,8 @@ it.each([
         ...(phase === "validation"
           ? buildUpdateRehearsalPathEnv(state.stateDir)
           : { OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH: state.path("doctor-result.json") }),
-        OPENCLAW_UPDATE_IN_PROGRESS: "1",
+        ...updateEnv,
         OPENCLAW_SERVICE_REPAIR_POLICY: "external",
-        OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR: "0",
-        OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION: "0",
       };
       const startedAt = Date.now();
       const run = createUpdateRun(
@@ -269,14 +250,9 @@ it.each([
       observed.now = doctorStartedAt;
       observed.events = [];
       vi.spyOn(Date, "now").mockImplementation(() => observed.now);
-      const ids = new Set([
-        "doctor:auth-profiles",
-        "doctor:session-transcripts",
-        "doctor:write-config",
-        "doctor:final-config-validation",
-      ]);
-      const selected = resolveDoctorHealthContributions().filter((entry) => ids.has(entry.id));
-      expect(selected).toHaveLength(ids.size);
+      const selected = selectContributions(
+        doctorIds("auth-profiles session-transcripts write-config final-config-validation"),
+      );
       const priorWarnings = Array.from(
         { length: agentCount === 480 ? 32 : 0 },
         (_, index) => `Prior Doctor warning ${index}`,
