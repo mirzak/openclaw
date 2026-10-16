@@ -41,13 +41,13 @@ import { kickSessionEntryMaintenanceAfterWrite } from "./session-accessor.sqlite
 import { createFallbackSessionEntry } from "./session-accessor.sqlite-normalize.js";
 import {
   resolveSqliteScope,
-  withPreparedSqliteScope,
   resolveSqliteTranscriptArchiveDirectory,
   resolveSqliteTranscriptReadScope,
   runExclusiveSqliteSessionWrite,
   toDatabaseOptions,
   type ResolvedSqliteScope,
 } from "./session-accessor.sqlite-scope.js";
+import { withPreparedSqliteWriteScope } from "./session-accessor.sqlite-write-scope.js";
 import type { SessionEntryListScope, SessionEntryReadScope } from "./session-accessor.types.js";
 import { patchSessionActorEntryInScope } from "./session-actor-entry-adapter.js";
 import { getSessionActorStorageBinding } from "./session-actor-storage-binding.js";
@@ -265,7 +265,7 @@ async function patchSessionEntryInScope(
     return (await memory).entry;
   }
   const storePath = resolveSessionStorePathForScope(scope);
-  return withPreparedSqliteScope(scope, (resolved) => {
+  return withPreparedSqliteWriteScope(scope, (resolved, sharedWriteReserved) => {
     if (databaseAgentId) {
       resolved.databaseAgentId = databaseAgentId;
     }
@@ -289,6 +289,7 @@ async function patchSessionEntryInScope(
       resolved,
       sessionKey: resolved.sessionKey,
       storePath,
+      sharedWriteReserved,
       update,
     });
   });
@@ -334,7 +335,7 @@ async function patchSessionEntryTargetInScope(
     storePath: scope.storePath,
   };
   const storePath = source?.path ?? resolveSessionStorePathForScope(target);
-  const patch = (resolved: ResolvedSqliteScope) =>
+  const patch = (resolved: ResolvedSqliteScope, sharedWriteReserved = false) =>
     patchSqliteSessionEntrySnapshot({
       operationLabel: "session-entry-target.patch",
       capturedSource: source,
@@ -346,6 +347,7 @@ async function patchSessionEntryTargetInScope(
       resolved,
       sessionKey: scope.target.canonicalKey,
       storePath,
+      sharedWriteReserved,
       update,
     });
   return source
@@ -357,7 +359,7 @@ async function patchSessionEntryTargetInScope(
         ownerStorePath: source.path,
         sessionKey: "",
       })
-    : withPreparedSqliteScope(target, patch);
+    : withPreparedSqliteWriteScope(target, patch);
 }
 
 /** Callback and fixed-operation patches share source custody, FIFO, and commit publication. */
@@ -622,9 +624,8 @@ async function patchSqliteSessionEntrySnapshot(
     },
     params.operationLabel,
     undefined,
-    // The captured source validated the retained writer before borrowing its reservation.
-    // The admission owner still prevents reentry during a worker write grant.
-    options.retainedExecution || (useWorker && !sourceAssertion)
+    // The admission owner validates the active reservation and rejects worker-grant reentry.
+    params.sharedWriteReserved || options.retainedExecution || (useWorker && !sourceAssertion)
       ? "foreground-reentrant"
       : "foreground",
   );

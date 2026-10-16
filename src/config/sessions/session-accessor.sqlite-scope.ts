@@ -492,7 +492,7 @@ export async function prepareSqliteTranscriptReadScope(
 /** Exact locators can reserve their FIFO before worker-owned schema-owner discovery. */
 export function resolveSqliteWriteAdmissionScope(
   scope: SqliteScopeInput & { sessionKey: string },
-): ResolvedSqliteReadScope | undefined {
+): (ResolvedSqliteReadScope & { path: string; shared?: boolean }) | undefined {
   const { effectiveAgentId, effectiveStorePath, effectiveEnv, explicitIncognito } =
     resolveSqliteDatabaseScopeIdentity(scope);
   const target: ResolvedSqliteStoreTarget | undefined = effectiveStorePath
@@ -509,6 +509,7 @@ export function resolveSqliteWriteAdmissionScope(
     agentId,
     env: effectiveEnv,
     path: target?.path ?? resolveOpenClawAgentSqlitePath({ agentId, env: effectiveEnv }),
+    ...(target?.shared ? { shared: true } : {}),
   };
 }
 
