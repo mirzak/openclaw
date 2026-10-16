@@ -16,7 +16,6 @@ import { useDoctorConfigPreflightHome } from "./doctor-config-preflight.test-sup
 import { createDoctorPrompter } from "./doctor-prompter.js";
 
 const readText = (file: string) => fs.readFile(file, "utf8");
-const readJson = async (file: string) => JSON.parse(await readText(file));
 async function expectBytes(file: string, expected: string) {
   await expect(fs.readFile(file, "utf8")).resolves.toBe(expected);
 }
@@ -40,6 +39,11 @@ afterEach(() => {
 
 function expectNote(text: string) {
   expect(note.mock.calls.some(([message]) => message.includes(text))).toBe(true);
+}
+function warningMessages(fragment = "") {
+  return note.mock.calls
+    .filter(([message, title]) => title === "Doctor warnings" && message.includes(fragment))
+    .map(([message]) => message);
 }
 
 function fixture(owner?: string, store?: string): OpenClawConfig {
@@ -156,17 +160,14 @@ function createRepairableConfig(home: string) {
 }
 
 function expectConflictWarning() {
-  const warnings = note.mock.calls
-    .filter(([, title]) => title === "Doctor warnings")
-    .map(([message]) => message)
-    .join("\n");
+  const warnings = warningMessages().join("\n");
   expect(warnings).toContain("changed");
   expect(warnings).toContain("These config fixes were not written.");
   expect(warnings).toMatch(/rerun "openclaw doctor"/i);
   expect(note.mock.calls.some(([, title]) => title === "Doctor changes")).toBe(false);
 }
 async function expectRepairedSettings(file: string, bind?: string) {
-  const saved = await readJson(file);
+  const saved = JSON.parse(await readText(file));
   expect(saved.browser).toEqual({ enabled: false });
   expect(saved.logging.level).toBe("info");
   if (bind) {
@@ -263,12 +264,7 @@ it.each<ActivationCase>([
     const before = await readText(configPath);
     await using ctx = await prepareDoctorContext(configPath);
     expect(await readText(configPath)).toBe(before);
-    const advisory = note.mock.calls
-      .filter(
-        ([message, title]) =>
-          title === "Doctor warnings" && message.includes("machine auto-enablement"),
-      )
-      .map(([message]) => message);
+    const advisory = warningMessages("machine auto-enablement");
 
     expect(advisory).toEqual(
       warning

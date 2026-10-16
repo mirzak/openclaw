@@ -29,7 +29,6 @@ function expectContains(message: unknown, fragments: string[]) {
 }
 
 function collectWarnings(run: () => void): string[] {
-  noteMock.mockClear();
   run();
   return noteMock.mock.calls.map(([message]) => String(message));
 }
@@ -158,6 +157,9 @@ describe("doctor config analysis helpers", () => {
 
 describe("collectImplicitFallbackClobberWarnings", () => {
   const defaults = { primary: "openai/gpt-5.5", fallbacks: ["openai/gpt-5.4"] };
+  const listConfig = (list: unknown, model: unknown = defaults) => ({
+    agents: { defaults: { model }, list },
+  });
   it("warns when a canonical agent model suppresses default fallbacks", () => {
     const cfg: OpenClawConfig = {
       agents: {
@@ -185,22 +187,16 @@ describe("collectImplicitFallbackClobberWarnings", () => {
     ["no per-agent model is configured", defaults, [{ id: "ops" }, { id: "researcher" }]],
     ["agents.list is malformed", defaults, { ops: { id: "ops", model: "openai/gpt-5.3" } }],
   ])("returns empty when %s", (_name, model, list) => {
-    expect(
-      collectImplicitFallbackClobberWarnings({ agents: { defaults: { model }, list } }),
-    ).toEqual([]);
+    expect(collectImplicitFallbackClobberWarnings(listConfig(list, model))).toEqual([]);
   });
 
   it("warns for each offending agent independently", () => {
-    const cfg = {
-      agents: {
-        defaults: { model: defaults },
-        list: [
-          { id: "ops", model: "openai/gpt-5.3" },
-          { id: "researcher", model: { primary: "openai/gpt-5.4" } },
-        ],
-      },
-    };
-    const warnings = collectImplicitFallbackClobberWarnings(cfg);
+    const warnings = collectImplicitFallbackClobberWarnings(
+      listConfig([
+        { id: "ops", model: "openai/gpt-5.3" },
+        { id: "researcher", model: { primary: "openai/gpt-5.4" } },
+      ]),
+    );
     expect(warnings).toStrictEqual([
       [
         '- agents.list[0].model (id=ops) is "openai/gpt-5.3", a bare string with no fallbacks. At runtime this clobbers agents.defaults.model.fallbacks (openai/gpt-5.4), leaving the agent with no fallbacks.',

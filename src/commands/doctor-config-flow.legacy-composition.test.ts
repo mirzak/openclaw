@@ -112,10 +112,8 @@ it(
       expect(Object.keys(saved.agents.entries)).toEqual(["main", "research"]);
       expect(saved.agents.defaults.systemAgent.agentId).toBe("main");
       expect(saved.meta.migrations.modelPolicyAllowlist).toBe(true);
-      expect(saved.agents.defaults.modelPolicy.allow).toEqual([
-        "anthropic/claude-sonnet-4-6",
-        "anthropic/claude-opus-4-7",
-      ]);
+      const allowedModels = ["anthropic/claude-sonnet-4-6", "anthropic/claude-opus-4-7"];
+      expect(saved.agents.defaults.modelPolicy.allow).toEqual(allowedModels);
       expect(saved.memory.search).toEqual({ ...raw.agents.defaults.memorySearch });
       expect(saved.tools.media.models).toEqual([
         { ...raw.tools.media.audio.models[0], capabilities: ["audio"] },
@@ -139,11 +137,8 @@ it.each(["duplicate ids", "whole-entry include"])(
       const duplicate = shape === "duplicate ids";
       const identity = { name: "Second agent" };
       const included = { $include: "included.json" };
-      const includeRaw = `${JSON.stringify(
-        duplicate ? identity : { identity, memorySearch: { enabled: false } },
-        null,
-        3,
-      )}\n`;
+      const includedConfig = duplicate ? identity : { identity, memorySearch: { enabled: false } };
+      const includeRaw = `${JSON.stringify(includedConfig, null, 3)}\n`;
       const configPath = await writeCoreConfig(home, {
         agents: {
           list: duplicate
@@ -215,10 +210,9 @@ it.each([
           search(false, 9, { provider: "openai", remote: { apiKey: canonicalApiKey ?? apiKey } }),
         );
         expect(saved.agents.defaults).not.toHaveProperty("memorySearch");
-        expect(saved.agents.entries.ops.memory.search).toEqual(
-          search(false, 5, { provider: "openai" }),
-        );
-        expect(saved.agents.entries.ops).not.toHaveProperty("memorySearch");
+        const ops = saved.agents.entries.ops;
+        expect(ops.memory.search).toEqual(search(false, 5, { provider: "openai" }));
+        expect(ops).not.toHaveProperty("memorySearch");
         expect((await readConfigFileSnapshot()).valid).toBe(true);
         expect((await repairConfig(configPath)).shouldWriteConfig).toBe(false);
       });
