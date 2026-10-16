@@ -12,6 +12,10 @@ import { createDeferredCore } from "../shared/deferred.js";
 import { createChannelTestPluginBase } from "../test-utils/channel-plugins.js";
 import {
   createRecoveryChannelManager,
+  registerReloadChannel,
+  expectSiblingUnchanged,
+  observeRetainedWork,
+  waitForChannelAbort,
   type RecoveryFixtureFactory,
 } from "./server-plugin-reload.recovery.test-support.js";
 import { GatewayConfigReloadSupersededError } from "./server-reload-contracts.js";
@@ -210,18 +214,12 @@ export async function verifyPendingServiceCleanupRetry(
   expect(fixture.siblingStop).toHaveBeenCalledOnce();
   const instance = getPluginInstance(fixture.previousRegistry.plugins[0]!);
   assert(instance);
-  const drainEntered = createDeferredCore();
-  const wait = instance.waitForRetainedWork.bind(instance);
-  const observation = vi.spyOn(instance, "waitForRetainedWork").mockImplementation((...args) => {
-    const draining = wait(...args);
-    drainEntered.resolve();
-    return draining;
-  });
+  const observation = observeRetainedWork(instance);
   vi.useFakeTimers();
   let retry: Promise<unknown> | undefined;
   const first = fixture.reload().catch((error: unknown) => error);
   try {
-    await Promise.race([drainEntered.promise, first]);
+    await Promise.race([observation.entered, first]);
     await vi.advanceTimersByTimeAsync(1_000);
     expect(serviceStop).toHaveBeenCalledOnce();
     expect(starts).toBe(2);
@@ -257,7 +255,7 @@ export async function verifyPendingServiceCleanupRetry(
     expect(fixture.siblingStart).toHaveBeenCalledTimes(2);
     expect(fixture.siblingStop).toHaveBeenCalledOnce();
   } finally {
-    observation.mockRestore();
+    observation.restore();
     hookRelease.resolve();
     startupRelease.resolve();
     await Promise.allSettled([first, retry, startup]);
@@ -282,17 +280,11 @@ export async function verifyGatewayCleanupRefusal(createRecoveryFixture: Recover
         api.on("gateway_start", hookStart);
         api.on("gateway_stop", hookStop);
       }
-      api.registerChannel({
-        plugin: {
-          ...createChannelTestPluginBase({ id: channelIds[owner] }),
-          gateway: {
-            startAccount: async ({ abortSignal }) => {
-              signals[owner].push(abortSignal);
-              await new Promise<void>((resolve) => {
-                abortSignal.addEventListener("abort", () => resolve(), { once: true });
-              });
-            },
-          },
+      registerReloadChannel(api, {
+        id: channelIds[owner],
+        startAccount: async ({ abortSignal }) => {
+          signals[owner].push(abortSignal);
+          await waitForChannelAbort(abortSignal);
         },
       });
     },
@@ -382,15 +374,13 @@ export async function verifyPendingServiceCleanupRollback(
     ]);
     expect(fixture.firstStart).toHaveBeenCalledTimes(2);
     expect(fixture.registryOwner.registry).not.toBe(fixture.previousRegistry);
-    expect(fixture.siblingStart).toHaveBeenCalledOnce();
-    expect(fixture.siblingStop).not.toHaveBeenCalled();
+    expectSiblingUnchanged(fixture);
 
     await expect(fixture.reload()).resolves.toMatchObject({ runtime: { pluginIds: ["first"] } });
     expect(candidateStarts).toBe(2);
     expect(fixture.firstStart).toHaveBeenCalledTimes(2);
     expect(fixture.firstStop).toHaveBeenCalledTimes(2);
-    expect(fixture.siblingStart).toHaveBeenCalledOnce();
-    expect(fixture.siblingStop).not.toHaveBeenCalled();
+    expectSiblingUnchanged(fixture);
   } finally {
     releaseStop.resolve();
     await reload;
@@ -422,8 +412,7 @@ export async function verifyFailedRecoveryServiceOwnership(
     },
   });
   expect(fixture.firstStart).toHaveBeenCalledTimes(2);
-  expect(fixture.siblingStart).toHaveBeenCalledOnce();
-  expect(fixture.siblingStop).not.toHaveBeenCalled();
+  expectSiblingUnchanged(fixture);
   const shutdown = await fixture.owner
     .currentServices()!
     .stop({ strict: true, deadlineAtMs: Date.now() + 5_000 })
@@ -476,8 +465,7 @@ export async function verifyCandidateCleanupRefusal(createRecoveryFixture: Recov
     expect(disposed).toEqual([1, 2]);
     expect(resourceOpen).toBe(true);
     expect(fixture.registryOwner.registry).toBe(fixture.previousRegistry);
-    expect(fixture.siblingStart).toHaveBeenCalledOnce();
-    expect(fixture.siblingStop).not.toHaveBeenCalled();
+    expectSiblingUnchanged(fixture);
     const sibling = getPluginInstance(
       fixture.registryOwner.registry.plugins.find((record) => record.id === "sibling")!,
     );

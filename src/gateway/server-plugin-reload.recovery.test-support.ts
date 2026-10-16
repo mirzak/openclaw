@@ -3,6 +3,7 @@ import { IncomingMessage, ServerResponse } from "node:http";
 import { Socket } from "node:net";
 import { collectNestedErrorCandidates } from "@openclaw/normalization-core/error-coercion";
 import { expect, vi } from "vitest";
+import type { ChannelPlugin } from "../channels/plugins/types.public.js";
 import { setRuntimeConfigSnapshot } from "../config/io.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createSubsystemLogger, type SubsystemLogger } from "../logging/subsystem.js";
@@ -104,26 +105,19 @@ export async function createPluginReloadRecoveryFixture(
       await options.initialStop?.();
     }
   });
-  const firstRecord = createPluginRecord({ id: "first" });
-  previous.registry.plugins.push(firstRecord);
-  const firstApi = previous.createApi(firstRecord, { config });
-  options.register?.(firstApi, "first", firstRecord);
-  firstApi.registerService({
-    id: "first",
-    start: firstStart,
-    stop: firstStop,
-  });
   const siblingStart = vi.fn();
   const siblingStop = vi.fn();
-  const siblingRecord = createPluginRecord({ id: "sibling" });
-  previous.registry.plugins.push(siblingRecord);
-  const siblingApi = previous.createApi(siblingRecord, { config });
-  options.register?.(siblingApi, "sibling", siblingRecord);
-  siblingApi.registerService({
-    id: "sibling",
-    start: siblingStart,
-    stop: siblingStop,
-  });
+  const services = {
+    first: { id: "first", start: firstStart, stop: firstStop },
+    sibling: { id: "sibling", start: siblingStart, stop: siblingStop },
+  };
+  for (const id of ["first", "sibling"] as const) {
+    const record = createPluginRecord({ id });
+    previous.registry.plugins.push(record);
+    const api = previous.createApi(record, { config });
+    options.register?.(api, id, record);
+    api.registerService({ ...services[id] });
+  }
   setActivePluginRegistry(previous.registry);
   const registryOwner = createPluginRegistryOwner(previous.registry);
   const initial = await startPluginServices({ registry: previous.registry, config });
@@ -153,56 +147,41 @@ export async function createPluginReloadRecoveryFixture(
     if (loadModules) {
       (moduleRecoveries ? recoveries : candidates).push(candidate);
     }
-    const register = (
-      pluginOwner: "first" | "sibling",
-      record: ReturnType<typeof createPluginRecord>,
-    ) => {
-      const api = candidate.createApi(record, { config: cfg });
-      try {
-        options.register?.(api, pluginOwner, record);
-      } catch (error) {
-        record.status = "error";
-        record.error = error instanceof Error ? error.message : String(error);
-        throw new PluginLoadFailureError(candidate.registry, [record]);
+    for (const id of ["first", "sibling"] as const) {
+      if (!replacePluginIds.has(id)) {
+        const retained = registryOwner.registry.plugins.find((record) => record.id === id);
+        assert(retained);
+        candidate.registry.plugins.push(retained);
+        projectPluginContributions(registryOwner.registry, retained, candidate.registry);
+        continue;
       }
-      return api;
-    };
-    if (!replacePluginIds.has("first")) {
-      const retained = registryOwner.registry.plugins.find((record) => record.id === "first");
-      assert(retained);
-      candidate.registry.plugins.push(retained);
-      projectPluginContributions(registryOwner.registry, retained, candidate.registry);
-    } else if (cfg.plugins?.entries?.first?.enabled !== false) {
-      const record = createPluginRecord({ id: "first" });
+      if (id === "first" && cfg.plugins?.entries?.first?.enabled === false) {
+        continue;
+      }
+      const record = createPluginRecord({ id });
       candidate.registry.plugins.push(record);
       if (loadModules) {
-        const api = register("first", record);
+        const api = candidate.createApi(record, { config: cfg });
+        try {
+          options.register?.(api, id, record);
+        } catch (error) {
+          record.status = "error";
+          record.error = error instanceof Error ? error.message : String(error);
+          throw new PluginLoadFailureError(candidate.registry, [record]);
+        }
         api.registerService(
-          moduleRecoveries
-            ? { id: "first", start: firstStart, stop: firstStop }
-            : {
-                id: "first",
+          id === "first" && !moduleRecoveries
+            ? {
+                id,
                 start: () => {
                   aborted = options.abortOnCandidateStart !== false;
                   options.candidateStart?.();
                 },
                 stop: async () => await candidateStop(),
-              },
+              }
+            : { ...services[id] },
         );
       }
-    }
-    if (replacePluginIds.has("sibling")) {
-      const record = createPluginRecord({ id: "sibling" });
-      candidate.registry.plugins.push(record);
-      if (loadModules) {
-        const api = register("sibling", record);
-        api.registerService({ id: "sibling", start: siblingStart, stop: siblingStop });
-      }
-    } else {
-      const retained = registryOwner.registry.plugins.find((record) => record.id === "sibling");
-      assert(retained);
-      candidate.registry.plugins.push(retained);
-      projectPluginContributions(registryOwner.registry, retained, candidate.registry);
     }
     return {
       pluginRegistry: candidate.registry,
@@ -371,6 +350,52 @@ export type RecoveryFixtureFactory = (
   options?: Parameters<typeof createPluginReloadRecoveryFixture>[1],
 ) => ReturnType<typeof createPluginReloadRecoveryFixture>;
 
+type RecoveryFixture = Awaited<ReturnType<RecoveryFixtureFactory>>;
+
+export function expectSiblingUnchanged(fixture: RecoveryFixture) {
+  expect(fixture.siblingStart).toHaveBeenCalledOnce();
+  expect(fixture.siblingStop).not.toHaveBeenCalled();
+}
+
+export function observeRetainedWork(
+  instance: NonNullable<ReturnType<typeof getPluginInstance>>,
+  consumersOnly = false,
+) {
+  const entered = createDeferredCore();
+  const wait = instance.waitForRetainedWork.bind(instance);
+  const observation = vi.spyOn(instance, "waitForRetainedWork").mockImplementation((...args) => {
+    const pending = wait(...args);
+    if (!consumersOnly || args[1]) {
+      entered.resolve();
+    }
+    return pending;
+  });
+  return {
+    entered: entered.promise,
+    reject: entered.reject,
+    restore: () => observation.mockRestore(),
+  };
+}
+
+export function waitForChannelAbort(signal: AbortSignal, checkAborted = false) {
+  return new Promise<void>((resolve) => {
+    if (checkAborted && signal.aborted) {
+      resolve();
+    } else {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    }
+  });
+}
+
+export function registerReloadChannel(
+  api: OpenClawPluginApi,
+  options: Pick<Parameters<typeof createChannelTestPluginBase>[0], "id" | "config"> &
+    NonNullable<ChannelPlugin["gateway"]>,
+) {
+  const { id, config, ...gateway } = options;
+  api.registerChannel({ plugin: { ...createChannelTestPluginBase({ id, config }), gateway } });
+}
+
 export function createRecoveryChannelManager(fixture: Awaited<ReturnType<RecoveryFixtureFactory>>) {
   return createChannelManager({
     scheduler: createTestGatewayScheduler(),
@@ -456,41 +481,31 @@ export async function verifyChannelReplacementContracts(
         channels: [channelId],
         handler,
       });
-      api.registerChannel({
-        plugin: {
-          ...createChannelTestPluginBase({ id: channelId }),
-          gateway: {
-            startAccount: async ({ abortSignal }) => {
-              starts.push(generation);
-              const command = createPluginCommandRuntime().listNativeCandidates(channelId)[0];
-              assert(command);
-              dispatches.push(command.prepareDispatch());
-              const unregister = registerPluginHttpRoute({
-                path: "/reload-contract",
-                auth: "plugin",
-                pluginId: "first",
-                source: "account",
-                throwOnFailure: true,
-                handler: (_req, res) => {
-                  res.end(`generation ${generation}`);
-                },
-              });
-              try {
-                await new Promise<void>((resolve) => {
-                  if (abortSignal.aborted) {
-                    resolve();
-                    return;
-                  }
-                  abortSignal.addEventListener("abort", () => resolve(), { once: true });
-                });
-              } finally {
-                unregister();
-              }
+      registerReloadChannel(api, {
+        id: channelId,
+        startAccount: async ({ abortSignal }) => {
+          starts.push(generation);
+          const command = createPluginCommandRuntime().listNativeCandidates(channelId)[0];
+          assert(command);
+          dispatches.push(command.prepareDispatch());
+          const unregister = registerPluginHttpRoute({
+            path: "/reload-contract",
+            auth: "plugin",
+            pluginId: "first",
+            source: "account",
+            throwOnFailure: true,
+            handler: (_req, res) => {
+              res.end(`generation ${generation}`);
             },
-            stopAccount: async () => {
-              stops.push(generation);
-            },
-          },
+          });
+          try {
+            await waitForChannelAbort(abortSignal, true);
+          } finally {
+            unregister();
+          }
+        },
+        stopAccount: async () => {
+          stops.push(generation);
         },
       });
     },
@@ -536,20 +551,12 @@ export async function verifyColdAccountReplacement(createRecoveryFixture: Recove
       if (owner !== "first") {
         return;
       }
-      api.registerChannel({
-        plugin: {
-          ...createChannelTestPluginBase({
-            id: channelId,
-            config: { listAccountIds: () => ["healthy", "cold"] },
-          }),
-          gateway: {
-            startAccount: async ({ accountId, abortSignal }) => {
-              starts.push(accountId);
-              await new Promise<void>((resolve) => {
-                abortSignal.addEventListener("abort", () => resolve(), { once: true });
-              });
-            },
-          },
+      registerReloadChannel(api, {
+        id: channelId,
+        config: { listAccountIds: () => ["healthy", "cold"] },
+        startAccount: async ({ accountId, abortSignal }) => {
+          starts.push(accountId);
+          await waitForChannelAbort(abortSignal);
         },
       });
     },
@@ -609,23 +616,13 @@ export async function verifyChannelCleanupFailureFence(
       if (owner === "first") {
         api.on("gateway_start", gatewayStart);
       }
-      api.registerChannel({
-        plugin: {
-          ...createChannelTestPluginBase({ id: `cleanup-${owner}` }),
-          gateway: {
-            startAccount: async ({ abortSignal }) => {
-              signals[owner].push(abortSignal);
-              await new Promise<void>((resolve) => {
-                if (abortSignal.aborted) {
-                  resolve();
-                  return;
-                }
-                abortSignal.addEventListener("abort", () => resolve(), { once: true });
-              });
-            },
-            ...(owner === "first" ? { stopAccount } : {}),
-          },
+      registerReloadChannel(api, {
+        id: `cleanup-${owner}`,
+        startAccount: async ({ abortSignal }) => {
+          signals[owner].push(abortSignal);
+          await waitForChannelAbort(abortSignal, true);
         },
+        ...(owner === "first" ? { stopAccount } : {}),
       });
     },
   });

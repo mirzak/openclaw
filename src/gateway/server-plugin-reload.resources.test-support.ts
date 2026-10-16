@@ -9,7 +9,11 @@ import { getPluginInstance } from "../plugins/plugin-instance-scope.js";
 import type { PluginInstanceConsumer } from "../plugins/plugin-instance.types.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import type { GatewayRequestHandlerOptions } from "./server-methods/types.js";
-import type { RecoveryFixtureFactory } from "./server-plugin-reload.recovery.test-support.js";
+import {
+  expectSiblingUnchanged,
+  observeRetainedWork,
+  type RecoveryFixtureFactory,
+} from "./server-plugin-reload.recovery.test-support.js";
 
 type RecoveryFixture = Awaited<ReturnType<RecoveryFixtureFactory>>;
 
@@ -98,8 +102,7 @@ export async function verifySharedResourceReplacement(
   expect(fixture.registryOwner.registry.plugins.find((record) => record.id === "sibling")).toBe(
     sibling,
   );
-  expect(fixture.siblingStart).toHaveBeenCalledOnce();
-  expect(fixture.siblingStop).not.toHaveBeenCalled();
+  expectSiblingUnchanged(fixture);
 }
 
 export async function verifyCandidateResourceCleanup(createFixture: RecoveryFixtureFactory) {
@@ -142,8 +145,7 @@ export async function verifyCandidateResourceCleanup(createFixture: RecoveryFixt
     { closed: false, flushed: false },
   ]);
   expect(fixture.firstStart).toHaveBeenCalledTimes(2);
-  expect(fixture.siblingStart).toHaveBeenCalledOnce();
-  expect(fixture.siblingStop).not.toHaveBeenCalled();
+  expectSiblingUnchanged(fixture);
 }
 
 async function verifySelfConsumerReload(
@@ -176,13 +178,7 @@ async function verifySelfConsumerReload(
   assert(record);
   const instance = getPluginInstance(record);
   assert(instance);
-  const drainEntered = createDeferredCore();
-  const waitForWork = instance.waitForRetainedWork.bind(instance);
-  const observation = vi.spyOn(instance, "waitForRetainedWork").mockImplementation((...args) => {
-    const draining = waitForWork(...args);
-    drainEntered.resolve();
-    return draining;
-  });
+  const observation = observeRetainedWork(instance);
   if (caller !== "final checkpoint") {
     consumer = instance.retainConsumer();
   }
@@ -196,7 +192,7 @@ async function verifySelfConsumerReload(
         : fixture.reload(undefined, pluginIds)
     ).catch((error: unknown) => error);
     // Observe the original bounded failure without releasing the work reload depends on.
-    await Promise.race([drainEntered.promise, reloading]);
+    await Promise.race([observation.entered, reloading]);
     await vi.advanceTimersByTimeAsync(70_000);
     expect(await reloading).toMatchObject({
       details: { phase: caller === "own invocation" ? "prepare" : "drain", committed: false },
@@ -219,7 +215,7 @@ async function verifySelfConsumerReload(
       runtime: { pluginIds },
     });
   } finally {
-    observation.mockRestore();
+    observation.restore();
     cleanup.resolve();
     await closing;
     consumer?.release();
@@ -254,15 +250,7 @@ async function verifyOverlappingRetainedWork(createRecoveryFixture: RecoveryFixt
   const instance = getPluginInstance(record);
   assert(instance);
   const consumer = instance.retainConsumer();
-  const consumerDrainEntered = createDeferredCore();
-  const waitForWork = instance.waitForRetainedWork.bind(instance);
-  const observation = vi.spyOn(instance, "waitForRetainedWork").mockImplementation((...args) => {
-    const draining = waitForWork(...args);
-    if (args[1]) {
-      consumerDrainEntered.resolve();
-    }
-    return draining;
-  });
+  const observation = observeRetainedWork(instance, true);
   const first = retainRuntimePluginWork([old]);
   const second = retainRuntimePluginWork([old]);
   const reloading = fixture.reload();
@@ -276,7 +264,7 @@ async function verifyOverlappingRetainedWork(createRecoveryFixture: RecoveryFixt
     expect(instance.run(() => "old run finishes")).toBe("old run finishes");
     expect(fixture.candidates).toHaveLength(0);
     second();
-    await Promise.race([consumerDrainEntered.promise, reloading]);
+    await Promise.race([observation.entered, reloading]);
     expect(disposed).toEqual([]);
     consumer.release();
     const receipt = await reloading;
@@ -294,7 +282,7 @@ async function verifyOverlappingRetainedWork(createRecoveryFixture: RecoveryFixt
     first();
     second();
     consumer.release();
-    observation.mockRestore();
+    observation.restore();
     await reloading.catch(() => {});
   }
 }
@@ -321,13 +309,7 @@ async function verifyExplicitDrainWait(
         ? () => consumer.release()
         : () => released.resolve();
   const call = kind === "active call" ? instance.run(() => released.promise) : undefined;
-  const drainEntered = createDeferredCore();
-  const waitForWork = instance.waitForRetainedWork.bind(instance);
-  const observation = vi.spyOn(instance, "waitForRetainedWork").mockImplementation((...args) => {
-    const pending = waitForWork(...args);
-    drainEntered.resolve();
-    return pending;
-  });
+  const observation = observeRetainedWork(instance);
   let settled = false;
   vi.useFakeTimers();
   const reloading = fixture
@@ -338,7 +320,7 @@ async function verifyExplicitDrainWait(
       return result;
     });
   try {
-    await Promise.race([drainEntered.promise, reloading]);
+    await Promise.race([observation.entered, reloading]);
     expect(fixture.owner.getReloadStatus()?.reason).toBeTruthy();
     await vi.advanceTimersByTimeAsync(70_000);
     expect(settled).toBe(false);
@@ -365,14 +347,13 @@ async function verifyExplicitDrainWait(
       expect(instance.disposing).toBe(true);
     }
     expect(fixture.owner.getReloadStatus()).toBeUndefined();
-    expect(fixture.siblingStart).toHaveBeenCalledOnce();
-    expect(fixture.siblingStop).not.toHaveBeenCalled();
+    expectSiblingUnchanged(fixture);
   } finally {
     release();
     released.resolve();
     await call;
     await reloading;
-    observation.mockRestore();
+    observation.restore();
     vi.useRealTimers();
   }
 }

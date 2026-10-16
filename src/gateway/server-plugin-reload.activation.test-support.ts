@@ -5,9 +5,11 @@ import { expect, vi } from "vitest";
 import { registerPluginHttpRoute } from "../plugins/http-registry.js";
 import { getPluginInstance } from "../plugins/plugin-instance-scope.js";
 import { createDeferredCore } from "../shared/deferred.js";
-import { createChannelTestPluginBase } from "../test-utils/channel-plugins.js";
 import {
   createRecoveryChannelManager,
+  registerReloadChannel,
+  expectSiblingUnchanged,
+  waitForChannelAbort,
   type RecoveryFixtureFactory,
 } from "./server-plugin-reload.recovery.test-support.js";
 import { createReadinessChecker } from "./server/readiness.js";
@@ -27,21 +29,15 @@ export async function verifyPreparedSidecarRecovery(
       if (owner === "first") {
         api.on("gateway_start", start);
         api.on("gateway_stop", stop);
-        api.registerChannel({
-          plugin: {
-            ...createChannelTestPluginBase({ id: channelId }),
-            gateway: {
-              startAccount: async ({ accountId, abortSignal, setStatus }) => {
-                signals.push(abortSignal);
-                setStatus({ accountId, running: true, connected: true, lifecycle: "ready" });
-                await new Promise<void>((resolve) => {
-                  abortSignal.addEventListener("abort", () => resolve(), { once: true });
-                });
-                if (mode === "aborted-predecessor") {
-                  await finishTask.promise;
-                }
-              },
-            },
+        registerReloadChannel(api, {
+          id: channelId,
+          startAccount: async ({ accountId, abortSignal, setStatus }) => {
+            signals.push(abortSignal);
+            setStatus({ accountId, running: true, connected: true, lifecycle: "ready" });
+            await waitForChannelAbort(abortSignal);
+            if (mode === "aborted-predecessor") {
+              await finishTask.promise;
+            }
           },
         });
       }
@@ -149,8 +145,7 @@ export async function verifyServiceCleanupRecovery(createFixture: RecoveryFixtur
   expect(new Set(fixture.registryOwner.registry.plugins.map((plugin) => plugin.id))).toEqual(
     new Set(["first", "sibling"]),
   );
-  expect(fixture.siblingStart).toHaveBeenCalledOnce();
-  expect(fixture.siblingStop).not.toHaveBeenCalled();
+  expectSiblingUnchanged(fixture);
 }
 
 export async function verifyIndependentPostCommitActivation(
@@ -222,41 +217,33 @@ export async function verifyIndependentPostCommitActivation(
         "healthy-channel",
         ...(current === 1 ? ["removed-channel"] : []),
       ]) {
-        api.registerChannel({
-          plugin: {
-            ...createChannelTestPluginBase({
-              id,
-              config: {
-                listAccountIds: () => {
-                  if (boundary === "hook-and-channel" && current > 1 && id === "first-channel") {
-                    throw channelFailure;
-                  }
-                  return ["default"];
-                },
-              },
-            }),
-            gateway: {
-              startAccount: async ({ abortSignal }) => {
-                starts.push(`${id}:${current}`);
-                const unregister = registerPluginHttpRoute({
-                  path: `/${id}`,
-                  auth: "plugin",
-                  pluginId: "first",
-                  source: "account",
-                  throwOnFailure: true,
-                  handler: (_req, res) => {
-                    res.end(`generation ${current}`);
-                  },
-                });
-                try {
-                  await new Promise<void>((resolve) => {
-                    abortSignal.addEventListener("abort", () => resolve(), { once: true });
-                  });
-                } finally {
-                  unregister();
-                }
-              },
+        registerReloadChannel(api, {
+          id,
+          config: {
+            listAccountIds: () => {
+              if (boundary === "hook-and-channel" && current > 1 && id === "first-channel") {
+                throw channelFailure;
+              }
+              return ["default"];
             },
+          },
+          startAccount: async ({ abortSignal }) => {
+            starts.push(`${id}:${current}`);
+            const unregister = registerPluginHttpRoute({
+              path: `/${id}`,
+              auth: "plugin",
+              pluginId: "first",
+              source: "account",
+              throwOnFailure: true,
+              handler: (_req, res) => {
+                res.end(`generation ${current}`);
+              },
+            });
+            try {
+              await waitForChannelAbort(abortSignal);
+            } finally {
+              unregister();
+            }
           },
         });
       }
@@ -372,17 +359,11 @@ export async function verifyLifecycleHookSettlement(
           await release.promise;
         });
       }
-      api.registerChannel({
-        plugin: {
-          ...createChannelTestPluginBase({ id: "hook-dependent" }),
-          gateway: {
-            startAccount: async ({ abortSignal }) => {
-              starts.push(current);
-              await new Promise<void>((resolve) => {
-                abortSignal.addEventListener("abort", () => resolve(), { once: true });
-              });
-            },
-          },
+      registerReloadChannel(api, {
+        id: "hook-dependent",
+        startAccount: async ({ abortSignal }) => {
+          starts.push(current);
+          await waitForChannelAbort(abortSignal);
         },
       });
     },
@@ -447,27 +428,19 @@ export async function verifyIndependentRollbackRestoration(
         return;
       }
       for (const id of ["first-restore", "healthy-restore"]) {
-        api.registerChannel({
-          plugin: {
-            ...createChannelTestPluginBase({
-              id,
-              config: {
-                listAccountIds: () => {
-                  if (restoring && boundary === "channel" && id === "first-restore") {
-                    throw failure;
-                  }
-                  return ["default"];
-                },
-              },
-            }),
-            gateway: {
-              startAccount: async ({ abortSignal }) => {
-                starts.push(id);
-                await new Promise<void>((resolve) => {
-                  abortSignal.addEventListener("abort", () => resolve(), { once: true });
-                });
-              },
+        registerReloadChannel(api, {
+          id,
+          config: {
+            listAccountIds: () => {
+              if (restoring && boundary === "channel" && id === "first-restore") {
+                throw failure;
+              }
+              return ["default"];
             },
+          },
+          startAccount: async ({ abortSignal }) => {
+            starts.push(id);
+            await waitForChannelAbort(abortSignal);
           },
         });
       }
@@ -532,8 +505,7 @@ export async function verifyIndependentRollbackRestoration(
           .reloadingChannels?.size ?? 0,
       ).toBe(0);
     }
-    expect(fixture.siblingStart).toHaveBeenCalledOnce();
-    expect(fixture.siblingStop).not.toHaveBeenCalled();
+    expectSiblingUnchanged(fixture);
     expect(fixture.owner.currentServices()).not.toBeNull();
     if (boundary === "channel") {
       await fixture.reload(fixture.getConfig(), ["sibling"]);

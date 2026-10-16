@@ -31,7 +31,7 @@ import type { OpenClawPluginApi } from "../plugins/types.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { resolveRelativeBundledPluginPublicModuleId } from "../test-utils/bundled-plugin-public-surface.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import type { createPluginReloadRecoveryFixture } from "./server-plugin-reload.recovery.test-support.js";
+import type { RecoveryFixtureFactory } from "./server-plugin-reload.recovery.test-support.js";
 
 const { createMemoryRuntime, configureMemoryCoreDreamingState } = await vi.importActual<{
   configureMemoryCoreDreamingState: (
@@ -48,10 +48,45 @@ const { createMemoryRuntime, configureMemoryCoreDreamingState } = await vi.impor
   }),
 );
 
+function memoryReloadConfig(
+  workspace: string,
+  model: string,
+  search: NonNullable<NonNullable<OpenClawConfig["memory"]>["search"]> = {},
+): OpenClawConfig {
+  return {
+    plugins: { allow: ["first", "sibling"], slots: { memory: "sibling" } },
+    agents: { defaults: { workspace } },
+    memory: {
+      search: {
+        provider: "gateway-memory-probe",
+        model,
+        fallback: "none",
+        store: { vector: { enabled: false } },
+        ...search,
+      },
+    },
+  };
+}
+
+function registerMemoryRuntime(api: OpenClawPluginApi) {
+  assert(api.lifecycle.runInBackgroundContext);
+  const runtime = createMemoryRuntime({
+    runInBackgroundContext: api.lifecycle.runInBackgroundContext,
+  });
+  api.registerMemoryCapability({ runtime });
+  return runtime;
+}
+
+function independentRegistry() {
+  return createPluginRegistry({
+    logger: { info() {}, warn() {}, error() {}, debug() {} },
+    runtime: createPluginRuntime(),
+    activateGlobalSideEffects: false,
+  });
+}
+
 export async function verifyGatewayMemoryReplacement(
-  createRecoveryFixture: (
-    options: Parameters<typeof createPluginReloadRecoveryFixture>[1],
-  ) => ReturnType<typeof createPluginReloadRecoveryFixture>,
+  createRecoveryFixture: RecoveryFixtureFactory,
   mode: "held-close" | "failed-close",
 ) {
   const state = await createOpenClawTestState({
@@ -59,18 +94,7 @@ export async function verifyGatewayMemoryReplacement(
     label: "gateway-memory-reload",
   });
   const providerId = "gateway-memory-probe";
-  const config: OpenClawConfig = {
-    plugins: { allow: ["first", "sibling"], slots: { memory: "sibling" } },
-    agents: { defaults: { workspace: state.workspaceDir } },
-    memory: {
-      search: {
-        provider: providerId,
-        model: "synthetic-embedding",
-        fallback: "none",
-        store: { vector: { enabled: false } },
-      },
-    },
-  };
+  const config = memoryReloadConfig(state.workspaceDir, "synthetic-embedding");
   const entered = createDeferredCore();
   const release = createDeferredCore();
   const events: string[] = [];
@@ -105,12 +129,7 @@ export async function verifyGatewayMemoryReplacement(
       if (owner === "sibling") {
         record.kind = "memory";
         record.memorySlotSelected = true;
-        assert(api.lifecycle.runInBackgroundContext);
-        api.registerMemoryCapability({
-          runtime: createMemoryRuntime({
-            runInBackgroundContext: api.lifecycle.runInBackgroundContext,
-          }),
-        });
+        registerMemoryRuntime(api);
       } else {
         record.contracts = { ...record.contracts, embeddingProviders: [providerId] };
         const generation = ++generations;
@@ -132,23 +151,14 @@ export async function verifyGatewayMemoryReplacement(
   });
   const runtime = fixture.previousRegistry.memoryCapabilities[0]?.capability.runtime;
   assert(runtime);
-  const independent = createPluginRegistry({
-    logger: { info() {}, warn() {}, error() {}, debug() {} },
-    runtime: createPluginRuntime(),
-    activateGlobalSideEffects: false,
-  });
+  const independent = independentRegistry();
   const otherRecord = createPluginRecord({ id: "other-memory-host" });
   otherRecord.kind = "memory";
   otherRecord.memorySlotSelected = true;
   otherRecord.contracts = { embeddingProviders: [providerId] };
   independent.registry.plugins.push(otherRecord);
   const otherApi = independent.createApi(otherRecord, { config });
-  assert(otherApi.lifecycle.runInBackgroundContext);
-  otherApi.registerMemoryCapability({
-    runtime: createMemoryRuntime({
-      runInBackgroundContext: otherApi.lifecycle.runInBackgroundContext,
-    }),
-  });
+  registerMemoryRuntime(otherApi);
   const otherClose = vi.fn(async () => {});
   otherApi.registerEmbeddingProvider({
     id: providerId,
@@ -242,9 +252,7 @@ export async function verifyGatewayMemoryReplacement(
 }
 
 export async function verifyGatewayMemoryWatcherRestart(
-  createRecoveryFixture: (
-    options: Parameters<typeof createPluginReloadRecoveryFixture>[1],
-  ) => ReturnType<typeof createPluginReloadRecoveryFixture>,
+  createRecoveryFixture: RecoveryFixtureFactory,
   providerState: "pending" | "initialized" | "separate-registry" | "rollback",
   signal: AbortSignal,
   recovery?: {
@@ -253,20 +261,10 @@ export async function verifyGatewayMemoryWatcherRestart(
   },
 ) {
   const state = await createOpenClawTestState({ label: "gateway-memory-watcher-reload" });
-  const config: OpenClawConfig = {
-    plugins: { allow: ["first", "sibling"], slots: { memory: "sibling" } },
-    agents: { defaults: { workspace: state.workspaceDir } },
-    memory: {
-      search: {
-        provider: "gateway-memory-probe",
-        model: "synthetic",
-        fallback: "none",
-        sources: ["memory"],
-        cache: { enabled: false },
-        store: { vector: { enabled: false } },
-      },
-    },
-  };
+  const config = memoryReloadConfig(state.workspaceDir, "synthetic", {
+    sources: ["memory"],
+    cache: { enabled: false },
+  });
   const subscriptions: Array<{ notify: () => void; signal: AbortSignal }> = [];
   const unused = async (): Promise<never> => {
     throw new Error("Unexpected document operation");
@@ -388,11 +386,7 @@ export async function verifyGatewayMemoryWatcherRestart(
     expect(subscriptions).toHaveLength(1);
     const first = managers[0]!;
     if (providerState === "separate-registry") {
-      independent = createPluginRegistry({
-        logger: { info() {}, warn() {}, error() {}, debug() {} },
-        runtime: createPluginRuntime(),
-        activateGlobalSideEffects: false,
-      });
+      independent = independentRegistry();
       const record = createPluginRecord({
         id: "lazy-provider",
         contracts: { embeddingProviders: ["gateway-memory-probe"] },
