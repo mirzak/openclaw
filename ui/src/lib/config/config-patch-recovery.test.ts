@@ -1,12 +1,11 @@
 // @vitest-environment node
-import {
-  GatewayProtocolClient,
-  isGatewayProtocolResponseError,
-} from "@openclaw/gateway-client/browser";
+
+import { isGatewayProtocolResponseError } from "@openclaw/gateway-client/browser";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
 import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
 import type { ConfigSnapshot } from "../../api/types.ts";
+import { configTransport, expectStoredConfig } from "./config-suite.test-support.ts";
 import {
   CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS,
   createConfigCapabilityHarness,
@@ -25,7 +24,7 @@ afterEach(() => {
   capabilities.clear();
 });
 
-function createRecoveryCapability(request: GatewayBrowserClient["request"]) {
+function createRecoveryCapability(request: Parameters<typeof createConfigCapabilityHarness>[0]) {
   const harness = createConfigCapabilityHarness(request);
   capabilities.add(harness.runtimeConfig);
   return harness;
@@ -73,7 +72,7 @@ function createPersistedFailureTransport(
   let requestId = 0;
   const frames: Array<{ id: string; method: string; params: unknown }> = [];
   const responseErrors: unknown[] = [];
-  const transport = new GatewayProtocolClient<Record<string, never>>({
+  const transport = configTransport({
     createSocket: (handlers) => ({
       isOpen: () => true,
       close: () => undefined,
@@ -123,17 +122,6 @@ function createPersistedFailureTransport(
       },
     }),
     createRequestId: () => `patch-recovery-${++requestId}`,
-    createRequestError: (error) =>
-      new GatewayRequestError({
-        code: error.code ?? "UNAVAILABLE",
-        details: error.details,
-        message: error.message ?? "request failed",
-      }),
-    buildConnectPlan: () => ({}),
-    buildConnectParams: (plan) => plan,
-    resolveClose: () => ({ retry: false, notify: false }),
-    handshake: { mode: "require-challenge", timeoutMs: 100 },
-    reconnect: { initialMs: 10, multiplier: 2, maxMs: 100 },
   });
   transport.start();
   const request: GatewayBrowserClient["request"] = async (method, params) => {
@@ -294,30 +282,19 @@ describe("config patch recovery", () => {
           expect(runtimeConfig.state.configAutoSaveStatus).toBe("conflict");
           expect(runtimeConfig.state.configRaw).toBe('{ "count": 7 }\n');
           expect(store.submissions).toHaveLength(2);
-          await expect(store.request("config.get")).resolves.toMatchObject({
-            config: { count: 3, enabled: true },
-          });
+          await expectStoredConfig(store, { count: 3, enabled: true });
           return;
         }
-        const recovered = await runtimeConfig.retry();
+        await expect(runtimeConfig.retry()).resolves.toBe(true);
         expect(runtimeConfig.state.configFormDirty).toBe(true);
         expect(frames.filter((frame) => frame.method === "config.set")).toHaveLength(0);
-        const observed = {
-          recovered,
-          revision: runtimeConfig.state.configSnapshot?.hash,
-          needsApply: runtimeConfig.state.configNeedsApply,
-          status: runtimeConfig.state.configAutoSaveStatus,
-          lastError: runtimeConfig.state.lastError,
-          patchBases: frames
+        expect(runtimeConfig.state.configSnapshot?.hash).toBe("hash-2");
+        expect(runtimeConfig.state.configNeedsApply).toBe(true);
+        expect(
+          frames
             .filter((frame) => frame.method === "config.patch")
             .map((frame) => (frame.params as { baseHash: string }).baseHash),
-        };
-        expect(observed, JSON.stringify(observed)).toMatchObject({
-          recovered: true,
-          revision: "hash-2",
-          needsApply: true,
-          patchBases: ["hash-1", "hash-2"],
-        });
+        ).toEqual(["hash-1", "hash-2"]);
         if (mode === "raw") {
           // Whole-file raw text still omits the independently committed field.
           expect(runtimeConfig.state.configRaw).toBe('{ "count": 7 }\n');
@@ -348,9 +325,7 @@ describe("config patch recovery", () => {
         }
         return server.request(method, params);
       });
-      const { runtimeConfig, publish } = createRecoveryCapability(
-        request as GatewayBrowserClient["request"],
-      );
+      const { runtimeConfig, publish } = createRecoveryCapability(request);
       await runtimeConfig.ensureLoaded();
       if (scenario === "paused") {
         runtimeConfig.patchForm(["count"], 7);
@@ -405,9 +380,7 @@ describe("config patch recovery", () => {
       if (scenario === "autosave") {
         runtimeConfig.patchForm(["count"], 3);
         await vi.advanceTimersByTimeAsync(CONFIG_FORM_AUTO_SAVE_DEBOUNCE_MS);
-        await expect(server.store.request("config.get")).resolves.toMatchObject({
-          config: { ...config, count: 3 },
-        });
+        await expectStoredConfig(server.store, { ...config, count: 3 });
         expect(runtimeConfig.state.configFormDirty).toBe(false);
         expect(runtimeConfig.state.configAutoSaveStatus).toBe("saved");
       }
@@ -416,9 +389,7 @@ describe("config patch recovery", () => {
 
   it("clears a scalar patch conflict after refresh and a successful Workshop retry", async () => {
     const server = createPatchServer();
-    const { runtimeConfig } = createRecoveryCapability(
-      server.request as GatewayBrowserClient["request"],
-    );
+    const { runtimeConfig } = createRecoveryCapability(server.request);
     await runtimeConfig.ensureLoaded();
     await server.store.request("config.set", { raw: '{"count":7}', baseHash: "hash-1" });
     const patch = {
@@ -434,8 +405,9 @@ describe("config patch recovery", () => {
     expect(runtimeConfig.state.lastError).toBeNull();
     await expect(runtimeConfig.patch(patch)).resolves.toBe(true);
 
-    await expect(server.store.request("config.get")).resolves.toMatchObject({
-      config: { count: 7, skills: { workshop: { autonomous: { mode: "off" } } } },
+    await expectStoredConfig(server.store, {
+      count: 7,
+      skills: { workshop: { autonomous: { mode: "off" } } },
     });
     expect(runtimeConfig.state.configAutoSaveStatus).toBe("saved");
     expect(runtimeConfig.state.lastError).toBeNull();
@@ -455,9 +427,7 @@ describe("config patch recovery", () => {
         }
         return server.request(method, params);
       });
-      const { runtimeConfig } = createRecoveryCapability(
-        request as GatewayBrowserClient["request"],
-      );
+      const { runtimeConfig } = createRecoveryCapability(request);
       await runtimeConfig.ensureLoaded();
       const editCount = (count: number) => {
         if (mode === "raw") {
@@ -491,9 +461,7 @@ describe("config patch recovery", () => {
       expect(runtimeConfig.state.configFormOriginal).toEqual({ count: 1 });
       expect(runtimeConfig.state.configDraftBaseHash).toBe("hash-3");
       expect(request.mock.calls.filter(([method]) => method === "config.set")).toHaveLength(1);
-      await expect(server.store.request("config.get")).resolves.toMatchObject({
-        config: { count: 9, enabled: false },
-      });
+      await expectStoredConfig(server.store, { count: 9, enabled: false });
     },
   );
 
@@ -503,7 +471,7 @@ describe("config patch recovery", () => {
       const response = await server.request(method, params);
       return method === "config.get" ? { ...response, hash: null } : response;
     });
-    const { runtimeConfig } = createRecoveryCapability(request as GatewayBrowserClient["request"]);
+    const { runtimeConfig } = createRecoveryCapability(request);
     await runtimeConfig.ensureLoaded();
 
     await expect(runtimeConfig.patch({ raw: { count: 2 }, note: "Change count" })).resolves.toBe(
@@ -513,9 +481,7 @@ describe("config patch recovery", () => {
     expect(runtimeConfig.state.configAutoSaveStatus).toBe("conflict");
     expect(runtimeConfig.state.lastError).toContain("Config hash missing");
     expect(request.mock.calls.filter(([method]) => method === "config.patch")).toHaveLength(0);
-    await expect(server.store.request("config.get")).resolves.toMatchObject({
-      config: { count: 1 },
-    });
+    await expectStoredConfig(server.store, { count: 1 });
   });
 
   it.each(["rejected", "pending"] as const)(
@@ -541,9 +507,7 @@ describe("config patch recovery", () => {
         }
         return server.request(method, params);
       });
-      const { runtimeConfig, publish } = createRecoveryCapability(
-        request as GatewayBrowserClient["request"],
-      );
+      const { runtimeConfig, publish } = createRecoveryCapability(request);
       await runtimeConfig.ensureLoaded();
       const oldWrite = runtimeConfig.patch({ raw: { count: 2 }, note: "Old edit" });
       await patchStarted.promise;
@@ -565,9 +529,7 @@ describe("config patch recovery", () => {
         runtimeConfig.patchForm(["count"], 4);
       }
       await expect(runtimeConfig.retry()).resolves.toBe(true);
-      await expect(server.store.request("config.get")).resolves.toMatchObject({
-        config: { count: settlement === "pending" ? 3 : 4 },
-      });
+      await expectStoredConfig(server.store, { count: settlement === "pending" ? 3 : 4 });
       expect(request.mock.calls.filter(([method]) => method === "config.patch")).toHaveLength(
         settlement === "pending" ? 3 : 1,
       );
@@ -588,9 +550,7 @@ describe("config patch recovery", () => {
         }
         return server.request(method, params);
       });
-      const { runtimeConfig } = createRecoveryCapability(
-        request as GatewayBrowserClient["request"],
-      );
+      const { runtimeConfig } = createRecoveryCapability(request);
       await runtimeConfig.ensureLoaded();
       await expect(
         runtimeConfig.patch({
@@ -604,9 +564,7 @@ describe("config patch recovery", () => {
         await expect(runtimeConfig.retry()).resolves.toBe(false);
         expect(request.mock.calls.filter(([method]) => method === "config.patch")).toHaveLength(1);
         expect(request.mock.calls.filter(([method]) => method === "config.set")).toHaveLength(0);
-        await expect(server.store.request("config.get")).resolves.toMatchObject({
-          config: { count: 1 },
-        });
+        await expectStoredConfig(server.store, { count: 1 });
       } else {
         await expect(
           runtimeConfig.patchFromSnapshot((config) =>

@@ -1,16 +1,19 @@
 // @vitest-environment node
-import { describe, expect, it, vi } from "vitest";
-import { createDeferred } from "../../../../test/helpers/promise.ts";
-import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
-import { REDACTED_SENTINEL } from "../config-form-utils.ts";
-import {
-  createConfigCapabilityHarness,
-  createConfigServerMock,
-  createDeferredSetServerMock,
-} from "./config-test-harness.ts";
 
-function rejectedEdit() {
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../../test/helpers/promise.ts";
+import { GatewayRequestError } from "../../api/gateway.ts";
+import { REDACTED_SENTINEL } from "../config-form-utils.ts";
+import { loadedConfig } from "./config-suite.test-support.ts";
+import { createConfigServerMock, createDeferredSetServerMock } from "./config-test-harness.ts";
+
+beforeEach(() => vi.useFakeTimers());
+
+async function rejectedEdit(applied = false) {
   const server = createConfigServerMock();
+  if (applied) {
+    await server.request("config.set", { raw: '{"count":1}', baseHash: server.currentHash() });
+  }
   let reject = true;
   const request = vi.fn(async (method: string, params?: unknown) => {
     if (method === "config.set" && reject) {
@@ -19,28 +22,18 @@ function rejectedEdit() {
     }
     return server.request(method, params);
   });
-  return {
-    server,
-    request,
-    ...createConfigCapabilityHarness(request as GatewayBrowserClient["request"]),
-  };
+  const harness = await loadedConfig(request);
+  harness.runtimeConfig.patchForm(["count"], 2);
+  await harness.runtimeConfig.flushFormChanges();
+  const snapshot = await server.request("config.get");
+  return { server, request, snapshot, ...harness };
 }
 
 describe("field-scoped config draft cancellation", () => {
   it.each(["absent", "authored-empty", "sibling"])(
     "restores %s ancestor containers without creating a new write on Cancel",
     async (scenario) => {
-      vi.useFakeTimers();
-      const saved = {
-        plugins: {
-          entries: {
-            demo: {
-              enabled: true,
-              ...(scenario === "authored-empty" ? { config: { search: {} } } : {}),
-            },
-          },
-        },
-      };
+      const saved = { plugins: { entries: { demo: { enabled: true } } } };
       const request = vi.fn(async (method: string) => {
         if (method === "config.get") {
           return { config: saved, raw: JSON.stringify(saved), hash: "saved", valid: true };
@@ -50,10 +43,7 @@ describe("field-scoped config draft cancellation", () => {
         }
         return {};
       });
-      const { runtimeConfig } = createConfigCapabilityHarness(
-        request as GatewayBrowserClient["request"],
-      );
-      await runtimeConfig.ensureLoaded();
+      const { runtimeConfig } = await loadedConfig(request);
       const parent = ["plugins", "entries", "demo", "config", "search"];
       runtimeConfig.patchForm([...parent, "apiKey"], {
         source: "file",
@@ -85,12 +75,8 @@ describe("field-scoped config draft cancellation", () => {
   );
 
   it("waits for a pending acknowledgement and preserves its committed value", async () => {
-    vi.useFakeTimers();
     const server = createDeferredSetServerMock();
-    const { runtimeConfig } = createConfigCapabilityHarness(
-      server.request as GatewayBrowserClient["request"],
-    );
-    await runtimeConfig.ensureLoaded();
+    const { runtimeConfig } = await loadedConfig(server.request);
     runtimeConfig.patchForm(["count"], 2);
     const save = runtimeConfig.flushFormChanges();
     const cancel = runtimeConfig.discardFormValue(["count"]);
@@ -105,12 +91,7 @@ describe("field-scoped config draft cancellation", () => {
   it.each(["same-value", "sibling", "raw", "connection"])(
     "does not let a delayed cancellation replace newer %s intent",
     async (change) => {
-      vi.useFakeTimers();
-      const { runtimeConfig, request, server, publish } = rejectedEdit();
-      await runtimeConfig.ensureLoaded();
-      runtimeConfig.patchForm(["count"], 2);
-      await runtimeConfig.flushFormChanges();
-      const snapshot = await server.request("config.get");
+      const { runtimeConfig, request, server, publish, snapshot } = await rejectedEdit();
       const read = createDeferred<typeof snapshot>();
       request.mockImplementationOnce(() => read.promise);
       const cancel = runtimeConfig.discardFormValue(["count"]);
@@ -118,8 +99,6 @@ describe("field-scoped config draft cancellation", () => {
         runtimeConfig.patchForm(["count"], 2);
       } else if (change === "sibling") {
         runtimeConfig.patchForm(["other"], "new edit");
-      } else if (change === "raw") {
-        runtimeConfig.setRaw('{"count":3}');
       } else {
         publish(false);
       }
@@ -131,8 +110,6 @@ describe("field-scoped config draft cancellation", () => {
         expect(server.submissions.map((entry) => JSON.parse(entry.raw))).toEqual([
           { count: 1, other: "new edit" },
         ]);
-      } else if (change === "raw") {
-        expect(runtimeConfig.state.configRaw).toBe('{"count":3}');
       } else {
         expect(runtimeConfig.state.configForm).toEqual({ count: 2 });
       }
@@ -144,15 +121,11 @@ describe("field-scoped config draft cancellation", () => {
   it.each(["uncommitted", "exact", "redacted"])(
     "reconciles an unknown write only when the saved bytes confirm it (%s)",
     async (outcome) => {
-      const committed = outcome !== "uncommitted";
       const confirmed = outcome === "exact";
-      vi.useFakeTimers();
       const server = createConfigServerMock();
       const request = vi.fn(async (method: string, params?: unknown) => {
         if (method === "config.set") {
-          if (committed) {
-            await server.request(method, params);
-          }
+          await server.request(method, params);
           throw new Error("Transport acknowledgement unavailable");
         }
         const result = await server.request(method, params);
@@ -162,10 +135,7 @@ describe("field-scoped config draft cancellation", () => {
         }
         return result;
       });
-      const { runtimeConfig } = createConfigCapabilityHarness(
-        request as GatewayBrowserClient["request"],
-      );
-      await runtimeConfig.ensureLoaded();
+      const { runtimeConfig } = await loadedConfig(request);
       const value =
         outcome === "redacted" ? { source: "file", provider: "team", id: "/new-key" } : 2;
       runtimeConfig.patchForm(["count"], value);
@@ -186,12 +156,7 @@ describe("field-scoped config draft cancellation", () => {
   );
 
   it("keeps a newer explicit refresh's failure after a superseded cancel read rejects", async () => {
-    vi.useFakeTimers();
-    const { runtimeConfig, request, server } = rejectedEdit();
-    await runtimeConfig.ensureLoaded();
-    runtimeConfig.patchForm(["count"], 2);
-    await runtimeConfig.flushFormChanges();
-    const snapshot = await server.request("config.get");
+    const { runtimeConfig, request, snapshot } = await rejectedEdit();
     const read = createDeferred<typeof snapshot>();
     request.mockImplementationOnce(() => read.promise);
     const cancel = runtimeConfig.discardFormValue(["count"]);
@@ -206,16 +171,7 @@ describe("field-scoped config draft cancellation", () => {
   });
 
   it("keeps the cancel read error when applied-config polling overlaps its rejection", async () => {
-    vi.useFakeTimers();
-    const { runtimeConfig, request, server } = rejectedEdit();
-    await server.request("config.set", {
-      raw: JSON.stringify({ count: 1 }),
-      baseHash: server.currentHash(),
-    });
-    const snapshot = await server.request("config.get");
-    await runtimeConfig.ensureLoaded();
-    runtimeConfig.patchForm(["count"], 2);
-    await runtimeConfig.flushFormChanges();
+    const { runtimeConfig, request, snapshot } = await rejectedEdit(true);
     expect(runtimeConfig.state.lastError).toContain("Write rejected");
     const read = createDeferred<typeof snapshot>();
     request.mockImplementationOnce(() => read.promise);

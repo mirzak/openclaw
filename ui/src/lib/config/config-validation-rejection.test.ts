@@ -1,20 +1,23 @@
 // @vitest-environment node
-import { GatewayProtocolClient } from "@openclaw/gateway-client/browser";
+
 import { expect, it, vi } from "vitest";
 import { createDeferred as deferred } from "../../../../test/helpers/promise.js";
-import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
+import { GatewayRequestError } from "../../api/gateway.ts";
+import { configTransport, loadedConfig } from "./config-suite.test-support.ts";
 import { createConfigCapabilityHarness, createConfigServerMock } from "./config-test-harness.ts";
 
 const issues = [{ path: "count", message: "Expected number, received string" }];
+const rejectionMessage = "invalid config: count: Expected number, received string";
+const persisted = { issues, persistedConfig: { config: { count: 2 }, hash: "hash-2" } };
 
 async function validationError(
   overrides: ConstructorParameters<typeof GatewayRequestError>[0] = {
     code: "INVALID_REQUEST",
-    message: "invalid config: count: Expected number, received string",
+    message: rejectionMessage,
     details: { issues },
   },
 ) {
-  const transport = new GatewayProtocolClient<Record<string, never>>({
+  const transport = configTransport({
     createSocket: (handlers) => ({
       isOpen: () => true,
       close: () => undefined,
@@ -24,17 +27,6 @@ async function validationError(
       },
     }),
     createRequestId: () => "validation-rejection",
-    createRequestError: (error) =>
-      new GatewayRequestError({
-        code: error.code ?? "UNAVAILABLE",
-        message: error.message ?? "request failed",
-        details: error.details,
-      }),
-    buildConnectPlan: () => ({}),
-    buildConnectParams: (plan) => plan,
-    resolveClose: () => ({ retry: false, notify: false }),
-    handshake: { mode: "require-challenge", timeoutMs: 100 },
-    reconnect: { initialMs: 10, multiplier: 2, maxMs: 100 },
   });
   transport.start();
   try {
@@ -59,10 +51,7 @@ it.each(["save", "apply", "patch"] as const)(
       }
       return server.request(method === "config.patch" ? "config.set" : method, params);
     });
-    const { runtimeConfig } = createConfigCapabilityHarness(
-      request as GatewayBrowserClient["request"],
-    );
-    await runtimeConfig.ensureLoaded();
+    const { runtimeConfig } = await loadedConfig(request);
     const original = runtimeConfig.state.configSnapshot;
     if (operation !== "patch") {
       runtimeConfig.patchForm(["count"], "invalid");
@@ -117,9 +106,7 @@ it.each(["unchanged", "saved"] as const)(
       }
       return server.request(method, params);
     });
-    const { runtimeConfig } = createConfigCapabilityHarness(
-      request as GatewayBrowserClient["request"],
-    );
+    const { runtimeConfig } = createConfigCapabilityHarness(request);
     let opening: Promise<void> | undefined;
     try {
       await runtimeConfig.ensureLoaded();
@@ -182,21 +169,8 @@ it.each([
     { issues, publication: "complete", rollbackStatus: "unknown" },
     "error",
   ],
-  [
-    "persisted write",
-    "INVALID_REQUEST",
-    "runtime apply failed",
-    { issues, persistedConfig: { config: { count: 2 }, hash: "hash-2" } },
-    "error",
-  ],
-  [
-    "uncertain retry",
-    "INVALID_REQUEST",
-    "invalid config: count: Expected number, received string",
-    { issues },
-    "error",
-    true,
-  ],
+  ["persisted write", "INVALID_REQUEST", "runtime apply failed", persisted, "error"],
+  ["uncertain retry", "INVALID_REQUEST", rejectionMessage, { issues }, "error", true],
 ] as const)(
   "keeps %s failures out of the validation notice",
   async (_label, code, message, details, status, previousUncertain?: boolean) => {
@@ -212,10 +186,7 @@ it.each([
       }
       return server.request(method, params);
     });
-    const { runtimeConfig } = createConfigCapabilityHarness(
-      request as GatewayBrowserClient["request"],
-    );
-    await runtimeConfig.ensureLoaded();
+    const { runtimeConfig } = await loadedConfig(request);
     runtimeConfig.patchForm(["count"], 2);
     await expect(runtimeConfig.save()).resolves.toBe(false);
     if (previousUncertain) {
@@ -245,10 +216,7 @@ it.each(["read", "schema", "open"])(
       }
       return server.request(method, params);
     });
-    const { runtimeConfig } = createConfigCapabilityHarness(
-      request as GatewayBrowserClient["request"],
-    );
-    await runtimeConfig.ensureLoaded();
+    const { runtimeConfig } = await loadedConfig(request);
     runtimeConfig.patchForm(["count"], "invalid");
     await runtimeConfig.save();
     expect(runtimeConfig.state.configAutoSaveStatus).toBe("rejected");
