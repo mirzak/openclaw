@@ -742,15 +742,14 @@ describe.skipIf(!connection)("Doctor PostgreSQL version migration", () => {
           await lock!.run(() => capture.admit());
           // Keep the registered DDL and predecessor resolution; add observable
           // candidate writes to prove rollback restores retained rows and allocation.
+          const migrationWithCandidateWrites = {
+            ...migration,
+            sql: `${migration.sql}
+              UPDATE cache_entries SET value_json = '"after"' WHERE scope = 'fixture';
+              SELECT nextval('context_engine_turn_outbox_enqueue_sequence_seq');`,
+          };
           agentEngineSchema.postgresMigrations = candidate.postgresMigrations!.map((step) =>
-            step === migration
-              ? {
-                  ...step,
-                  sql: `${step.sql}
-                    UPDATE cache_entries SET value_json = '"after"' WHERE scope = 'fixture';
-                    SELECT nextval('context_engine_turn_outbox_enqueue_sequence_seq');`,
-                }
-              : step,
+            step === migration ? migrationWithCandidateWrites : step,
           );
           if (!foreignWrite) {
             expect(() =>

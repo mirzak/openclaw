@@ -301,7 +301,7 @@ export async function loadAgentPortDescriptor(
         postData: withLegacyAgentPostgresWriteLayout(descriptor.postData),
         expectedCatalog: catalog.map((fact) =>
           fact.table === "transcript_event_identities" && fact.kind === "indexes"
-            ? { ...fact, value: 5 }
+            ? { table: fact.table, kind: fact.kind, value: 5 }
             : fact,
         ),
         inspectSqliteSource: undefined,
