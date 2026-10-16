@@ -3,7 +3,6 @@ import { beginSessionWorkAdmission } from "../sessions/session-lifecycle-admissi
 import { createDeferredCore } from "../shared/deferred.js";
 import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import { closeStateDatabaseForTest } from "../test-utils/database-cleanup.js";
-import { disposeSessionReadContexts } from "./server-methods/sessions-read-cache.test-support.js";
 import { loadGatewayWorkerEnvironmentStartupState } from "./server-worker-environment-startup.js";
 import { loadSessionEntryAsync } from "./session-entry-load.test-support.js";
 import { embeddedRunMock, writeSessionStore } from "./test-helpers.js";
@@ -19,6 +18,7 @@ import {
   setupGatewaySessionsHandlerTestHarness,
 } from "./test/server-sessions.test-helpers.js";
 import { createWorkerInferenceDrainService } from "./worker-environments/inference-control.test-helpers.js";
+import { LOCAL_PLACEMENT } from "./worker-environments/placement-dispatch-coordinator.test-support.js";
 import { REQUEST } from "./worker-environments/placement-dispatch-test-fixtures.js";
 import { createHarness } from "./worker-environments/placement-dispatch-test-harness.js";
 import type { WorkerSessionPlacementReader } from "./worker-environments/placement-projector.js";
@@ -33,36 +33,21 @@ import { executeLocalTurn } from "./worker-environments/worker-turn-admission.js
 
 const { createSessionStoreDir, seedActiveMainSession } = setupGatewaySessionsHandlerTestHarness();
 
-afterEach(async () => {
-  await disposeSessionReadContexts();
-  await closeStateDatabaseForTest();
-});
+afterEach(closeStateDatabaseForTest);
 
 function placementRecord(
   sessionId: string,
   state: "active" | "local" | "failed" | "reclaimed",
   sessionKey = "agent:main:worker-session",
 ): WorkerSessionPlacementRecord {
+  const { profileId: _dispatchProfileId, ...local } = LOCAL_PLACEMENT;
   const identity = {
+    ...local,
     sessionId,
-    agentId: "main",
     sessionKey,
-    executionMode: "worker-turn" as const,
-    turnClaim: null,
-    createdAtMs: 1,
     updatedAtMs: 2,
     stateChangedAtMs: 2,
-    lastTranscriptAckCursor: null,
-    lastLiveEventAckCursor: null,
-    recoveryError: null,
-    terminalReason: null,
-    terminalAtMs: null,
     generation: 0,
-    environmentId: null,
-    activeOwnerEpoch: null,
-    workspaceBaseManifestRef: null,
-    remoteWorkspaceDir: null,
-    workerBundleHash: null,
   };
   if (state === "local") {
     return { ...identity, state };
@@ -179,10 +164,7 @@ function sequencedPlacementService(
   records: readonly WorkerSessionPlacementRecord[],
   retire: WorkerSessionPlacementRetirementService["retireSessionPlacement"] = () => {},
 ) {
-  return {
-    ...sequencedPlacementReader(records),
-    retireSessionPlacement: vi.fn(retire),
-  };
+  return { ...sequencedPlacementReader(records), retireSessionPlacement: vi.fn(retire) };
 }
 
 test.each([
@@ -427,9 +409,7 @@ test("sessions.delete retains failed placement when worker cleanup is unavailabl
   ]);
 
   const deleted = await placementReq("sessions.delete", sessionKey, {
-    workerEnvironmentService: {
-      get: () => ({ state: "failed", leaseId: "lease-1" }),
-    } as never,
+    workerEnvironmentService: { get: () => ({ state: "failed", leaseId: "lease-1" }) } as never,
     workerSessionPlacementService: placementService,
   });
 
@@ -679,11 +659,7 @@ test.each(["worker-turn", "remote-exec"] as const)(
     );
     const deleted = await placementReq("sessions.delete", REQUEST.sessionKey, {
       workerEnvironmentService: createWorkerInferenceDrainService(
-        () => ({
-          drained: Promise.resolve(),
-          hasWork: () => false,
-          release,
-        }),
+        () => ({ drained: Promise.resolve(), hasWork: () => false, release }),
         harness.environments,
       ),
       workerPlacementDispatchService: harness.service,

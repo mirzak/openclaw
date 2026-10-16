@@ -3,7 +3,7 @@ import {
   createPluginRegistryFixture,
   registerVirtualTestPlugin,
 } from "openclaw/plugin-sdk/plugin-test-contracts";
-import { afterEach, describe, expect, onTestFinished, test, vi } from "vitest";
+import { afterEach, expect, onTestFinished, test, vi } from "vitest";
 import type { WebSocket } from "ws";
 import {
   buildGatewayConnectAuth,
@@ -90,7 +90,8 @@ function proxyAuth(identityScopes?: GatewayAuthConfig["identityScopes"]): Gatewa
 
 async function configureGatewayAuth(
   auth: GatewayAuthConfig,
-  options?: { tailscaleMode?: "serve"; roles?: GatewayOperatorRolesConfig },
+  roles?: GatewayOperatorRolesConfig,
+  tailscale = false,
 ): Promise<void> {
   testState.gatewayAuth = auth;
   testState.gatewayControlUi = { allowedOrigins: [BROWSER_ORIGIN] };
@@ -98,16 +99,14 @@ async function configureGatewayAuth(
     gateway: {
       auth,
       trustedProxies: ["127.0.0.1"],
-      ...(options?.tailscaleMode ? { tailscale: { mode: options.tailscaleMode } } : {}),
-      ...(options?.roles ? { roles: options.roles } : {}),
+      ...(tailscale ? { tailscale: { mode: "serve" } } : {}),
+      ...(roles ? { roles } : {}),
       controlUi: { allowedOrigins: [BROWSER_ORIGIN] },
     },
   });
 }
 
-function responseAuth(
-  response: Awaited<ReturnType<typeof connectReq>>,
-): HelloOk["auth"] | undefined {
+function responseAuth(response: Connected): HelloOk["auth"] | undefined {
   return (response.payload as HelloOk | undefined)?.auth;
 }
 
@@ -153,17 +152,6 @@ async function withIdentityServer(
   await withGatewayServer(({ port, server }) => run(identityConnections(port, server)));
 }
 
-async function withVerifiedIdentity(
-  run: IdentityRun,
-  options: ConnectOptions = {},
-  headers: Parameters<typeof openWs>[1] = TRUSTED_PROXY_HEADERS,
-) {
-  await withIdentityServer(async ({ connect }) => {
-    const { ws, connected } = await connect(options, headers);
-    await run(ws, connected);
-  });
-}
-
 function expectScopes(connected: Connected, scopes: string[]) {
   expect(connected.ok, JSON.stringify(connected.error)).toBe(true);
   expect(responseAuth(connected)?.scopes).toEqual(scopes);
@@ -182,7 +170,8 @@ function configureTailscale(
 ) {
   return configureGatewayAuth(
     { mode: "token", token: "secret", allowTailscale: true, ...auth },
-    { tailscaleMode: "serve", roles },
+    roles,
+    true,
   );
 }
 
@@ -287,537 +276,473 @@ function gitHubTailscalePeople(
   };
 }
 
-describe("gateway identity scope grants", () => {
-  test("denies missing person access, retires grant or alias authority, and preserves staff", async () => {
-    await configureGatewayAuth(proxyAuth(), {
-      roles: {
-        default: "reader",
-        definitions: {
-          reader: {
-            accessPolicyPlugin: "person-access",
-            ...role(["operator.read"]),
-          },
-          staff: role(["operator.admin"], "write"),
-        },
-      },
-    });
-    setUserProfileRole(ensureProfileForEmail("staff@example.com").id, "staff");
-    const { config, registry } = createPluginRegistryFixture();
-    let grant: AbortController | undefined;
-    registerVirtualTestPlugin({
-      registry,
-      config,
-      id: "person-access",
-      name: "Person access",
-      register(api) {
-        api.registerGatewayAccessPolicy({
-          authorize({ profile }) {
-            if (profile.assignedRole === "staff") {
-              return undefined;
-            }
-            const current = grant;
-            if (!current) {
-              throw new Error("An active grant is required");
-            }
-            return { signal: current.signal, assertCurrent: () => current.signal.throwIfAborted() };
-          },
-        });
-      },
-    });
-    setTestPluginRegistry(registry.registry);
-    await withIdentityServer(async ({ connect: connectIdentity }) => {
-      const connect = (email: string) => {
-        return connectIdentity({}, { ...TRUSTED_PROXY_HEADERS, "x-forwarded-user": email });
-      };
-      const accessPolicies = getTestPluginRegistry().gatewayAccessPolicies;
-      const registeredPolicies = [...accessPolicies];
-      try {
-        grant = new AbortController();
-        accessPolicies.length = 0;
-        expect((await connect("visitor@example.com")).connected).toMatchObject({
-          ok: false,
-          error: { code: "FORBIDDEN", details: { code: "OPERATOR_ACCESS_DENIED" } },
-        });
-        const staff = await connect("staff@example.com");
-        expect(staff.connected.ok).toBe(true);
-        accessPolicies.push(...registeredPolicies);
-        grant = undefined;
-        expect((await connect("visitor@example.com")).connected).toMatchObject({
-          ok: false,
-          error: { code: "FORBIDDEN", details: { code: "OPERATOR_ACCESS_DENIED" } },
-        });
-        grant = new AbortController();
-        const guest = await connect("visitor@example.com");
-        expect(guest.connected.ok).toBe(true);
-        expect((await rpcReq(guest.ws, "status")).ok).toBe(true);
-        grant.abort(new Error("Grant expired"));
-        expect(await waitForWsClose(guest.ws, 1_000)).toBe(true);
-        expect((await rpcReq(staff.ws, "status")).ok).toBe(true);
-        expect((await connect("visitor@example.com")).connected.ok).toBe(false);
-
-        grant = new AbortController();
-        const person = ensureProfileForEmail("visitor@example.com");
-        linkEmail("retained@example.com", person.id);
-        const replacement = ensureProfileForEmail("replacement@example.com");
-        const aliasGuest = await connect("visitor@example.com");
-        expect(aliasGuest.connected.ok).toBe(true);
-        setDisplayName(person.id, "Updated visitor");
-        linkEmail("added@example.com", person.id);
-        expect((await rpcReq(aliasGuest.ws, "status")).ok).toBe(true);
-
-        const closed = waitForWsClose(aliasGuest.ws, 1_000);
-        linkEmail("visitor@example.com", replacement.id);
-        linkEmail("visitor@example.com", person.id);
-        expect(await closed).toBe(true);
-        expect(grant.signal.aborted).toBe(false);
-        expect((await rpcReq(staff.ws, "status")).ok).toBe(true);
-        expect((await connect("visitor@example.com")).connected.ok).toBe(true);
-      } finally {
-        accessPolicies.splice(0, accessPolicies.length, ...registeredPolicies);
-      }
-    });
+test("denies missing person access, retires grant or alias authority, and preserves staff", async () => {
+  await configureGatewayAuth(proxyAuth(), {
+    default: "reader",
+    definitions: {
+      reader: { accessPolicyPlugin: "person-access", ...role(["operator.read"]) },
+      staff: role(["operator.admin"], "write"),
+    },
   });
-
-  test.each([
-    roleCase("unassigned default guest", undefined, READ_WRITE),
-    roleCase("admin-only without identity grants", "admin-only", NARROW_SCOPES, NARROW_SCOPES, []),
-    roleCase("read-only from an admin-only identity grant", "read-only", ["operator.read"], []),
-    roleCase("empty", "denied", [], NARROW_SCOPES),
-  ])("applies the $label role ceiling after device and identity grants", async (scenario) => {
-    const identityScopes = scenario.identityScopes;
-    await configureGatewayAuth(proxyAuth({ "admin@example.com": identityScopes }), {
-      roles: {
-        default: "guest",
-        definitions: {
-          guest: role(READ_WRITE),
-          "admin-only": role(["operator.admin"], "write"),
-          "read-only": role(["operator.read"]),
-          denied: role([], "none", []),
+  setUserProfileRole(ensureProfileForEmail("staff@example.com").id, "staff");
+  const { config, registry } = createPluginRegistryFixture();
+  let grant: AbortController | undefined;
+  registerVirtualTestPlugin({
+    registry,
+    config,
+    id: "person-access",
+    name: "Person access",
+    register(api) {
+      api.registerGatewayAccessPolicy({
+        authorize({ profile }) {
+          if (profile.assignedRole === "staff") {
+            return undefined;
+          }
+          const current = grant;
+          if (!current) {
+            throw new Error("An active grant is required");
+          }
+          return { signal: current.signal, assertCurrent: () => current.signal.throwIfAborted() };
         },
-      },
-    });
-    const profile = ensureProfileForEmail("admin@example.com");
-    if (scenario.assignedRole) {
-      setUserProfileRole(profile.id, scenario.assignedRole);
-    }
-
-    await withIdentityServer(async ({ connect }) => {
-      const { ws, connected } = await connect({
-        scopes: scenario.deviceScopes,
-        deviceIdentityPath: deviceIdentityPath(`identity-role-${scenario.label}`),
-      });
-      try {
-        expectScopes(connected, scenario.expectedScopes);
-        expect((await rpcReq(ws, "status")).ok).toBe(scenario.expectedScopes.length > 0);
-        if (scenario.assignedRole === "read-only") {
-          await expectWriteDenied(ws, "agent:main:denied");
-        }
-        expect(responseAuth(connected)?.deviceToken).toBe(undefined);
-        expect((await rpcReq(ws, "set-heartbeats", { enabled: false })).ok).toBe(false);
-        if (!scenario.assignedRole) {
-          const upgrade = await rpcReq(ws, "device.scopes.requestUpgrade", {
-            scopes: ["operator.read", "operator.write", "operator.admin"],
-          });
-          expect(upgrade).toMatchObject({
-            ok: false,
-            error: {
-              code: "INVALID_REQUEST",
-              message: expect.stringContaining("assigned operator role"),
-            },
-          });
-        }
-        if (scenario.assignedRole === "admin-only") {
-          const { ws: admin, connected: adminConnected } = await connect({
-            scopes: ["operator.admin"],
-            deviceIdentityPath: deviceIdentityPath("scope-upgrade-approver"),
-          });
-          expect(adminConnected.ok).toBe(true);
-          expect(responseAuth(adminConnected)?.deviceToken).toBeUndefined();
-          const registration = await rpcReq<{ requestId: string }>(
-            ws,
-            "device.scopes.requestUpgrade",
-            { scopes: UPGRADE_SCOPES },
-          );
-          expect(registration.ok).toBe(true);
-          const requestId = registration.payload?.requestId;
-          expect(requestId).toBeTypeOf("string");
-          expect((await rpcReq(admin, "device.pair.approve", { requestId })).ok).toBe(true);
-          const result = await rpcReq<{ deviceToken: string }>(ws, "device.scopes.waitUpgrade", {
-            requestId,
-          });
-          expect(result).toMatchObject({
-            ok: true,
-            payload: {
-              status: "approved",
-              scopes: [...UPGRADE_SCOPES, "operator.talk"].toSorted(),
-            },
-          });
-          expect(result.payload?.deviceToken).toBeTypeOf("string");
-          expect((await rpcReq(ws, "set-heartbeats", { enabled: false })).ok).toBe(false);
-        }
-      } finally {
-        invalidateOperatorRolePolicy(profile.id);
-      }
-    });
-  });
-
-  test("lets the shared-token owner manage accounts across device-token reconnects", async () => {
-    const auth = { mode: "token", token: "secret" } satisfies GatewayAuthConfig;
-    await configureGatewayAuth(auth);
-    const identityPath = deviceIdentityPath(`model-account-owner-${auth.mode}`);
-    await withIdentityServer(async ({ connect }) => {
-      let deviceToken: string | undefined;
-      let authProfileId: string | undefined;
-      for (const reconnect of [false, true]) {
-        const { ws, connected } = await connect(
-          {
-            skipDefaultAuth: reconnect,
-            ...(reconnect ? { deviceToken } : {}),
-            prePairDevice: !reconnect,
-            scopes: READ_WRITE,
-            deviceIdentityPath: identityPath,
-          },
-          { origin: BROWSER_ORIGIN },
-        );
-        expect(connected.ok, JSON.stringify(connected.error)).toBe(true);
-        await expectProfile(ws, GATEWAY_OWNER_PROFILE_ID);
-        if (!reconnect) {
-          deviceToken = (connected.payload as HelloOk).auth.deviceToken;
-          expect(deviceToken).toBeTypeOf("string");
-          authProfileId = connectUserModelAccount({
-            ownerProfileId: GATEWAY_OWNER_PROFILE_ID,
-            credential: { type: "api_key", provider: "anthropic", key: "synthetic-owner-key" },
-            assertCurrent() {},
-          }).authProfileId;
-        }
-        const cleared = await rpcReq(ws, "users.unlinkAuthProfile", {
-          profileId: GATEWAY_OWNER_PROFILE_ID,
-          provider: "anthropic",
-        });
-        expect(cleared.ok, JSON.stringify(cleared.error)).toBe(true);
-        await expectPayload(ws, "users.listModelAccounts", {
-          profileId: GATEWAY_OWNER_PROFILE_ID,
-          accounts: [{ authProfileId, provider: "anthropic", selected: false }],
-          links: [],
-        });
-        await expectPayload(
-          ws,
-          "users.selectModelAccount",
-          { links: [{ authProfileId, provider: "anthropic" }] },
-          { authProfileId },
-        );
-        await expectPayload(ws, "users.listModelAccounts", {
-          accounts: [expect.objectContaining({ authProfileId, selected: true })],
-        });
-        ws.close();
-        expect(await waitForWsClose(ws, 1_000)).toBe(true);
-      }
-    });
-  });
-
-  test("does not cap shared-secret clients without a durable profile", async () => {
-    await configureGatewayAuth(
-      { mode: "token", token: "secret" },
-      {
-        roles: { default: "guest", definitions: { guest: role(["operator.read"], "none", []) } },
-      },
-    );
-
-    await withIdentityServer(async ({ connect }) => {
-      const identityPath = deviceIdentityPath("identity-role-shared-secret");
-      const options = { scopes: READ_WRITE, deviceIdentityPath: identityPath };
-      const headers = { origin: BROWSER_ORIGIN };
-      const { connected } = await connect(
-        {
-          ...options,
-          skipDefaultAuth: false,
-          token: "secret",
-        },
-        headers,
-      );
-      expectScopes(connected, READ_WRITE);
-      const deviceToken = responseAuth(connected)?.deviceToken;
-      expect(deviceToken).toBeTypeOf("string");
-      const { connected: rejected } = await connect(
-        {
-          ...options,
-          prePairDevice: false,
-          deviceToken,
-        },
-        headers,
-      );
-      expect(rejected).toMatchObject({
-        ok: false,
-        error: { message: expect.stringContaining("verified user identity") },
-      });
-    });
-  });
-
-  test("adds a case-insensitive trusted-proxy email grant without changing pairing", async () => {
-    await configureGatewayAuth(proxyAuth(ADMIN_GRANT));
-    const identityPath = deviceIdentityPath("identity-scope-device");
-    const identity = loadOrCreateDeviceIdentity({ path: identityPath });
-    const configuredWorkspace = tempDirs.make("openclaw-identity-workspace-");
-    const outsideWorkspace = tempDirs.make("openclaw-identity-outside-");
-    testState.agentConfig = { workspace: configuredWorkspace };
-
-    try {
-      await withVerifiedIdentity(
-        async (ws, connected) => {
-          expectScopes(connected, ["operator.write", "operator.admin"]);
-          expect((await rpcReq(ws, "set-heartbeats", { enabled: false })).ok).toBe(true);
-          const browse = await rpcReq<{ path?: string }>(ws, "fs.listDir", {
-            path: outsideWorkspace,
-          });
-          expect(browse, JSON.stringify(browse.error)).toMatchObject({
-            ok: true,
-            payload: { path: outsideWorkspace },
-          });
-        },
-        { scopes: ["operator.write"], deviceIdentityPath: identityPath },
-        {
-          ...TRUSTED_PROXY_HEADERS,
-          "x-forwarded-user": "Admin@Example.com",
-        },
-      );
-    } finally {
-      testState.agentConfig = undefined;
-    }
-
-    await expectUnchangedPairing(identity.deviceId, ["operator.write"]);
-  });
-
-  test.each([
-    { configuredIdentity: "peter", verifiedIdentity: "peter", expectedAdmin: true },
-    { configuredIdentity: "Peter", verifiedIdentity: "peter", expectedAdmin: false },
-  ])(
-    "matches a verified Tailscale identity exactly ($configuredIdentity)",
-    async ({ configuredIdentity, verifiedIdentity, expectedAdmin }) => {
-      await configureTailscale({ identityScopes: { [configuredIdentity]: ["operator.admin"] } });
-      testTailscaleWhois.value = { login: verifiedIdentity, name: "Peter" };
-
-      await withIdentityServer(async ({ tailscale }) => {
-        const { connected } = await tailscale(verifiedIdentity);
-        expectScopes(
-          connected,
-          expectedAdmin ? ["operator.read", "operator.admin"] : ["operator.read"],
-        );
       });
     },
-  );
-
-  test.each([
-    {
-      authentication: "verified person with cached device auth",
-      token: undefined,
-      usesTailscaleIdentity: true,
-    },
-    {
-      authentication: "explicit shared-token authority",
-      token: "secret",
-      usesTailscaleIdentity: false,
-    },
-  ])("preserves $authentication on a second Tailscale connection", async (scenario) => {
-    await configureTailscale();
-    const login = "cached-person@example.com";
-    testTailscaleWhois.value = { login, name: "Cached Person" };
-    const identityPath = deviceIdentityPath("identity-tailscale-reconnect");
-    const identity = loadOrCreateDeviceIdentity({ path: identityPath });
-
-    await withIdentityServer(async ({ server, tailscale }) => {
-      const endpoint = tailscaleEndpoint(server);
-      const cacheKey = {
-        gatewayScope: `ws://${endpoint.host}:${endpoint.port}`,
-        deviceId: identity.deviceId,
-        role: "operator",
-      };
-      const options = { scopes: READ_WRITE, deviceIdentityPath: identityPath };
-      const { ws: initialWs, connected: initial } = await tailscale(login, options);
-      const profileId = await verifiedProfile(initialWs, initial);
-      expect(profileId).toBeTypeOf("string");
-      expect(profileId).not.toBe(GATEWAY_OWNER_PROFILE_ID);
-      const initialAuth = (initial.payload as HelloOk).auth;
-      if (!initialAuth.deviceToken) {
-        throw new Error("expected a Gateway-issued device token");
-      }
-      seedOriginDeviceToken({
-        ...cacheKey,
-        token: initialAuth.deviceToken,
-        scopes: initialAuth.scopes,
-      });
-      initialWs.close();
-      expect(await waitForWsClose(initialWs, 1_000)).toBe(true);
-
-      const cached = await loadOriginDeviceToken(cacheKey);
-      if (!cached) {
-        throw new Error("expected the first connection's cached device token");
-      }
-      const auth = buildGatewayConnectAuth(
-        selectGatewayConnectAuth({
-          token: scenario.token,
-          storedToken: cached.token,
-          storedScopes: cached.scopes,
-        }),
-      );
-      const { ws, connected } = await tailscale(login, {
-        ...options,
-        ...auth,
-        prePairDevice: false,
-      });
-      expect(connected.ok, JSON.stringify(connected.error)).toBe(true);
-      await expectProfile(
-        ws,
-        scenario.usesTailscaleIdentity ? profileId : GATEWAY_OWNER_PROFILE_ID,
-      );
-      ws.close();
-      expect(await waitForWsClose(ws, 1_000)).toBe(true);
-    });
   });
-
-  test("keeps a verified GitHub person signed in while anonymous GitHub quota is exhausted", async () => {
-    await configureTailscale();
-    const github = stubGitHubUserLookups({ ada: { id: 583231, login: "ada" } });
-
-    await withIdentityServer(async (connections) => {
-      const withPerson = gitHubTailscalePeople(connections);
-      const profileId = await withPerson("ada@github", verifiedProfile);
-
-      github.quotaExhausted = true;
-      await withPerson("ada@github", async (ws, connected) => {
-        expect(connected.ok, JSON.stringify(connected.error)).toBe(true);
-        await expectProfile(ws, profileId);
-        expect((await rpcReq(ws, "sessions.list")).ok).toBe(true);
-      });
-      await withPerson("eve@github", async (ws, connected) => {
-        expect(connected.ok, JSON.stringify(connected.error)).toBe(true);
-        for (const method of ["users.self", "sessions.list"]) {
-          const response = await rpcReq(ws, method);
-          expect(response.error, method).toMatchObject(GITHUB_RATE_LIMITED_ERROR);
-        }
-      });
-    });
-    expect(github.requests).toEqual(["/users/ada", "/users/ada"]);
-  });
-
-  test("refuses a reassigned GitHub login's former profile and role while GitHub is rate limiting", async () => {
-    await configureTailscale(
-      {},
-      {
-        default: "guest",
-        definitions: {
-          guest: role(["operator.read"], "none", []),
-          staff: role(READ_WRITE, "write"),
-        },
-      },
-    );
-    const users: Record<string, { id: number; login: string }> = {
-      ada: { id: 583231, login: "ada" },
-      grace: { id: 1001, login: "grace" },
+  setTestPluginRegistry(registry.registry);
+  await withIdentityServer(async ({ connect: connectIdentity }) => {
+    const connect = (email: string) => {
+      return connectIdentity({}, { ...TRUSTED_PROXY_HEADERS, "x-forwarded-user": email });
     };
-    const github = stubGitHubUserLookups(users);
-    const staffProfileIds: string[] = [];
-
-    await withIdentityServer(async (connections) => {
-      const withPerson = gitHubTailscalePeople(connections, READ_WRITE);
-      const profileOf = async (login: string) => {
-        const profileId = await withPerson(login, verifiedProfile);
-        if (!profileId) {
-          throw new Error(`expected a verified profile for ${login}`);
-        }
-        return profileId;
-      };
-      try {
-        const ada = await profileOf("ada@github");
-        const grace = await profileOf("grace@github");
-        for (const profileId of [ada, grace]) {
-          setUserProfileRole(profileId, "staff");
-          staffProfileIds.push(profileId);
-        }
-
-        // ada renames to ada-lovelace, so the profile no longer holds the `ada` login.
-        users["ada-lovelace"] = { id: 583231, login: "ada-lovelace" };
-        expect(await profileOf("ada-lovelace@github")).toBe(ada);
-        // The `grace` login moves to a different GitHub account id.
-        users.grace = { id: 2002, login: "grace" };
-        const graceSuccessor = await profileOf("grace@github");
-        expect(graceSuccessor).not.toBe(grace);
-
-        github.quotaExhausted = true;
-        await withPerson("ada-lovelace@github", async (ws, connected) => {
-          expect(responseAuth(connected)?.scopes).toEqual(READ_WRITE);
-          await expectProfile(ws, ada);
-        });
-        // The renamed-away login is refused at admission, before hello, sessions, or role methods.
-        await withPerson("ada@github", async (ws, connected) => {
-          expect(connected).toMatchObject({ ok: false, error: GITHUB_RATE_LIMITED_ERROR });
-          expect(await waitForWsClose(ws, 1_000)).toBe(true);
-        });
-        // The reassigned login reaches only its new account's guest profile, never the former one.
-        await withPerson("grace@github", async (ws, connected) => {
-          expect(responseAuth(connected)?.scopes).toEqual(["operator.read"]);
-          await expectProfile(ws, graceSuccessor);
-          await expectWriteDenied(ws, "agent:main:x");
-        });
-      } finally {
-        for (const profileId of staffProfileIds) {
-          invalidateOperatorRolePolicy(profileId);
-        }
-      }
-    });
-    expect(github.requests).toEqual([
-      "/users/ada",
-      "/users/grace",
-      "/users/ada-lovelace",
-      "/users/grace",
-      "/users/ada-lovelace",
-    ]);
-  });
-
-  test("caps a broader reconnect before device scope-upgrade comparison", async () => {
-    await configureGatewayAuth(proxyAuth(ADMIN_GRANT));
-    const identityPath = deviceIdentityPath("identity-scope-reconnect-cap");
-    const identity = loadOrCreateDeviceIdentity({ path: identityPath });
-
-    await withIdentityServer(async ({ connect }) => {
-      const { ws: initialWs, connected: initial } = await connect({
-        deviceIdentityPath: identityPath,
+    const accessPolicies = getTestPluginRegistry().gatewayAccessPolicies;
+    const registeredPolicies = [...accessPolicies];
+    try {
+      grant = new AbortController();
+      accessPolicies.length = 0;
+      expect((await connect("visitor@example.com")).connected).toMatchObject({
+        ok: false,
+        error: { code: "FORBIDDEN", details: { code: "OPERATOR_ACCESS_DENIED" } },
       });
-      expect(initial.ok).toBe(true);
-      initialWs.close();
+      const staff = await connect("staff@example.com");
+      expect(staff.connected.ok).toBe(true);
+      accessPolicies.push(...registeredPolicies);
+      grant = undefined;
+      expect((await connect("visitor@example.com")).connected).toMatchObject({
+        ok: false,
+        error: { code: "FORBIDDEN", details: { code: "OPERATOR_ACCESS_DENIED" } },
+      });
+      grant = new AbortController();
+      const guest = await connect("visitor@example.com");
+      expect(guest.connected.ok).toBe(true);
+      expect((await rpcReq(guest.ws, "status")).ok).toBe(true);
+      grant.abort(new Error("Grant expired"));
+      expect(await waitForWsClose(guest.ws, 1_000)).toBe(true);
+      expect((await rpcReq(staff.ws, "status")).ok).toBe(true);
+      expect((await connect("visitor@example.com")).connected.ok).toBe(false);
 
-      const { connected: reconnect } = await connect(
+      grant = new AbortController();
+      const person = ensureProfileForEmail("visitor@example.com");
+      linkEmail("retained@example.com", person.id);
+      const replacement = ensureProfileForEmail("replacement@example.com");
+      const aliasGuest = await connect("visitor@example.com");
+      expect(aliasGuest.connected.ok).toBe(true);
+      setDisplayName(person.id, "Updated visitor");
+      linkEmail("added@example.com", person.id);
+      expect((await rpcReq(aliasGuest.ws, "status")).ok).toBe(true);
+
+      const closed = waitForWsClose(aliasGuest.ws, 1_000);
+      linkEmail("visitor@example.com", replacement.id);
+      linkEmail("visitor@example.com", person.id);
+      expect(await closed).toBe(true);
+      expect(grant.signal.aborted).toBe(false);
+      expect((await rpcReq(staff.ws, "status")).ok).toBe(true);
+      expect((await connect("visitor@example.com")).connected.ok).toBe(true);
+    } finally {
+      accessPolicies.splice(0, accessPolicies.length, ...registeredPolicies);
+    }
+  });
+});
+
+test.each([
+  roleCase("unassigned default guest", undefined, READ_WRITE),
+  roleCase("admin-only without identity grants", "admin-only", NARROW_SCOPES, NARROW_SCOPES, []),
+  roleCase("read-only from an admin-only identity grant", "read-only", ["operator.read"], []),
+  roleCase("empty", "denied", [], NARROW_SCOPES),
+])("applies the $label role ceiling after device and identity grants", async (scenario) => {
+  await configureGatewayAuth(proxyAuth({ "admin@example.com": scenario.identityScopes }), {
+    default: "guest",
+    definitions: {
+      guest: role(READ_WRITE),
+      "admin-only": role(["operator.admin"], "write"),
+      "read-only": role(["operator.read"]),
+      denied: role([], "none", []),
+    },
+  });
+  const profile = ensureProfileForEmail("admin@example.com");
+  if (scenario.assignedRole) {
+    setUserProfileRole(profile.id, scenario.assignedRole);
+  }
+
+  await withIdentityServer(async ({ connect }) => {
+    const { ws, connected } = await connect({ scopes: scenario.deviceScopes });
+    try {
+      expectScopes(connected, scenario.expectedScopes);
+      expect((await rpcReq(ws, "status")).ok).toBe(scenario.expectedScopes.length > 0);
+      if (scenario.assignedRole === "read-only") {
+        await expectWriteDenied(ws, "agent:main:denied");
+      }
+      expect(responseAuth(connected)?.deviceToken).toBe(undefined);
+      expect((await rpcReq(ws, "set-heartbeats", { enabled: false })).ok).toBe(false);
+      if (!scenario.assignedRole) {
+        const upgrade = await rpcReq(ws, "device.scopes.requestUpgrade", {
+          scopes: ["operator.read", "operator.write", "operator.admin"],
+        });
+        expect(upgrade).toMatchObject({
+          ok: false,
+          error: {
+            code: "INVALID_REQUEST",
+            message: expect.stringContaining("assigned operator role"),
+          },
+        });
+      }
+      if (scenario.assignedRole === "admin-only") {
+        const { ws: admin, connected: adminConnected } = await connect({
+          scopes: ["operator.admin"],
+        });
+        expect(adminConnected.ok).toBe(true);
+        expect(responseAuth(adminConnected)?.deviceToken).toBeUndefined();
+        const registration = await rpcReq<{ requestId: string }>(
+          ws,
+          "device.scopes.requestUpgrade",
+          { scopes: UPGRADE_SCOPES },
+        );
+        expect(registration.ok).toBe(true);
+        const requestId = registration.payload?.requestId;
+        expect(requestId).toBeTypeOf("string");
+        expect((await rpcReq(admin, "device.pair.approve", { requestId })).ok).toBe(true);
+        const result = await rpcReq<{ deviceToken: string }>(ws, "device.scopes.waitUpgrade", {
+          requestId,
+        });
+        expect(result).toMatchObject({
+          ok: true,
+          payload: { status: "approved", scopes: [...UPGRADE_SCOPES, "operator.talk"].toSorted() },
+        });
+        expect(result.payload?.deviceToken).toBeTypeOf("string");
+        expect((await rpcReq(ws, "set-heartbeats", { enabled: false })).ok).toBe(false);
+      }
+    } finally {
+      invalidateOperatorRolePolicy(profile.id);
+    }
+  });
+});
+
+test("lets the shared-token owner manage accounts across device-token reconnects", async () => {
+  await configureGatewayAuth({ mode: "token", token: "secret" });
+  const identityPath = deviceIdentityPath("model-account-owner");
+  await withIdentityServer(async ({ connect }) => {
+    let deviceToken: string | undefined;
+    let authProfileId: string | undefined;
+    for (const reconnect of [false, true]) {
+      const { ws, connected } = await connect(
         {
-          prePairDevice: false,
+          skipDefaultAuth: reconnect,
+          ...(reconnect ? { deviceToken } : {}),
+          prePairDevice: !reconnect,
           scopes: READ_WRITE,
           deviceIdentityPath: identityPath,
         },
-        {
-          ...TRUSTED_PROXY_HEADERS,
-          "x-openclaw-scopes": "operator.read",
-        },
+        { origin: BROWSER_ORIGIN },
       );
-      expectScopes(reconnect, ["operator.read"]);
-    });
+      expect(connected.ok, JSON.stringify(connected.error)).toBe(true);
+      await expectProfile(ws, GATEWAY_OWNER_PROFILE_ID);
+      if (!reconnect) {
+        deviceToken = (connected.payload as HelloOk).auth.deviceToken;
+        expect(deviceToken).toBeTypeOf("string");
+        authProfileId = connectUserModelAccount({
+          ownerProfileId: GATEWAY_OWNER_PROFILE_ID,
+          credential: { type: "api_key", provider: "anthropic", key: "synthetic-owner-key" },
+          assertCurrent() {},
+        }).authProfileId;
+      }
+      const cleared = await rpcReq(ws, "users.unlinkAuthProfile", {
+        profileId: GATEWAY_OWNER_PROFILE_ID,
+        provider: "anthropic",
+      });
+      expect(cleared.ok, JSON.stringify(cleared.error)).toBe(true);
+      await expectPayload(ws, "users.listModelAccounts", {
+        profileId: GATEWAY_OWNER_PROFILE_ID,
+        accounts: [{ authProfileId, provider: "anthropic", selected: false }],
+        links: [],
+      });
+      await expectPayload(
+        ws,
+        "users.selectModelAccount",
+        { links: [{ authProfileId, provider: "anthropic" }] },
+        { authProfileId },
+      );
+      await expectPayload(ws, "users.listModelAccounts", {
+        accounts: [expect.objectContaining({ authProfileId, selected: true })],
+      });
+      ws.close();
+      expect(await waitForWsClose(ws, 1_000)).toBe(true);
+    }
+  });
+});
 
-    await expectUnchangedPairing(identity.deviceId, ["operator.read"]);
+test("does not cap shared-secret clients without a durable profile", async () => {
+  await configureGatewayAuth(
+    { mode: "token", token: "secret" },
+    { default: "guest", definitions: { guest: role(["operator.read"], "none", []) } },
+  );
+
+  await withIdentityServer(async ({ connect }) => {
+    const identityPath = deviceIdentityPath("identity-role-shared-secret");
+    const options = { scopes: READ_WRITE, deviceIdentityPath: identityPath };
+    const headers = { origin: BROWSER_ORIGIN };
+    const { connected } = await connect(
+      { ...options, skipDefaultAuth: false, token: "secret" },
+      headers,
+    );
+    expectScopes(connected, READ_WRITE);
+    const deviceToken = responseAuth(connected)?.deviceToken;
+    expect(deviceToken).toBeTypeOf("string");
+    const { connected: rejected } = await connect(
+      { ...options, prePairDevice: false, deviceToken },
+      headers,
+    );
+    expect(rejected).toMatchObject({
+      ok: false,
+      error: { message: expect.stringContaining("verified user identity") },
+    });
+  });
+});
+
+test("adds a case-insensitive trusted-proxy email grant without changing pairing", async () => {
+  await configureGatewayAuth(proxyAuth(ADMIN_GRANT));
+  const identityPath = deviceIdentityPath("identity-scope-device");
+  const identity = loadOrCreateDeviceIdentity({ path: identityPath });
+  const configuredWorkspace = tempDirs.make("openclaw-identity-workspace-");
+  const outsideWorkspace = tempDirs.make("openclaw-identity-outside-");
+  testState.agentConfig = { workspace: configuredWorkspace };
+
+  try {
+    await withIdentityServer(async ({ connect }) => {
+      const { ws, connected } = await connect(
+        { scopes: ["operator.write"], deviceIdentityPath: identityPath },
+        { ...TRUSTED_PROXY_HEADERS, "x-forwarded-user": "Admin@Example.com" },
+      );
+      expectScopes(connected, ["operator.write", "operator.admin"]);
+      expect((await rpcReq(ws, "set-heartbeats", { enabled: false })).ok).toBe(true);
+      const browse = await rpcReq<{ path?: string }>(ws, "fs.listDir", {
+        path: outsideWorkspace,
+      });
+      expect(browse, JSON.stringify(browse.error)).toMatchObject({
+        ok: true,
+        payload: { path: outsideWorkspace },
+      });
+    });
+  } finally {
+    testState.agentConfig = undefined;
+  }
+
+  await expectUnchangedPairing(identity.deviceId, ["operator.write"]);
+});
+
+test.each<[string, OperatorScope[]]>([
+  ["peter", ["operator.read", "operator.admin"]],
+  ["Peter", ["operator.read"]],
+])(
+  "matches verified Tailscale identity peter exactly (%s)",
+  async (configuredIdentity, expectedScopes) => {
+    await configureTailscale({ identityScopes: { [configuredIdentity]: ["operator.admin"] } });
+    testTailscaleWhois.value = { login: "peter", name: "Peter" };
+
+    await withIdentityServer(async ({ tailscale }) => {
+      const { connected } = await tailscale("peter");
+      expectScopes(connected, expectedScopes);
+    });
+  },
+);
+
+test.each<[string, string | undefined, boolean]>([
+  ["verified person with cached device auth", undefined, true],
+  ["explicit shared-token authority", "secret", false],
+])("preserves %s on a second Tailscale connection", async (_authentication, token, usePerson) => {
+  await configureTailscale();
+  const login = "cached-person@example.com";
+  testTailscaleWhois.value = { login, name: "Cached Person" };
+  const identityPath = deviceIdentityPath("identity-tailscale-reconnect");
+  const identity = loadOrCreateDeviceIdentity({ path: identityPath });
+
+  await withIdentityServer(async ({ server, tailscale }) => {
+    const endpoint = tailscaleEndpoint(server);
+    const cacheKey = {
+      gatewayScope: `ws://${endpoint.host}:${endpoint.port}`,
+      deviceId: identity.deviceId,
+      role: "operator",
+    };
+    const options = { scopes: READ_WRITE, deviceIdentityPath: identityPath };
+    const { ws: initialWs, connected: initial } = await tailscale(login, options);
+    const profileId = await verifiedProfile(initialWs, initial);
+    expect(profileId).toBeTypeOf("string");
+    expect(profileId).not.toBe(GATEWAY_OWNER_PROFILE_ID);
+    const initialAuth = (initial.payload as HelloOk).auth;
+    if (!initialAuth.deviceToken) {
+      throw new Error("expected a Gateway-issued device token");
+    }
+    seedOriginDeviceToken({
+      ...cacheKey,
+      token: initialAuth.deviceToken,
+      scopes: initialAuth.scopes,
+    });
+    initialWs.close();
+    expect(await waitForWsClose(initialWs, 1_000)).toBe(true);
+
+    const cached = await loadOriginDeviceToken(cacheKey);
+    if (!cached) {
+      throw new Error("expected the first connection's cached device token");
+    }
+    const auth = buildGatewayConnectAuth(
+      selectGatewayConnectAuth({ token, storedToken: cached.token, storedScopes: cached.scopes }),
+    );
+    const { ws, connected } = await tailscale(login, { ...options, ...auth, prePairDevice: false });
+    expect(connected.ok, JSON.stringify(connected.error)).toBe(true);
+    await expectProfile(ws, usePerson ? profileId : GATEWAY_OWNER_PROFILE_ID);
+    ws.close();
+    expect(await waitForWsClose(ws, 1_000)).toBe(true);
+  });
+});
+
+test("keeps a verified GitHub person signed in while anonymous GitHub quota is exhausted", async () => {
+  await configureTailscale();
+  const github = stubGitHubUserLookups({ ada: { id: 583231, login: "ada" } });
+
+  await withIdentityServer(async (connections) => {
+    const withPerson = gitHubTailscalePeople(connections);
+    const profileId = await withPerson("ada@github", verifiedProfile);
+
+    github.quotaExhausted = true;
+    await withPerson("ada@github", async (ws, connected) => {
+      expect(connected.ok, JSON.stringify(connected.error)).toBe(true);
+      await expectProfile(ws, profileId);
+      expect((await rpcReq(ws, "sessions.list")).ok).toBe(true);
+    });
+    await withPerson("eve@github", async (ws, connected) => {
+      expect(connected.ok, JSON.stringify(connected.error)).toBe(true);
+      for (const method of ["users.self", "sessions.list"]) {
+        const response = await rpcReq(ws, method);
+        expect(response.error, method).toMatchObject(GITHUB_RATE_LIMITED_ERROR);
+      }
+    });
+  });
+  expect(github.requests).toEqual(["/users/ada", "/users/ada"]);
+});
+
+test("refuses a reassigned GitHub login's former profile and role while GitHub is rate limiting", async () => {
+  await configureTailscale(
+    {},
+    {
+      default: "guest",
+      definitions: { guest: role(["operator.read"], "none", []), staff: role(READ_WRITE, "write") },
+    },
+  );
+  const users: Record<string, { id: number; login: string }> = {
+    ada: { id: 583231, login: "ada" },
+    grace: { id: 1001, login: "grace" },
+  };
+  const github = stubGitHubUserLookups(users);
+  const staffProfileIds: string[] = [];
+
+  await withIdentityServer(async (connections) => {
+    const withPerson = gitHubTailscalePeople(connections, READ_WRITE);
+    const profileOf = async (login: string) => {
+      const profileId = await withPerson(login, verifiedProfile);
+      if (!profileId) {
+        throw new Error(`expected a verified profile for ${login}`);
+      }
+      return profileId;
+    };
+    try {
+      const ada = await profileOf("ada@github");
+      const grace = await profileOf("grace@github");
+      for (const profileId of [ada, grace]) {
+        setUserProfileRole(profileId, "staff");
+        staffProfileIds.push(profileId);
+      }
+
+      users["ada-lovelace"] = { id: 583231, login: "ada-lovelace" };
+      expect(await profileOf("ada-lovelace@github")).toBe(ada);
+      users.grace = { id: 2002, login: "grace" };
+      const graceSuccessor = await profileOf("grace@github");
+      expect(graceSuccessor).not.toBe(grace);
+
+      github.quotaExhausted = true;
+      await withPerson("ada-lovelace@github", async (ws, connected) => {
+        expect(responseAuth(connected)?.scopes).toEqual(READ_WRITE);
+        await expectProfile(ws, ada);
+      });
+      // The renamed-away login is refused at admission, before hello, sessions, or role methods.
+      await withPerson("ada@github", async (ws, connected) => {
+        expect(connected).toMatchObject({ ok: false, error: GITHUB_RATE_LIMITED_ERROR });
+        expect(await waitForWsClose(ws, 1_000)).toBe(true);
+      });
+      // The reassigned login reaches only its new account's guest profile, never the former one.
+      await withPerson("grace@github", async (ws, connected) => {
+        expect(responseAuth(connected)?.scopes).toEqual(["operator.read"]);
+        await expectProfile(ws, graceSuccessor);
+        await expectWriteDenied(ws, "agent:main:x");
+      });
+    } finally {
+      staffProfileIds.forEach(invalidateOperatorRolePolicy);
+    }
+  });
+  expect(github.requests).toEqual([
+    "/users/ada",
+    "/users/grace",
+    "/users/ada-lovelace",
+    "/users/grace",
+    "/users/ada-lovelace",
+  ]);
+});
+
+test("caps a broader reconnect before device scope-upgrade comparison", async () => {
+  await configureGatewayAuth(proxyAuth(ADMIN_GRANT));
+  const identityPath = deviceIdentityPath("identity-scope-reconnect-cap");
+  const identity = loadOrCreateDeviceIdentity({ path: identityPath });
+
+  await withIdentityServer(async ({ connect }) => {
+    const { ws: initialWs, connected: initial } = await connect({
+      deviceIdentityPath: identityPath,
+    });
+    expect(initial.ok).toBe(true);
+    initialWs.close();
+
+    const { connected: reconnect } = await connect(
+      { prePairDevice: false, scopes: READ_WRITE, deviceIdentityPath: identityPath },
+      { ...TRUSTED_PROXY_HEADERS, "x-openclaw-scopes": "operator.read" },
+    );
+    expectScopes(reconnect, ["operator.read"]);
   });
 
-  test.each<[string, GatewayAuthConfig, ConnectOptions, string[]]>([
-    ["clears device-less scopes", proxyAuth(ADMIN_GRANT), { device: null }, ["operator.admin"]],
-    [
-      "ignores unauthenticated headers",
-      { mode: "none", identityScopes: ADMIN_GRANT },
-      {},
-      ["operator.read"],
-    ],
-    [
-      "withholds node scopes",
-      proxyAuth(ADMIN_GRANT),
-      { role: "node", scopes: [], client: NODE_CLIENT, browserOrigin: undefined },
-      [],
-    ],
-  ])("%s", async (_label, auth, options, scopes) => {
-    await configureGatewayAuth(auth);
-    await withVerifiedIdentity(async (_ws, connected) => expectScopes(connected, scopes), options);
+  await expectUnchangedPairing(identity.deviceId, ["operator.read"]);
+});
+
+test.each<[string, GatewayAuthConfig, ConnectOptions, string[]]>([
+  ["clears device-less scopes", proxyAuth(ADMIN_GRANT), { device: null }, ["operator.admin"]],
+  [
+    "ignores unauthenticated headers",
+    { mode: "none", identityScopes: ADMIN_GRANT },
+    {},
+    ["operator.read"],
+  ],
+  [
+    "withholds node scopes",
+    proxyAuth(ADMIN_GRANT),
+    { role: "node", scopes: [], client: NODE_CLIENT, browserOrigin: undefined },
+    [],
+  ],
+])("%s", async (_label, auth, options, scopes) => {
+  await configureGatewayAuth(auth);
+  await withIdentityServer(async ({ connect }) => {
+    const { connected } = await connect(options);
+    expectScopes(connected, scopes);
   });
 });
