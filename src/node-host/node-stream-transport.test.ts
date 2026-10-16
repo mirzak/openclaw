@@ -40,6 +40,15 @@ async function close(server: net.Server | WebSocketServer) {
     server.close(() => resolve());
   });
 }
+async function connectTarget(port: number) {
+  const socket = net.connect(port, "127.0.0.1");
+  await once(socket, "connect");
+  return socket;
+}
+function scheduleTimer(callback: () => void, delayMs: number) {
+  const timer = setTimeout(callback, delayMs);
+  return () => clearTimeout(timer);
+}
 function targetStream() {
   return new Duplex({
     read() {},
@@ -47,6 +56,42 @@ function targetStream() {
       callback();
     },
   });
+}
+async function streamHarness(server: net.Server, target = targetStream()) {
+  const gatewayUrl = `ws://127.0.0.1:${await listenServer(server)}`;
+  const controller = new AbortController();
+  return {
+    target,
+    controller,
+    run: (options: Partial<StreamOptions> = {}) =>
+      runStream({ gatewayUrl, target: { stream: target }, signal: controller.signal, ...options }),
+    async cleanup() {
+      controller.abort();
+      target.destroy();
+      await close(server);
+    },
+  };
+}
+async function websocketHarness(onConnection?: (ws: WebSocket) => void, target?: Duplex) {
+  const server = createHttpServer();
+  const wss = new WebSocketServer({ server });
+  if (onConnection) {
+    wss.on("connection", onConnection);
+  }
+  const harness = await streamHarness(server, target);
+  return {
+    ...harness,
+    wss,
+    async cleanup() {
+      harness.controller.abort();
+      harness.target.destroy();
+      for (const client of wss.clients) {
+        client.terminate();
+      }
+      await close(wss);
+      await harness.cleanup();
+    },
+  };
 }
 // Raw peers deliberately leave the websocket/TCP close handshake incomplete.
 function rawGateway(onFrame: (socket: net.Socket) => void, onPeer?: (socket: net.Socket) => void) {
@@ -76,9 +121,7 @@ function rawGateway(onFrame: (socket: net.Socket) => void, onPeer?: (socket: net
         .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
         .digest("base64");
       socket.write(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
-          accept +
-          "\r\n\r\n",
+        `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
       );
       upgraded = true;
       if (!onPeer && buffer.length > headerEnd + 4) {
@@ -86,6 +129,34 @@ function rawGateway(onFrame: (socket: net.Socket) => void, onPeer?: (socket: net
       }
     });
   });
+}
+async function rawFrameHarness(frame: number[], onPeer?: (socket: net.Socket) => void) {
+  let peer: net.Socket | undefined;
+  let sent = false;
+  const harness = await streamHarness(
+    rawGateway(
+      (socket) => {
+        if (!sent) {
+          sent = true;
+          socket.write(Buffer.from(frame));
+        }
+      },
+      (socket) => {
+        peer = socket;
+        onPeer?.(socket);
+      },
+    ),
+  );
+  return {
+    ...harness,
+    destroyPeer: () => peer?.destroy(),
+    async cleanup() {
+      harness.controller.abort();
+      harness.target.destroy();
+      peer?.destroy();
+      await harness.cleanup();
+    },
+  };
 }
 
 const fingerprint = new X509Certificate(TEST_TLS_CERT_PEM).fingerprint256;
@@ -138,10 +209,7 @@ describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) =>
       const listen = async (server: net.Server) => {
         servers.push(server);
         server.on("connection", track);
-        await new Promise<void>((resolve) => {
-          server.listen(0, "127.0.0.1", resolve);
-        });
-        return (server.address() as AddressInfo).port;
+        return listenServer(server);
       };
       const localPort = await listen(
         net.createServer((socket) => {
@@ -209,12 +277,7 @@ describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) =>
         target:
           streamName === "portal"
             ? { port: localPort }
-            : {
-                stream: await new Promise<net.Socket>((resolve, reject) => {
-                  const socket = net.connect(localPort, "127.0.0.1", () => resolve(socket));
-                  socket.once("error", reject);
-                }),
-              },
+            : { stream: await connectTarget(localPort) },
         streamName,
         signal: controller.signal,
       }).catch((error: unknown) => {
@@ -227,7 +290,6 @@ describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) =>
           } else {
             await expect.poll(() => frames).toEqual([JSON.stringify({ ok: true }), "stream-echo"]);
           }
-          expect(failure).toBeUndefined();
           expect(accessHeaders).toEqual(["fixture-client-secret"]);
           if (closeMode === "owner-abort") {
             controller.abort();
@@ -268,10 +330,9 @@ describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) =>
           expect(failure).toBeUndefined();
           const serialized = JSON.stringify(logCapture.records);
           expect(serialized).not.toContain(ticket);
-          expect(serialized).not.toContain("peer restart");
-          expect(serialized).not.toContain("fixture-client-secret");
-          expect(serialized).not.toContain("stream-echo");
-          expect(serialized).not.toContain("attach?ticket=");
+          expect(serialized).not.toMatch(
+            /peer restart|fixture-client-secret|stream-echo|attach\?ticket=/,
+          );
         } else {
           await expect.poll(() => failure).toBeInstanceOf(Error);
           expect(String(failure)).toMatch(/fingerprint (?:mismatch|unavailable)/i);
@@ -280,9 +341,11 @@ describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) =>
         await running;
         await expect.poll(() => sockets.size).toBe(0);
         if (!correctPin) {
-          expect(bytes).toBe(0);
-          expect(frames).toEqual([]);
-          expect(accessHeaders).toEqual([]);
+          expect({ bytes, frames, accessHeaders }).toEqual({
+            bytes: 0,
+            frames: [],
+            accessHeaders: [],
+          });
         }
         expect(tunnels).toBe(managed ? 1 : 0);
       } finally {
@@ -301,158 +364,125 @@ describe.each([false, true])("node stream TLS (managed proxy: %s)", (managed) =>
   );
 });
 
-describe("node stream startup ownership", () => {
-  it.each([
-    ["malformed URL", { gatewayUrl: "not-a-url" }],
-    ["cross-origin attachment", { attachPath: "ws://example.invalid/node-desktop/attach" }],
-    ["constructor rejects fragment", { attachPath: "/node-desktop/attach#invalid" }],
-    [
-      "constructor rejects header",
-      { gatewayCloudflareAccess: { clientId: "invalid\nheader", clientSecret: "fixture" } },
-    ],
-  ])("closes its connected target when %s fails", async (_name, override) => {
-    const peerClosed = createDeferred();
-    const local = net.createServer((peer) => peer.once("close", () => peerClosed.resolve()));
-    await listenServer(local);
-    const port = (local.address() as AddressInfo).port;
-    const socket = await new Promise<net.Socket>((resolve, reject) => {
-      const connected = net.connect(port, "127.0.0.1", () => resolve(connected));
-      connected.once("error", reject);
-    });
-    try {
-      await expect(
-        runStream({
-          gatewayUrl: "ws://127.0.0.1:1",
-          target: { stream: socket },
-          metadata: { auth: "vnc-password" },
-          signal: new AbortController().signal,
-          ...override,
-        }),
-      ).rejects.toBeInstanceOf(Error);
-      expect(socket.destroyed).toBe(true);
-      await peerClosed.promise;
-    } finally {
-      socket.destroy();
-      await close(local);
-    }
-  });
+it.each([
+  ["malformed URL", { gatewayUrl: "not-a-url" }],
+  ["cross-origin attachment", { attachPath: "ws://example.invalid/node-desktop/attach" }],
+  ["constructor rejects fragment", { attachPath: "/node-desktop/attach#invalid" }],
+  [
+    "constructor rejects header",
+    { gatewayCloudflareAccess: { clientId: "invalid\nheader", clientSecret: "fixture" } },
+  ],
+])("closes its connected target when %s fails", async (_name, override) => {
+  const peerClosed = createDeferred();
+  const local = net.createServer((peer) => peer.once("close", () => peerClosed.resolve()));
+  const port = await listenServer(local);
+  const socket = await connectTarget(port);
+  try {
+    await expect(
+      runStream({
+        gatewayUrl: "ws://127.0.0.1:1",
+        target: { stream: socket },
+        metadata: { auth: "vnc-password" },
+        signal: new AbortController().signal,
+        ...override,
+      }),
+    ).rejects.toBeInstanceOf(Error);
+    expect(socket.destroyed).toBe(true);
+    await peerClosed.promise;
+  } finally {
+    socket.destroy();
+    await close(local);
+  }
 });
-
-describe("node stream EOF with inbound backpressure", () => {
-  it("settles after the target closes before drain", async () => {
-    const streamName = "desktop";
-    const wrote = createDeferred();
-    let writes = 0;
-    const target = new Duplex({
-      highWaterMark: 1,
-      read() {},
-      write(_chunk, _encoding, _callback) {
-        // The target closes with a write pending, so it will never emit drain.
-        writes++;
-        wrote.resolve();
-      },
-    });
-    target.once("end", () => target.destroy());
-    const gateway = createHttpServer();
-    const wss = new WebSocketServer({ server: gateway });
-    const frames: string[] = [];
-    wss.on("connection", (ws) => {
-      ws.on("message", (data) => {
-        frames.push(rawDataToString(data));
-        if (frames.length === 1) {
-          ws.send(Buffer.from("pending-target-write"));
-        } else {
-          ws.send(Buffer.from("late-target-write"));
-        }
-      });
-    });
-    await listenServer(gateway);
-    const controller = new AbortController();
-    let settled = false;
-    const running = runStream({
-      gatewayUrl: `ws://127.0.0.1:${(gateway.address() as AddressInfo).port}`,
-      attachPath: `/node-${streamName}/attach`,
-      expectedAttachPath: `/node-${streamName}/attach`,
-      target: { stream: target },
-      streamName,
-      signal: controller.signal,
-    }).then(() => {
-      settled = true;
-    });
-    try {
-      await wrote.promise;
-      target.push(Buffer.from("terminal-response"));
-      target.push(null);
-      await expect.poll(() => settled).toBe(true);
-      await running;
-      expect(frames).toEqual([JSON.stringify({ ok: true }), "terminal-response"]);
-      expect(writes).toBe(1);
-      expect(target.listenerCount("drain")).toBe(0);
-    } finally {
-      controller.abort();
-      await running;
-      for (const client of wss.clients) {
-        client.terminate();
+it("settles after the target closes before drain", async () => {
+  const wrote = createDeferred();
+  let writes = 0;
+  const target = new Duplex({
+    highWaterMark: 1,
+    read() {},
+    write(_chunk, _encoding, _callback) {
+      // The target closes with a write pending, so it will never emit drain.
+      writes++;
+      wrote.resolve();
+    },
+  });
+  target.once("end", () => target.destroy());
+  const frames: string[] = [];
+  const harness = await websocketHarness((ws) => {
+    ws.on("message", (data) => {
+      frames.push(rawDataToString(data));
+      if (frames.length === 1) {
+        ws.send(Buffer.from("pending-target-write"));
+      } else {
+        ws.send(Buffer.from("late-target-write"));
       }
-      await close(wss);
-      await close(gateway);
-    }
+    });
+  }, target);
+  let settled = false;
+  const running = harness.run().then(() => {
+    settled = true;
   });
+  try {
+    await wrote.promise;
+    target.push(Buffer.from("terminal-response"));
+    target.push(null);
+    await expect.poll(() => settled).toBe(true);
+    await running;
+    expect(frames).toEqual([JSON.stringify({ ok: true }), "terminal-response"]);
+    expect(writes).toBe(1);
+    expect(target.listenerCount("drain")).toBe(0);
+  } finally {
+    harness.controller.abort();
+    await running;
+    await harness.cleanup();
+  }
 });
-
 describe("node stream close acknowledgement", () => {
   it("finishes when the gateway never completes the close handshake", async () => {
     const logCapture = createDiagnosticLogRecordCapture();
     logCaptures.push(logCapture);
     const gotFrame = createDeferred();
     const gateway = rawGateway(() => gotFrame.resolve());
-    await listenServer(gateway);
-    const gatewayPort = (gateway.address() as AddressInfo).port;
+    const harness = await streamHarness(gateway);
     let targetPeer: net.Socket | undefined;
     const targetServer = net.createServer((peer) => {
       targetPeer = peer;
     });
-    await listenServer(targetServer);
-    const targetPort = (targetServer.address() as AddressInfo).port;
+    const targetPort = await listenServer(targetServer);
     const closedLog = createDeferred();
     const stopClosedLog = onInternalDiagnosticEvent((event) => {
       if (event.type === "log.record" && event.message === "node stream closed") {
         closedLog.resolve();
       }
     });
-    const controller = new AbortController();
     let failure: unknown;
     let ack: (() => void) | undefined;
-    let markAckArmed: () => void = () => {};
-    const ackArmed = new Promise<void>((resolve) => {
-      markAckArmed = resolve;
-    });
-    const running = runStream({
-      gatewayUrl: `ws://127.0.0.1:${gatewayPort}`,
-      attachPath: `/node-desktop/attach?ticket=${ticket}`,
-      target: { port: targetPort },
-      signal: controller.signal,
-      closeAckMs: 40,
-      scheduleCloseAck: (callback, delayMs) => {
-        if (delayMs === 40) {
-          ack = callback;
-          markAckArmed();
-          return () => {
-            if (ack === callback) {
-              ack = undefined;
-            }
-          };
-        }
-        const timer = setTimeout(callback, delayMs);
-        return () => clearTimeout(timer);
-      },
-    }).catch((error: unknown) => {
-      failure = error;
-    });
+    const ackArmed = createDeferred();
+    const running = harness
+      .run({
+        attachPath: `/node-desktop/attach?ticket=${ticket}`,
+        target: { port: targetPort },
+        closeAckMs: 40,
+        scheduleCloseAck: (callback, delayMs) => {
+          if (delayMs === 40) {
+            ack = callback;
+            ackArmed.resolve();
+            return () => {
+              if (ack === callback) {
+                ack = undefined;
+              }
+            };
+          }
+          return scheduleTimer(callback, delayMs);
+        },
+      })
+      .catch((error: unknown) => {
+        failure = error;
+      });
     try {
       await gotFrame.promise;
       targetPeer?.end();
-      await ackArmed;
+      await ackArmed.promise;
       ack?.();
       await running;
       expect(failure).toBeUndefined();
@@ -466,60 +496,44 @@ describe("node stream close acknowledgement", () => {
         closeCode: 1006,
       });
     } finally {
-      controller.abort();
+      harness.controller.abort();
       await running;
       targetPeer?.destroy();
       await close(targetServer);
-      await close(gateway);
+      await harness.cleanup();
       stopClosedLog();
     }
   });
 
   async function expectFlushBudget(payload: Buffer) {
-    const gateway = createHttpServer();
-    const wss = new WebSocketServer({ server: gateway });
     let receivedSevens = 0;
     const received = createDeferred();
-    wss.on("connection", (ws) => {
+    const harness = await websocketHarness((ws) => {
       ws.on("message", (data, isBinary) => {
         if (!isBinary) {
           return;
         }
-        const buffer = Array.isArray(data)
-          ? Buffer.concat(data)
-          : data instanceof ArrayBuffer
-            ? Buffer.from(new Uint8Array(data))
-            : data;
-        for (const byte of buffer) {
-          if (byte === 7) {
-            receivedSevens += 1;
-          }
-        }
+        receivedSevens += rawDataToString(data, "latin1").split("\x07").length - 1;
         if (receivedSevens >= payload.length) {
           received.resolve();
         }
       });
     });
-    await listenServer(gateway);
     const connected = createDeferred<net.Socket>();
     const targetServer = net.createServer((peer) => {
       connected.resolve(peer);
     });
-    await listenServer(targetServer);
+    const targetPort = await listenServer(targetServer);
     const delays: number[] = [];
-    const controller = new AbortController();
-    const running = runStream({
-      gatewayUrl: `ws://127.0.0.1:${(gateway.address() as AddressInfo).port}`,
-      target: { port: (targetServer.address() as AddressInfo).port },
-      signal: controller.signal,
+    const running = harness.run({
+      target: { port: targetPort },
       closeAckMs: 40,
       scheduleCloseAck: (callback, delayMs) => {
         delays.push(delayMs);
         if (delayMs >= 30_000) {
           return () => undefined;
         }
-        const timer = setTimeout(callback, delayMs);
-        return () => clearTimeout(timer);
+        return scheduleTimer(callback, delayMs);
       },
     });
     let targetPeer: net.Socket | undefined;
@@ -528,52 +542,39 @@ describe("node stream close acknowledgement", () => {
       targetPeer.write(payload);
       targetPeer.end();
       await received.promise;
-      for (const client of wss.clients) {
+      for (const client of harness.wss.clients) {
         client.close();
       }
       await running;
-      expect(delays.includes(40)).toBe(false);
+      expect(delays).not.toContain(40);
       expect(delays).not.toContain(5_000);
       expect(receivedSevens).toBe(payload.length);
     } finally {
-      controller.abort();
+      harness.controller.abort();
       await running;
       targetPeer?.destroy();
       await close(targetServer);
-      for (const client of wss.clients) {
-        client.terminate();
-      }
-      await close(wss);
-      await close(gateway);
+      await harness.cleanup();
     }
   }
 
-  it("waits out a small forward instead of the short close acknowledgement", async () => {
-    await expectFlushBudget(Buffer.alloc(1024, 7));
-  });
-
-  it("waits out a large forward instead of the short close acknowledgement", async () => {
-    await expectFlushBudget(Buffer.alloc(200 * 1024, 7));
-  });
+  it.each([1024, 200 * 1024])(
+    "waits out a %i-byte forward instead of the short close acknowledgement",
+    async (size) => {
+      await expectFlushBudget(Buffer.alloc(size, 7));
+    },
+  );
 
   it("bounds websocket cleanup when the gateway sends a text frame", async () => {
-    const gateway = createHttpServer();
-    const wss = new WebSocketServer({ server: gateway });
     let gatewaySocket: { send: (data: string) => void } | undefined;
-    wss.on("connection", (ws) => {
+    const harness = await websocketHarness((ws) => {
       gatewaySocket = ws;
     });
-    await listenServer(gateway);
-    const target = targetStream();
     const delays: number[] = [];
     const cleanups: Array<() => void> = [];
-    const controller = new AbortController();
     try {
       await expect(
-        runStream({
-          gatewayUrl: `ws://127.0.0.1:${(gateway.address() as AddressInfo).port}`,
-          target: { stream: target },
-          signal: controller.signal,
+        harness.run({
           emitStatus: async (status) => {
             if (status.includes("attached")) {
               gatewaySocket?.send("not-binary");
@@ -591,32 +592,19 @@ describe("node stream close acknowledgement", () => {
       for (const cleanup of cleanups) {
         cleanup();
       }
-      controller.abort();
-      target.destroy();
-      for (const client of wss.clients) {
-        client.terminate();
-      }
-      await close(wss);
-      await close(gateway);
+      await harness.cleanup();
     }
   });
 
   it("completes a drained forward when the gateway acknowledges close", async () => {
-    const gateway = createHttpServer();
-    const wss = new WebSocketServer({ server: gateway });
-    wss.on("connection", (ws) => {
+    const harness = await websocketHarness((ws) => {
       ws.on("message", () => undefined);
     });
-    await listenServer(gateway);
-    const target = targetStream();
+    const { target } = harness;
     target.on("end", () => target.destroy());
     const delays: number[] = [];
-    const controller = new AbortController();
     try {
-      await runStream({
-        gatewayUrl: `ws://127.0.0.1:${(gateway.address() as AddressInfo).port}`,
-        target: { stream: target },
-        signal: controller.signal,
+      await harness.run({
         emitStatus: async (status) => {
           if (status.includes("attached")) {
             target.push(Buffer.alloc(64, 7));
@@ -625,90 +613,41 @@ describe("node stream close acknowledgement", () => {
         },
         scheduleCloseAck: (callback, delayMs) => {
           delays.push(delayMs);
-          const timer = setTimeout(callback, delayMs);
-          return () => clearTimeout(timer);
+          return scheduleTimer(callback, delayMs);
         },
       });
       expect(delays).not.toContain(5_000);
       expect(delays).not.toContain(30_000);
     } finally {
-      controller.abort();
-      target.destroy();
-      for (const client of wss.clients) {
-        client.terminate();
-      }
-      await close(wss);
-      await close(gateway);
+      await harness.cleanup();
     }
   });
 
   it("rejects a protocol error without a node handshake timer", async () => {
-    let peer: net.Socket | undefined;
-    let sentInvalidFrame = false;
-    const gateway = rawGateway(
-      (socket) => {
-        if (!sentInvalidFrame) {
-          sentInvalidFrame = true;
-          socket.write(Buffer.from([0x83, 0x00]));
-        }
-      },
-      (socket) => {
-        peer = socket;
-      },
-    );
-    await listenServer(gateway);
-    const target = targetStream();
-    const controller = new AbortController();
+    const harness = await rawFrameHarness([0x83, 0x00]);
     const started = Date.now();
     try {
-      await expect(
-        runStream({
-          gatewayUrl: `ws://127.0.0.1:${(gateway.address() as AddressInfo).port}`,
-          target: { stream: target },
-          signal: controller.signal,
-        }),
-      ).rejects.toThrow(/invalid opcode 3/);
+      await expect(harness.run()).rejects.toThrow(/invalid opcode 3/);
       expect(Date.now() - started).toBeLessThan(2_000);
     } finally {
-      controller.abort();
-      target.destroy();
-      peer?.destroy();
-      await close(gateway);
+      await harness.cleanup();
     }
   });
 
   it("closes the client when a gateway close withholds TCP FIN", async () => {
-    let peer: net.Socket | undefined;
     const receivedFin = createDeferred();
-    let sentClose = false;
-    const gateway = rawGateway(
-      (socket) => {
-        if (!sentClose) {
-          sentClose = true;
-          socket.write(Buffer.from([0x88, 0x02, 0x03, 0xe8]));
-        }
-      },
-      (socket) => {
-        peer = socket;
-        socket.once("end", () => receivedFin.resolve());
-      },
-    );
-    await listenServer(gateway);
-    const target = targetStream();
+    const harness = await rawFrameHarness([0x88, 0x02, 0x03, 0xe8], (socket) => {
+      socket.once("end", () => receivedFin.resolve());
+    });
     const closeSpy = vi.spyOn(WebSocket.prototype, "close");
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const controller = new AbortController();
     let failure: unknown;
-    const running = runStream({
-      gatewayUrl: `ws://127.0.0.1:${(gateway.address() as AddressInfo).port}`,
-      target: { stream: target },
-      signal: controller.signal,
-    }).catch((error: unknown) => {
+    const running = harness.run().catch((error: unknown) => {
       failure = error;
     });
     try {
       await receivedFin.promise;
-      expect(target.readableEnded).toBe(false);
+      expect(harness.target.readableEnded).toBe(false);
       const client = closeSpy.mock.contexts[0];
       if (!(client instanceof WebSocket)) {
         throw new Error("Expected a client WebSocket close handshake");
@@ -720,13 +659,13 @@ describe("node stream close acknowledgement", () => {
       await running;
       expect(failure).toBeUndefined();
     } finally {
-      controller.abort();
-      target.destroy();
-      peer?.destroy();
+      harness.controller.abort();
+      harness.target.destroy();
+      harness.destroyPeer();
       await running;
       closeSpy.mockRestore();
       vi.useRealTimers();
-      await close(gateway);
+      await harness.cleanup();
     }
   });
 });
