@@ -35,17 +35,15 @@ function summaryFacts(source: SessionActivitySummaryBatchResult) {
   if (!source) {
     throw new Error("Expected a complete activity summary batch");
   }
+  const { snapshot, page, ...rest } = source;
   return {
-    ...source,
+    ...rest,
     snapshot: {
-      totalMessages: source.snapshot.totalMessages,
-      activeLeafEntryId: source.snapshot.activeLeafEntryId,
-      generation: source.snapshot.snapshot.generation,
+      totalMessages: snapshot.totalMessages,
+      activeLeafEntryId: snapshot.activeLeafEntryId,
+      generation: snapshot.snapshot.generation,
     },
-    page: {
-      events: source.page.events.map(({ event }) => event),
-      scannedMessages: source.page.scannedMessages,
-    },
+    page: { events: page.events.map(({ event }) => event), scannedMessages: page.scannedMessages },
   };
 }
 
@@ -166,15 +164,11 @@ it("reuses complete actor context with the worker's byte bounds, anchors and rol
           { ...previous(1), formatRevision: ACTIVITY_SUMMARY_FORMAT_REVISION },
           { covered: 1, omitted: true },
         ],
-        [
+        ...[
           { ...previous(1), generation: "obsolete" },
-          { previous: undefined, covered: 0 },
-        ],
-        [
           { ...previous(1), leafEntryId: "off-path" },
-          { previous: undefined, covered: 0 },
-        ],
-        [previous(events.length + 1), { previous: undefined, covered: 0 }],
+          previous(events.length + 1),
+        ].map((invalid) => [invalid, { previous: undefined, covered: 0 }] as const),
       ] as const) {
         const input = { scope: f.scope, previous: prior };
         const resident = summaryFacts(readActivitySummaryBatchFromReplica(input));

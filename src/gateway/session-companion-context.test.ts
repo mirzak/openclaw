@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { observeHostDataSql } from "../../test/helpers/sqlite-statement-execution-counter.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import {
@@ -64,6 +64,22 @@ const persist = (
   messages: Parameters<typeof persistSessionTranscriptTurn>[1]["messages"],
 ) => persistSessionTranscriptTurn(scope, { messages, touchSessionEntry: true });
 
+const ready = (scope: ReturnType<typeof createScope>, messages: unknown[]) => ({
+  kind: "ready",
+  context: { empty: messages.length === 0, messages, sessionId: scope.sessionId },
+});
+const compact = (scope: ReturnType<typeof createScope>, details?: { payload: string }) =>
+  appendTranscriptEvent(scope, {
+    type: "compaction",
+    id: "compaction",
+    parentId: "retained",
+    timestamp: "2026-08-11T00:00:00.000Z",
+    summary: "older context was compacted",
+    firstKeptEntryId: "retained",
+    tokensBefore: 100,
+    ...(details ? { details } : {}),
+  });
+
 async function readReady(scope: ReturnType<typeof createScope>) {
   const result = await defaultSessionCompanionContextReader.read(scope);
   expect(result.kind).toBe("ready");
@@ -73,371 +89,317 @@ async function readReady(scope: ReturnType<typeof createScope>) {
   return result.context.messages;
 }
 
-describe("session companion context", () => {
-  it("reads replaced session identities without host SQL", async () => {
-    const scope = createScope("companion-context-identity");
-    for (const sessionId of [scope.sessionId, `${scope.sessionId}-replacement`]) {
-      await upsertSessionEntryCore(scope, { sessionId, updatedAt: 1 });
-      const hostSql = observeHostDataSql();
-      try {
-        await expect(defaultSessionCompanionContextReader.currentSessionId(scope)).resolves.toBe(
-          sessionId,
-        );
-        expect(hostSql.queries).toEqual([]);
-      } finally {
-        hostSql.restore();
-      }
-    }
-  });
-
-  it.each(
-    [false, true].flatMap((warm) =>
-      (["reset", "dispose", "request-abort", "backing-reset"] as const).map((cancellation) => ({
-        warm,
-        cancellation,
-      })),
-    ),
-  )(
-    "cancels $cancellation before prepared context resumes (warm=$warm)",
-    async ({ warm, cancellation }) => {
-      const scope = await seedScope(`companion-cancel-${cancellation}-${warm}`);
-      const run = vi.fn(async () => "Existing answer.");
-      const service = createSessionCompanion({
-        scheduler: createTestGatewayScheduler(),
-        getConfig: () => ({}),
-        contextReader: defaultSessionCompanionContextReader,
-        sessionObserver: {
-          getCompanionSnapshotAsync: async () => ({ agentId: "main", notes: [] }),
-        },
-        resolveUtilityModelRef: () => "openai/gpt-5.6-luna",
-        run,
-        now: () => 123,
-      });
-      const request = {
-        agentId: scope.agentId,
-        sessionKey: scope.sessionKey,
-        question: "Why?",
-        connId: "conn-1",
-      };
-      try {
-        if (warm) {
-          await service.ask(request);
-        }
-        const controller = new AbortController();
-        const pending = service
-          .ask({ ...request, signal: controller.signal })
-          .catch((error: unknown) => error);
-        if (cancellation === "reset") {
-          service.reset(request);
-        } else if (cancellation === "dispose") {
-          service.dispose();
-        } else if (cancellation === "backing-reset") {
-          notifyGatewaySessionReset(scope.sessionKey, scope.agentId);
-        } else {
-          controller.abort();
-        }
-        await expect(pending).resolves.toMatchObject({
-          reason: cancellation === "backing-reset" ? "context-unavailable" : "unavailable",
-          message:
-            cancellation === "backing-reset"
-              ? "The selected session changed before Side chat could answer."
-              : cancellation === "reset"
-                ? "The Side chat request was cancelled."
-                : "Side chat could not answer right now.",
-        });
-        expect(run).toHaveBeenCalledTimes(warm ? 1 : 0);
-        expect(service.state(request)).toEqual({
-          exchanges:
-            warm && cancellation === "request-abort"
-              ? [{ question: "Why?", answer: "Existing answer.", ts: 123 }]
-              : [],
-        });
-        await new Promise<void>((resolve) => {
-          setImmediate(resolve);
-        });
-      } finally {
-        service.dispose();
-      }
-    },
-  );
-
-  it("distinguishes a missing session from an empty selected transcript", async () => {
-    const scope = createScope("companion-context-empty");
-    await expect(defaultSessionCompanionContextReader.read(scope)).resolves.toEqual({
-      kind: "missing",
-    });
-
-    await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-    const result = await defaultSessionCompanionContextReader.read(scope);
-    expect(result).toEqual({
-      kind: "ready",
-      context: {
-        empty: true,
-        messages: [],
-        sessionId: scope.sessionId,
-      },
-    });
-  });
-
-  it("reads current incognito context without creating missing sessions", async () => {
-    const scope = {
-      ...createScope("companion-memory"),
-      sessionKey: "agent:main:dashboard:incognito-companion",
-    };
-    const location = {
-      agentId: scope.agentId,
-      path: resolveIncognitoOpenClawAgentSqlitePath(scope),
-    };
-    expect(await defaultSessionCompanionContextReader.read(scope)).toEqual({ kind: "missing" });
-    expect(memorySessionActorOwners.read(location)).toBeUndefined();
-    await upsertSessionEntryCore(scope, {
-      sessionId: scope.sessionId,
-      updatedAt: 1,
-      incognito: true,
-    });
-    expect(await defaultSessionCompanionContextReader.currentSessionId(scope)).toBe(
-      scope.sessionId,
-    );
-    for (const [index, text] of ["First question", "Latest question"].entries()) {
-      await persist(scope, [
-        {
-          eventId: `question-${index}`,
-          message: { role: "user", content: text, timestamp: index },
-        },
-      ]);
-      const result = await defaultSessionCompanionContextReader.read(scope);
-      expect(result).toMatchObject({
-        kind: "ready",
-        context: {
-          sessionId: scope.sessionId,
-          messages: expect.arrayContaining([{ role: "user", text, ts: index }]),
-        },
-      });
-    }
-    memorySessionActorOwners.closeDatabase(location);
-    expect(await defaultSessionCompanionContextReader.read(scope)).toEqual({ kind: "missing" });
-    expect(await defaultSessionCompanionContextReader.currentSessionId(scope)).toBeUndefined();
-  });
-
-  it("reads a bounded active SQLite tail without decoding old transcript rows", async () => {
-    const scope = await seedScope("companion-context-tail");
-    const transcript = Array.from({ length: 201 }, (_, index) =>
-      turn(
-        `message-${index}`,
-        index === 0 ? null : `message-${index - 1}`,
-        index % 2 === 0 ? "user" : "assistant",
-        `message ${index}`,
-        index,
-      ),
-    );
-    await persist(scope, transcript);
-
-    const database = openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env });
-    database.db
-      .prepare("UPDATE transcript_events SET event_json = '{' WHERE session_id = ? AND seq = 1")
-      .run(scope.sessionId);
-
-    const messages = await readReady(scope);
-    expect(messages).toHaveLength(40);
-    expect(messages.at(0)).toEqual({
-      role: "assistant",
-      text: "message 161",
-      ts: 161,
-    });
-    expect(messages.at(-1)).toEqual({
-      role: "user",
-      text: "message 200",
-      ts: 200,
-    });
-  });
-
-  it("pages past a tool-heavy tail while retaining the selected session's latest user turn", async () => {
-    const scope = await seedScope("companion-context-tools");
-    const usefulMessages = Array.from({ length: 50 }, (_, index) => ({
-      role: index % 2 === 0 ? ("user" as const) : ("assistant" as const),
-      content: `useful ${index}`,
-      timestamp: index,
-    }));
-    const toolMessages = Array.from({ length: 400 }, (_, index) => ({
-      role: "toolResult" as const,
-      content: `tool result ${index}`,
-      timestamp: usefulMessages.length + index,
-    }));
-    const transcriptMessages = [
-      ...usefulMessages,
-      ...toolMessages,
-      { role: "user" as const, content: "visible latest question", timestamp: 450 },
-    ].map((message, index) => ({
-      eventId: `message-${index}`,
-      parentId: index === 0 ? null : `message-${index - 1}`,
-      message,
-    }));
-    await persist(scope, transcriptMessages);
-
-    const messages = await readReady(scope);
-    expect(messages).toHaveLength(40);
-    expect(messages.at(-1)?.text).toBe("visible latest question");
-    expect(messages.some((message) => message.text.startsWith("tool result"))).toBe(false);
-  });
-
-  it("keeps complete recent context when older tool rows exhaust the scan byte budget", async () => {
-    const scope = await seedScope("companion-context-byte-budget");
-    const recentMessages = Array.from({ length: 128 }, (_, index) =>
-      turn(
-        `recent-${index}`,
-        index === 0 ? "older-tool" : `recent-${index - 1}`,
-        index % 9 === 0 ? "user" : "toolResult",
-        index % 9 === 0 ? `useful ${index}` : "x".repeat(7800),
-        index,
-      ),
-    );
-    const transcript = [
-      turn("older-tool", null, "toolResult", "x".repeat(200_000), -1),
-      ...recentMessages,
-    ];
-    await persist(scope, transcript);
-
-    const messages = await readReady(scope);
-    expect(messages.length).toBeGreaterThan(0);
-    expect(messages.at(-1)?.text).toBe("useful 126");
-    expect(messages.every((message) => message.text.startsWith("useful"))).toBe(true);
-  });
-
-  it.each([
-    { expectedKind: "ready", unsupportedCount: 4095 },
-    { expectedKind: "unavailable", unsupportedCount: 4096 },
-  ] as const)(
-    "fails closed only when unsupported roles exceed the bounded scan ($unsupportedCount)",
-    async ({ expectedKind, unsupportedCount }) => {
-      const scope = await seedScope(`companion-context-unsupported-${unsupportedCount}`);
-      const messages = [
-        turn("visible-user", null, "user", "authoritative question", 1),
-        ...Array.from({ length: unsupportedCount }, (_, index) => ({
-          eventId: `custom-${index}`,
-          parentId: index === 0 ? "visible-user" : `custom-${index - 1}`,
-          message: {
-            role: "custom" as const,
-            customType: "test-context",
-            content: `unsupported ${index}`,
-            timestamp: index + 2,
-          },
-        })),
-      ];
-      await persist(scope, messages);
-
-      const result = await defaultSessionCompanionContextReader.read(scope);
-
-      expect(result.kind).toBe(expectedKind);
-      if (result.kind === "ready") {
-        expect(result.context.messages.map((message) => message.text)).toEqual([
-          "authoritative question",
-        ]);
-      }
-    },
-  );
-
-  it("returns unavailable instead of backfilling past an oversized latest user message", async () => {
-    const scope = await seedScope("companion-context-oversized-latest");
-    await persist(scope, [
-      turn("older", null, "user", "stale older question", 1),
-      turn("oversized", "older", "user", "x".repeat(1024 * 1024), 2),
-    ]);
-
-    await expect(defaultSessionCompanionContextReader.read(scope)).resolves.toEqual({
-      kind: "unavailable",
-    });
-  });
-
-  it("uses the contiguous newest suffix when an older message exceeds the read budget", async () => {
-    const scope = await seedScope("companion-context-oversized-older");
-    await persist(scope, [
-      turn("stale", null, "user", "stale older question", 1),
-      turn("oversized", "stale", "assistant", "x".repeat(1024 * 1024), 2),
-      turn("recent-question", "oversized", "user", "recent question", 3),
-      turn("recent-answer", "recent-question", "assistant", "recent answer", 4),
-    ]);
-
+it("reads replaced session identities without host SQL", async () => {
+  const scope = createScope("companion-context-identity");
+  for (const sessionId of [scope.sessionId, `${scope.sessionId}-replacement`]) {
+    await upsertSessionEntryCore(scope, { sessionId, updatedAt: 1 });
     const hostSql = observeHostDataSql();
-    const result = await defaultSessionCompanionContextReader
-      .read(scope)
-      .finally(() => hostSql.restore());
-    expect(hostSql.queries).toEqual([]);
-    expect(result).toEqual({
+    try {
+      await expect(defaultSessionCompanionContextReader.currentSessionId(scope)).resolves.toBe(
+        sessionId,
+      );
+      expect(hostSql.queries).toEqual([]);
+    } finally {
+      hostSql.restore();
+    }
+  }
+});
+
+it.each(
+  [false, true].flatMap((warm) =>
+    (["reset", "dispose", "request-abort", "backing-reset"] as const).map((cancellation) => ({
+      warm,
+      cancellation,
+    })),
+  ),
+)(
+  "cancels $cancellation before prepared context resumes (warm=$warm)",
+  async ({ warm, cancellation }) => {
+    const scope = await seedScope(`companion-cancel-${cancellation}-${warm}`);
+    const run = vi.fn(async () => "Existing answer.");
+    const service = createSessionCompanion({
+      scheduler: createTestGatewayScheduler(),
+      getConfig: () => ({}),
+      contextReader: defaultSessionCompanionContextReader,
+      sessionObserver: {
+        getCompanionSnapshotAsync: async () => ({ agentId: "main", notes: [] }),
+      },
+      resolveUtilityModelRef: () => "openai/gpt-5.6-luna",
+      run,
+      now: () => 123,
+    });
+    const request = {
+      agentId: scope.agentId,
+      sessionKey: scope.sessionKey,
+      question: "Why?",
+      connId: "conn-1",
+    };
+    try {
+      if (warm) {
+        await service.ask(request);
+      }
+      const controller = new AbortController();
+      const pending = service
+        .ask({ ...request, signal: controller.signal })
+        .catch((error: unknown) => error);
+      if (cancellation === "reset") {
+        service.reset(request);
+      } else if (cancellation === "dispose") {
+        service.dispose();
+      } else if (cancellation === "backing-reset") {
+        notifyGatewaySessionReset(scope.sessionKey, scope.agentId);
+      } else {
+        controller.abort();
+      }
+      await expect(pending).resolves.toMatchObject({
+        reason: cancellation === "backing-reset" ? "context-unavailable" : "unavailable",
+        message:
+          cancellation === "backing-reset"
+            ? "The selected session changed before Side chat could answer."
+            : cancellation === "reset"
+              ? "The Side chat request was cancelled."
+              : "Side chat could not answer right now.",
+      });
+      expect(run).toHaveBeenCalledTimes(warm ? 1 : 0);
+      expect(service.state(request)).toEqual({
+        exchanges:
+          warm && cancellation === "request-abort"
+            ? [{ question: "Why?", answer: "Existing answer.", ts: 123 }]
+            : [],
+      });
+      await new Promise<void>((resolve) => {
+        setImmediate(resolve);
+      });
+    } finally {
+      service.dispose();
+    }
+  },
+);
+
+it("distinguishes a missing session from an empty selected transcript", async () => {
+  const scope = createScope("companion-context-empty");
+  await expect(defaultSessionCompanionContextReader.read(scope)).resolves.toEqual({
+    kind: "missing",
+  });
+
+  await upsertSessionEntryCore(scope, { sessionId: scope.sessionId, updatedAt: 1 });
+  expect(await defaultSessionCompanionContextReader.read(scope)).toEqual(ready(scope, []));
+});
+
+it("reads current incognito context without creating missing sessions", async () => {
+  const scope = {
+    ...createScope("companion-memory"),
+    sessionKey: "agent:main:dashboard:incognito-companion",
+  };
+  const location = {
+    agentId: scope.agentId,
+    path: resolveIncognitoOpenClawAgentSqlitePath(scope),
+  };
+  expect(await defaultSessionCompanionContextReader.read(scope)).toEqual({ kind: "missing" });
+  expect(memorySessionActorOwners.read(location)).toBeUndefined();
+  await upsertSessionEntryCore(scope, {
+    sessionId: scope.sessionId,
+    updatedAt: 1,
+    incognito: true,
+  });
+  expect(await defaultSessionCompanionContextReader.currentSessionId(scope)).toBe(scope.sessionId);
+  for (const [index, text] of ["First question", "Latest question"].entries()) {
+    await persist(scope, [
+      {
+        eventId: `question-${index}`,
+        message: { role: "user", content: text, timestamp: index },
+      },
+    ]);
+    expect(await defaultSessionCompanionContextReader.read(scope)).toMatchObject({
       kind: "ready",
       context: {
-        empty: false,
-        messages: [
-          { role: "user", text: "recent question", ts: 3 },
-          { role: "assistant", text: "recent answer", ts: 4 },
-        ],
         sessionId: scope.sessionId,
+        messages: expect.arrayContaining([{ role: "user", text, ts: index }]),
       },
     });
+  }
+  memorySessionActorOwners.closeDatabase(location);
+  expect(await defaultSessionCompanionContextReader.read(scope)).toEqual({ kind: "missing" });
+  expect(await defaultSessionCompanionContextReader.currentSessionId(scope)).toBeUndefined();
+});
+
+it("reads a bounded active SQLite tail without decoding old transcript rows", async () => {
+  const scope = await seedScope("companion-context-tail");
+  const transcript = Array.from({ length: 201 }, (_, index) =>
+    turn(
+      `message-${index}`,
+      index === 0 ? null : `message-${index - 1}`,
+      index % 2 === 0 ? "user" : "assistant",
+      `message ${index}`,
+      index,
+    ),
+  );
+  await persist(scope, transcript);
+
+  const database = openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env });
+  database.db
+    .prepare("UPDATE transcript_events SET event_json = '{' WHERE session_id = ? AND seq = 1")
+    .run(scope.sessionId);
+
+  const messages = await readReady(scope);
+  expect(messages).toHaveLength(40);
+  expect([messages.at(0), messages.at(-1)]).toEqual([
+    { role: "assistant", text: "message 161", ts: 161 },
+    { role: "user", text: "message 200", ts: 200 },
+  ]);
+});
+
+it("pages past a tool-heavy tail while retaining the selected session's latest user turn", async () => {
+  const scope = await seedScope("companion-context-tools");
+  const transcriptMessages = Array.from({ length: 451 }, (_, index) =>
+    turn(
+      `message-${index}`,
+      index === 0 ? null : `message-${index - 1}`,
+      index === 450 ? "user" : index >= 50 ? "toolResult" : index % 2 ? "assistant" : "user",
+      index === 450
+        ? "visible latest question"
+        : `${index < 50 ? "useful" : "tool result"} ${index}`,
+      index,
+    ),
+  );
+  await persist(scope, transcriptMessages);
+
+  const messages = await readReady(scope);
+  expect(messages).toHaveLength(40);
+  expect(messages.at(-1)?.text).toBe("visible latest question");
+  expect(messages.some((message) => message.text.startsWith("tool result"))).toBe(false);
+});
+
+it("keeps complete recent context when older tool rows exhaust the scan byte budget", async () => {
+  const scope = await seedScope("companion-context-byte-budget");
+  const recentMessages = Array.from({ length: 128 }, (_, index) =>
+    turn(
+      `recent-${index}`,
+      index === 0 ? "older-tool" : `recent-${index - 1}`,
+      index % 9 === 0 ? "user" : "toolResult",
+      index % 9 === 0 ? `useful ${index}` : "x".repeat(7800),
+      index,
+    ),
+  );
+  const transcript = [
+    turn("older-tool", null, "toolResult", "x".repeat(200_000), -1),
+    ...recentMessages,
+  ];
+  await persist(scope, transcript);
+
+  const messages = await readReady(scope);
+  expect(messages.length).toBeGreaterThan(0);
+  expect(messages.at(-1)?.text).toBe("useful 126");
+  expect(messages.every((message) => message.text.startsWith("useful"))).toBe(true);
+});
+
+it.each([
+  { expectedKind: "ready", unsupportedCount: 4095 },
+  { expectedKind: "unavailable", unsupportedCount: 4096 },
+] as const)(
+  "fails closed only when unsupported roles exceed the bounded scan ($unsupportedCount)",
+  async ({ expectedKind, unsupportedCount }) => {
+    const scope = await seedScope(`companion-context-unsupported-${unsupportedCount}`);
+    const messages = [
+      turn("visible-user", null, "user", "authoritative question", 1),
+      ...Array.from({ length: unsupportedCount }, (_, index) => ({
+        eventId: `custom-${index}`,
+        parentId: index === 0 ? "visible-user" : `custom-${index - 1}`,
+        message: {
+          role: "custom" as const,
+          customType: "test-context",
+          content: `unsupported ${index}`,
+          timestamp: index + 2,
+        },
+      })),
+    ];
+    await persist(scope, messages);
+
+    const result = await defaultSessionCompanionContextReader.read(scope);
+
+    expect(result.kind).toBe(expectedKind);
+    if (result.kind === "ready") {
+      expect(result.context.messages.map((message) => message.text)).toEqual([
+        "authoritative question",
+      ]);
+    }
+  },
+);
+
+it("returns unavailable instead of backfilling past an oversized latest user message", async () => {
+  const scope = await seedScope("companion-context-oversized-latest");
+  await persist(scope, [
+    turn("older", null, "user", "stale older question", 1),
+    turn("oversized", "older", "user", "x".repeat(1024 * 1024), 2),
+  ]);
+
+  await expect(defaultSessionCompanionContextReader.read(scope)).resolves.toEqual({
+    kind: "unavailable",
   });
+});
 
-  it("keeps transcript-visible messages across compaction", async () => {
-    const scope = await seedScope("companion-context-compaction");
-    await persist(scope, [
-      turn("discarded", null, "user", "discarded context", 1),
-      turn("retained", "discarded", "user", "retained context", 2),
-    ]);
-    await appendTranscriptEvent(scope, {
-      type: "compaction",
-      id: "compaction",
-      parentId: "retained",
-      timestamp: "2026-08-11T00:00:00.000Z",
-      summary: "older context was compacted",
-      firstKeptEntryId: "retained",
-      tokensBefore: 100,
-    });
-    await persist(scope, [
-      turn("answer", "compaction", "assistant", "recent answer", 3),
-      turn("question", "answer", "user", "visible current question", 4),
-    ]);
+it("uses the contiguous newest suffix when an older message exceeds the read budget", async () => {
+  const scope = await seedScope("companion-context-oversized-older");
+  await persist(scope, [
+    turn("stale", null, "user", "stale older question", 1),
+    turn("oversized", "stale", "assistant", "x".repeat(1024 * 1024), 2),
+    turn("recent-question", "oversized", "user", "recent question", 3),
+    turn("recent-answer", "recent-question", "assistant", "recent answer", 4),
+  ]);
 
-    const messages = await readReady(scope);
-    expect(messages.map((message) => [message.role, message.text])).toEqual([
-      ["user", "discarded context"],
-      ["user", "retained context"],
-      ["assistant", "recent answer"],
-      ["user", "visible current question"],
-    ]);
-  });
+  const hostSql = observeHostDataSql();
+  const result = await defaultSessionCompanionContextReader
+    .read(scope)
+    .finally(() => hostSql.restore());
+  expect(hostSql.queries).toEqual([]);
+  expect(result).toEqual(
+    ready(scope, [
+      { role: "user", text: "recent question", ts: 3 },
+      { role: "assistant", text: "recent answer", ts: 4 },
+    ]),
+  );
+});
 
-  it("ignores oversized non-message compaction details", async () => {
-    const scope = await seedScope("companion-context-oversized-boundary");
-    await persist(scope, [turn("retained", null, "user", "retained context", 1)]);
-    await appendTranscriptEvent(scope, {
-      type: "compaction",
-      id: "oversized-compaction",
-      parentId: "retained",
-      timestamp: "2026-08-11T00:00:00.000Z",
-      summary: "small summary",
-      firstKeptEntryId: "retained",
-      tokensBefore: 100,
-      details: { payload: "x".repeat(1024 * 1024) },
-    });
+it("keeps transcript-visible messages across compaction", async () => {
+  const scope = await seedScope("companion-context-compaction");
+  await persist(scope, [
+    turn("discarded", null, "user", "discarded context", 1),
+    turn("retained", "discarded", "user", "retained context", 2),
+  ]);
+  await compact(scope);
+  await persist(scope, [
+    turn("answer", "compaction", "assistant", "recent answer", 3),
+    turn("question", "answer", "user", "visible current question", 4),
+  ]);
 
-    await expect(defaultSessionCompanionContextReader.read(scope)).resolves.toEqual({
-      kind: "ready",
-      context: {
-        empty: false,
-        messages: [{ role: "user", text: "retained context", ts: 1 }],
-        sessionId: scope.sessionId,
-      },
-    });
-  });
+  const messages = await readReady(scope);
+  expect(messages.map((message) => [message.role, message.text])).toEqual([
+    ["user", "discarded context"],
+    ["user", "retained context"],
+    ["assistant", "recent answer"],
+    ["user", "visible current question"],
+  ]);
+});
 
-  it("returns unavailable rather than an empty context while the active projection is stale", async () => {
-    const scope = await seedScope("companion-context-unavailable");
-    await persist(scope, [turn("question", null, "user", "visible question", 1)]);
-    const database = openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env });
-    database.db
-      .prepare("UPDATE session_transcript_index_state SET needs_rebuild = 1 WHERE session_id = ?")
-      .run(scope.sessionId);
+it("ignores oversized non-message compaction details", async () => {
+  const scope = await seedScope("companion-context-oversized-boundary");
+  await persist(scope, [turn("retained", null, "user", "retained context", 1)]);
+  await compact(scope, { payload: "x".repeat(1024 * 1024) });
 
-    await expect(defaultSessionCompanionContextReader.read(scope)).resolves.toEqual({
-      kind: "unavailable",
-    });
+  await expect(defaultSessionCompanionContextReader.read(scope)).resolves.toEqual(
+    ready(scope, [{ role: "user", text: "retained context", ts: 1 }]),
+  );
+});
+
+it("returns unavailable rather than an empty context while the active projection is stale", async () => {
+  const scope = await seedScope("companion-context-unavailable");
+  await persist(scope, [turn("question", null, "user", "visible question", 1)]);
+  const database = openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env });
+  database.db
+    .prepare("UPDATE session_transcript_index_state SET needs_rebuild = 1 WHERE session_id = ?")
+    .run(scope.sessionId);
+
+  await expect(defaultSessionCompanionContextReader.read(scope)).resolves.toEqual({
+    kind: "unavailable",
   });
 });

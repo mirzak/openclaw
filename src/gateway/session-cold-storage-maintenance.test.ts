@@ -35,7 +35,7 @@ let config: OpenClawConfig;
 const getRuntimeConfig = () => config;
 const onError = vi.fn();
 beforeEach(() => {
-  config = {};
+  config = { session: { maintenance: { coldStorage: { enabled: true } } } };
   onError.mockReset();
   clock = createGatewaySchedulerClock();
   scheduler = createTestGatewayScheduler(clock.clock);
@@ -50,7 +50,42 @@ afterEach(async () => {
   await scheduler.stop();
 });
 
+function blockSweep() {
+  const completion = createDeferred<{ archivedTranscripts: number }>();
+  const started = createDeferred();
+  sweep.mockImplementation(async ({ assertCurrent }: { assertCurrent: () => void }) => {
+    started.resolve();
+    const result = await completion.promise;
+    assertCurrent();
+    return result;
+  });
+  return { completion, started };
+}
+
+async function invoke(
+  method: keyof typeof sessionMaintenanceHandlers,
+  hasCurrentClientAuthority?: () => boolean,
+) {
+  const respond = vi.fn();
+  await sessionMaintenanceHandlers[method]!({
+    params: {},
+    context: { getRuntimeConfig },
+    respond,
+    hasCurrentClientAuthority,
+  } as never);
+  return respond;
+}
+
+function expectProgress(respond: ReturnType<typeof vi.fn>, progress: Record<string, unknown>) {
+  expect(respond).toHaveBeenCalledWith(
+    true,
+    expect.objectContaining({ maintenance: expect.objectContaining(progress) }),
+    undefined,
+  );
+}
+
 it("picks up enabled and changed age settings without recreating the scheduler", async () => {
+  config = {};
   await clock.advanceBy(60_000);
   expect(sweep).not.toHaveBeenCalled();
   expect(() => requestGatewaySessionColdStorageMaintenance(getRuntimeConfig)).toThrow("disabled");
@@ -73,17 +108,8 @@ it("picks up enabled and changed age settings without recreating the scheduler",
 });
 
 it("coalesces manual and periodic work and rejects commits after a config change", async () => {
-  config = {
-    session: { maintenance: { coldStorage: { enabled: true, afterDays: 30 } } },
-  };
-  const completion = createDeferred<{ archivedTranscripts: number }>();
-  const started = createDeferred();
-  sweep.mockImplementation(async ({ assertCurrent }: { assertCurrent: () => void }) => {
-    started.resolve();
-    const result = await completion.promise;
-    assertCurrent();
-    return result;
-  });
+  config = { session: { maintenance: { coldStorage: { enabled: true, afterDays: 30 } } } };
+  const { completion, started } = blockSweep();
   const running = clock.wake();
   requestGatewaySessionColdStorageMaintenance(getRuntimeConfig);
   void clock.advanceBy(180_000);
@@ -106,17 +132,7 @@ it("coalesces manual and periodic work and rejects commits after a config change
 it.each(["periodic", "manual"] as const)(
   "waits for an admitted %s worker to relinquish its writer before shutdown completes",
   async (trigger) => {
-    config = {
-      session: { maintenance: { coldStorage: { enabled: true } } },
-    };
-    const completion = createDeferred<{ archivedTranscripts: number }>();
-    const started = createDeferred();
-    sweep.mockImplementation(async ({ assertCurrent }: { assertCurrent: () => void }) => {
-      started.resolve();
-      const result = await completion.promise;
-      assertCurrent();
-      return result;
-    });
+    const { completion, started } = blockSweep();
     if (trigger === "periodic") {
       void clock.wake();
     } else {
@@ -138,85 +154,44 @@ it.each(["periodic", "manual"] as const)(
 );
 
 it("acknowledges Run now before worker completion and exposes committed progress after failure", async () => {
-  config = { session: { maintenance: { coldStorage: { enabled: true } } } };
-  const completion = createDeferred<{
-    archivedTranscripts: number;
-    externalizedTranscripts: number;
-  }>();
+  const progress = { archivedTranscripts: 1, externalizedTranscripts: 2 };
+  const completion = createDeferred<typeof progress>();
   const started = createDeferred();
   sweep.mockImplementation(
-    async ({
-      onProgress,
-    }: {
-      onProgress: (progress: {
-        archivedTranscripts: number;
-        externalizedTranscripts: number;
-      }) => void;
-    }) => {
-      onProgress({ archivedTranscripts: 1, externalizedTranscripts: 2 });
+    async ({ onProgress }: { onProgress: (value: typeof progress) => void }) => {
+      onProgress(progress);
       started.resolve();
-      return await completion.promise;
+      return completion.promise;
     },
   );
-  const respond = vi.fn();
-  const request = sessionMaintenanceHandlers["sessions.storage.run"]!({
-    params: {},
-    context: { getRuntimeConfig },
-    respond,
-  } as never);
+  const request = invoke("sessions.storage.run");
   try {
-    await request;
+    const respond = await request;
     await started.promise;
-    expect(respond).toHaveBeenCalledWith(
-      true,
-      expect.objectContaining({
-        maintenance: expect.objectContaining({ running: true }),
-      }),
-      undefined,
-    );
+    expectProgress(respond, { running: true });
     expect(sweep).toHaveBeenCalledOnce();
     const running = maintenance.run().catch(() => {});
     completion.reject(new Error("second batch failed"));
     await running;
-    respond.mockClear();
-    await sessionMaintenanceHandlers["sessions.storage.status"]!({
-      params: {},
-      context: { getRuntimeConfig },
-      respond,
-    } as never);
-    expect(respond).toHaveBeenCalledWith(
-      true,
-      expect.objectContaining({
-        maintenance: expect.objectContaining({
-          running: false,
-          archivedTranscripts: 1,
-          externalizedTranscripts: 2,
-          lastError: "second batch failed",
-        }),
-      }),
-      undefined,
-    );
+    expectProgress(await invoke("sessions.storage.status"), {
+      running: false,
+      ...progress,
+      lastError: "second batch failed",
+    });
   } finally {
-    completion.resolve({ archivedTranscripts: 1, externalizedTranscripts: 2 });
+    completion.resolve(progress);
   }
 });
 
 it.each(["sessions.storage.status", "sessions.storage.run"] as const)(
   "%s rejects expired request authority after inventory",
   async (method) => {
-    config = { session: { maintenance: { coldStorage: { enabled: true } } } };
     let current = true;
     inventory.mockImplementation(async () => {
       current = false;
       return [];
     });
-    const respond = vi.fn();
-    await sessionMaintenanceHandlers[method]!({
-      params: {},
-      context: { getRuntimeConfig },
-      respond,
-      hasCurrentClientAuthority: () => current,
-    } as never);
+    const respond = await invoke(method, () => current);
     expect(respond).toHaveBeenCalledWith(
       false,
       undefined,
