@@ -45,9 +45,7 @@ async function effectCommand(body = '"unexpected"') {
   const effect = path.join(root, "effect");
   const script = path.join(root, "write-effect.cjs");
   await fs.writeFile(script, `require("node:fs").writeFileSync(process.argv[2], ${body});`);
-  const command = [process.execPath, script, effect]
-    .map((value) => JSON.stringify(value))
-    .join(" ");
+  const command = [process.execPath, script, effect].map((v) => JSON.stringify(v)).join(" ");
   return { effect, command };
 }
 
@@ -67,37 +65,27 @@ async function fixture(
   const host = await createAgentHarnessHostCapabilitiesForTest({
     attempt,
     pluginId: "codex",
-    ...(options.assertCurrent
-      ? {
-          operatorSource: {
-            profileId: "original",
-            scopes: ["operator.admin"],
-            assertCurrent: options.assertCurrent,
-          },
-        }
-      : {}),
+    operatorSource: options.assertCurrent
+      ? { profileId: "original", scopes: ["operator.admin"], assertCurrent: options.assertCurrent }
+      : undefined,
   });
   params.hostCapabilities = host.capabilities;
   closers.push(host.close);
-  const environment = host.capabilities.preparedEnvironment!();
-  const profileDir = environment.localIdentityEnv.GH_CONFIG_DIR!;
+  const profileDir = host.capabilities.preparedEnvironment!().localIdentityEnv.GH_CONFIG_DIR!;
   await writeProfile(profileDir);
   if (options.mutateSelection) {
     params.config.tools!.github!.profileId = "ghp_22222222222222222222222222222222";
   }
-  const nativeExecutionPolicy = await prepareTestNativeExecutionPolicy(params);
-  const native = shouldEnableCodexAppServerNativeToolSurface(params, undefined, {
-    nativeExecutionPolicy,
-  });
+  const policy = { nativeExecutionPolicy: await prepareTestNativeExecutionPolicy(params) };
+  const native = shouldEnableCodexAppServerNativeToolSurface(params, undefined, policy);
   const tools = await buildDynamicToolsForTest(params, root, {
     sandbox: null,
     nativeToolSurfaceEnabled: native,
-    nativeExecutionPolicy,
+    ...policy,
   });
   const bridge = createCodexDynamicToolBridge({ tools, signal: new AbortController().signal });
   let sequence = 0;
   return {
-    params,
     host,
     native,
     profileDir,
@@ -134,76 +122,54 @@ describe.skipIf(process.platform === "win32")("Codex host-owned credential execu
     expect(await fs.readFile(effect, "utf8")).toBe("selected");
   });
 
-  it.each(["denied", "closed", "revoked", "reassigned"] as const)(
-    "starts no child for a %s caller",
-    async (state) => {
-      let caller = "original";
-      const f = await fixture({
-        mode: state === "denied" ? "deny" : "full",
-        assertCurrent: () => {
-          if (caller !== "original") {
-            throw new Error("source no longer current");
-          }
-        },
-      });
-      expect(f.native).toBe(false);
-      const { effect, command } = await effectCommand();
-      if (state === "closed") {
-        f.host.close();
-      }
-      if (state === "revoked") {
-        caller = "revoked";
-      }
-      if (state === "reassigned") {
-        caller = "replacement";
-      }
-      const result = await f.execute(command);
-      expect(result.success).toBe(false);
-      expect(JSON.stringify(result.contentItems)).toContain(
-        state === "denied" ? "denied" : "no longer active",
-      );
-      expect(await fs.stat(effect).catch(() => undefined)).toBeUndefined();
-    },
-  );
-
-  it.each(["closed", "revoked"] as const)(
-    "rechecks a %s caller after an awaited hook before launch",
-    async (state) => {
-      let current = true;
-      const f = await fixture({
-        assertCurrent: () => {
-          if (!current) {
-            throw new Error("source no longer current");
-          }
-        },
-      });
-      const entered = createDeferred<void>();
-      const release = createDeferred<void>();
+  it.each([
+    ["denied", false],
+    ["closed", false],
+    ["revoked", false],
+    ["reassigned", false],
+    ["closed", true],
+    ["revoked", true],
+  ] as const)("starts no child for a %s caller (awaited hook: %s)", async (state, awaitedHook) => {
+    let caller = "original";
+    const f = await fixture({
+      mode: state === "denied" ? "deny" : "full",
+      assertCurrent: () => {
+        if (caller !== "original") {
+          throw new Error("source no longer current");
+        }
+      },
+    });
+    expect(f.native).toBe(false);
+    const entered = createDeferred<void>();
+    const release = createDeferred<void>();
+    if (awaitedHook) {
+      const handler = async () => {
+        entered.resolve();
+        await release.promise;
+        return {};
+      };
       initializeGlobalHookRunner(
-        createMockPluginRegistry([
-          {
-            hookName: "before_tool_call",
-            handler: async () => {
-              entered.resolve();
-              await release.promise;
-              return {};
-            },
-          },
-        ]),
+        createMockPluginRegistry([{ hookName: "before_tool_call", handler }]),
       );
-      const { effect, command } = await effectCommand();
-      const pending = f.execute(command);
+    }
+    const { effect, command } = await effectCommand();
+    const pending = awaitedHook ? f.execute(command) : undefined;
+    if (awaitedHook) {
       await entered.promise;
-      if (state === "closed") {
-        f.host.close();
-      } else {
-        current = false;
-      }
-      release.resolve();
-      expect((await pending).success).toBe(false);
-      expect(await fs.stat(effect).catch(() => undefined)).toBeUndefined();
-    },
-  );
+    }
+    if (state === "closed") {
+      f.host.close();
+    } else if (state !== "denied") {
+      caller = state === "reassigned" ? "replacement" : "revoked";
+    }
+    release.resolve();
+    const result = await (pending ?? f.execute(command));
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result.contentItems)).toContain(
+      state === "denied" ? "denied" : "no longer active",
+    );
+    expect(await fs.stat(effect).catch(() => undefined)).toBeUndefined();
+  });
 
   it("retains the native surface by default and disables inherited shell features for host-owned execution", async () => {
     const params = createParams(path.join(root, "default.jsonl"), root);
@@ -212,10 +178,8 @@ describe.skipIf(process.platform === "win32")("Codex host-owned credential execu
     const host = await createAgentHarnessHostCapabilitiesForTest({ attempt, pluginId: "codex" });
     closers.push(host.close);
     params.hostCapabilities = host.capabilities;
-    const nativeExecutionPolicy = await prepareTestNativeExecutionPolicy(params);
-    expect(
-      shouldEnableCodexAppServerNativeToolSurface(params, undefined, { nativeExecutionPolicy }),
-    ).toBe(true);
+    const policy = { nativeExecutionPolicy: await prepareTestNativeExecutionPolicy(params) };
+    expect(shouldEnableCodexAppServerNativeToolSurface(params, undefined, policy)).toBe(true);
     expect(
       buildCodexRuntimeThreadConfig(
         { "features.shell_tool": true, "features.unified_exec": true },

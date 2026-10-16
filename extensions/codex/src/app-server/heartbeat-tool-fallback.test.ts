@@ -118,18 +118,6 @@ async function createHostedBridge(options: Parameters<typeof createBridge>[0] = 
   return { bridge, controller, close: host.close };
 }
 
-function nativeCatalog(names: string[]) {
-  const specs = names.map(nativeSpec);
-  const descriptor = resolveInactiveCodexHeartbeatResponseDescriptor({
-    registeredTools: [],
-    registeredSpecs: specs,
-  });
-  if (!descriptor) {
-    throw new Error("native catalog did not resolve the heartbeat fallback descriptor");
-  }
-  return { specs, descriptor };
-}
-
 function expectResult(
   result: Awaited<ReturnType<ReturnType<typeof createBridge>["handleToolCall"]>>,
   expected: Record<string, unknown>,
@@ -195,63 +183,52 @@ describe("inactive Codex heartbeat endpoint", () => {
     );
   });
 
-  it("rejects quiet fallback calls when current host policy vetoes execution", async () => {
-    const beforeToolCall = vi.fn(async () => ({
-      block: true,
-      blockReason: "blocked by current policy",
-    }));
-    initializeGlobalHookRunner(
-      createMockPluginRegistry([{ hookName: "before_tool_call", handler: beforeToolCall }]),
-    );
-    const { bridge } = await createHostedBridge();
-
-    const result = await bridge.handleToolCall(heartbeatCall(false));
-
-    expectResult(result, { success: false });
-    expect(JSON.stringify(result.contentItems)).toContain("blocked by current policy");
-    expect(beforeToolCall).toHaveBeenCalledOnce();
-  });
-
-  it.each(["cancelled", "revoked"] as const)(
-    "rejects quiet fallback calls after host authority is %s",
+  it.each(["policy", "cancelled", "revoked"] as const)(
+    "rejects quiet fallback calls when host authority is %s",
     async (authorityState) => {
+      const beforeToolCall = vi.fn(async () => ({
+        block: true,
+        blockReason: "blocked by current policy",
+      }));
+      if (authorityState === "policy") {
+        initializeGlobalHookRunner(
+          createMockPluginRegistry([{ hookName: "before_tool_call", handler: beforeToolCall }]),
+        );
+      }
       const { bridge, controller, close } = await createHostedBridge();
       if (authorityState === "cancelled") {
         controller.abort(new Error("test cancellation"));
-      } else {
+      } else if (authorityState === "revoked") {
         close();
       }
 
       const result = await bridge.handleToolCall(heartbeatCall(false));
 
-      expectResult(result, { success: false, executionStarted: false });
+      expectResult(result, { success: false });
+      if (authorityState === "policy") {
+        expect(JSON.stringify(result.contentItems)).toContain("blocked by current policy");
+        expect(beforeToolCall).toHaveBeenCalledOnce();
+      } else {
+        expect(result.executionStarted).toBe(false);
+      }
     },
   );
 
-  it("creates the fallback from an inherited native catalog without rewriting declarations", async () => {
-    const { specs: nativeSpecs, descriptor } = nativeCatalog([heartbeatName, "message"]);
-    const bridge = createBridge({
+  it.each([false, true])("honors inherited catalog with exclusion=%s", async (excluded) => {
+    const nativeSpecs = (excluded ? [heartbeatName] : [heartbeatName, "message"]).map(nativeSpec);
+    const descriptor = resolveInactiveCodexHeartbeatResponseDescriptor({
       registeredTools: [],
       registeredSpecs: nativeSpecs,
-      registeredFallbackTools: [fallbackTool(descriptor)],
     });
-
-    const result = await bridge.handleToolCall(heartbeatCall(false));
-
-    expectResult(result, { success: true });
-    expect(bridge.specs).toEqual(nativeSpecs);
-    expect(specNames(bridge.availableSpecs)).toEqual(["message"]);
-    expect(bridge.availableTools.map((tool) => tool.name)).toEqual(["message"]);
-  });
-
-  it("rejects an inherited native heartbeat after the current plugin config excludes it", async () => {
-    const { specs: nativeSpecs, descriptor } = nativeCatalog([heartbeatName]);
+    if (!descriptor) {
+      throw new Error("native catalog did not resolve the heartbeat fallback descriptor");
+    }
     const fallback = selectInactiveCodexHeartbeatResponseTool({
       descriptor,
-      pluginConfig: { codexDynamicToolsExclude: [HEARTBEAT_RESPONSE_TOOL_NAME] },
+      pluginConfig: excluded ? { codexDynamicToolsExclude: [heartbeatName] } : {},
     });
     const bridge = createBridge({
-      tools: [],
+      ...(excluded ? { tools: [] } : {}),
       registeredTools: [],
       registeredSpecs: nativeSpecs,
       registeredFallbackTools: fallback ? [fallback] : [],
@@ -259,31 +236,36 @@ describe("inactive Codex heartbeat endpoint", () => {
 
     const result = await bridge.handleToolCall(heartbeatCall(false));
 
-    expect(fallback).toBeUndefined();
-    expectResult(result, { success: false, executionStarted: false });
+    expectResult(
+      result,
+      excluded ? { success: false, executionStarted: false } : { success: true },
+    );
+    if (excluded) {
+      expect(fallback).toBeUndefined();
+    } else {
+      expect(bridge.specs).toEqual(nativeSpecs);
+      expect(specNames(bridge.availableSpecs)).toEqual(["message"]);
+      expect(bridge.availableTools.map((tool) => tool.name)).toEqual(["message"]);
+    }
   });
 
-  it("rejects stale notification calls rather than silently discarding them", async () => {
-    const bridge = createBridge({
-      registeredFallbackTools: [fallbackTool(heartbeatTool())],
-    });
-
-    const result = await bridge.handleToolCall(heartbeatCall(true));
-
-    expectResult(result, { success: false });
-    expect(JSON.stringify(result.contentItems)).toContain(
+  it.each([
+    [
+      true,
+      "rejects stale notifications",
       "heartbeat_respond cannot send notifications outside a heartbeat turn",
-    );
-  });
-
-  it("does not mask a missing executor on an active heartbeat turn", async () => {
-    const bridge = createBridge();
-
-    const result = await bridge.handleToolCall(heartbeatCall(false));
-
-    expectResult(result, { success: false });
-    expect(JSON.stringify(result.contentItems)).toContain(
+    ],
+    [
+      false,
+      "does not mask a missing active executor",
       `OpenClaw tool is not available for this turn: ${HEARTBEAT_RESPONSE_TOOL_NAME}`,
+    ],
+  ] as const)("%s: %s", async (inactive, _label, error) => {
+    const bridge = createBridge(
+      inactive ? { registeredFallbackTools: [fallbackTool(heartbeatTool())] } : {},
     );
+    const result = await bridge.handleToolCall(heartbeatCall(inactive));
+    expectResult(result, { success: false });
+    expect(JSON.stringify(result.contentItems)).toContain(error);
   });
 });

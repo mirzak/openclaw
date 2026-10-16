@@ -1,99 +1,80 @@
+import { describe, expect, it, vi } from "vitest";
 import { createNativeCommandItem } from "./event-projector-command.test-support.js";
-import {
-  buildEmptyToolTelemetry,
-  createProjector,
-  describe,
-  expect,
-  forCurrentTurn,
-  it,
-  registerCodexEventProjectorTestLifecycle,
-  requireArray,
-  requireRecord,
-  turnCompleted,
-  createParams,
-  formatToolAggregate,
-  inferToolMetaFromArgs,
-  vi,
-  mockCallArg,
-} from "./event-projector.test-harness.js";
+import * as h from "./event-projector.test-harness.js";
 
-registerCodexEventProjectorTestLifecycle();
+h.registerCodexEventProjectorTestLifecycle();
 
-type Projector = Awaited<ReturnType<typeof createProjector>>;
-function notify(
-  projector: Projector,
-  method: Parameters<typeof forCurrentTurn>[0],
-  params: Record<string, unknown>,
-) {
-  return projector.handleNotification(forCurrentTurn(method, params));
+type Projector = Awaited<ReturnType<typeof h.createProjector>>;
+type Method = Parameters<typeof h.forCurrentTurn>[0];
+type Item = Record<string, unknown>;
+function notify(projector: Projector, method: Method, params: Item) {
+  return projector.handleNotification(h.forCurrentTurn(method, params));
 }
-function raw(projector: Projector, item: Record<string, unknown>) {
+function raw(projector: Projector, item: Item) {
   return notify(projector, "rawResponseItem/completed", { item });
 }
-function itemEvent(
-  projector: Projector,
-  phase: "started" | "completed",
-  item: Record<string, unknown>,
-) {
+function itemEvent(projector: Projector, phase: "started" | "completed", item: Item) {
   return notify(projector, `item/${phase}`, { item });
 }
 function delta(projector: Projector, itemId: string, text: string) {
   return notify(projector, "item/commandExecution/outputDelta", { itemId, delta: text });
 }
+function startCommand(projector: Projector, item: Item) {
+  return itemEvent(projector, "started", {
+    ...item,
+    status: "inProgress",
+    aggregatedOutput: null,
+    exitCode: null,
+    durationMs: null,
+  });
+}
 async function createVerboseProjector(
-  overrides: Partial<Awaited<ReturnType<typeof createParams>>> = {},
+  overrides: Partial<Awaited<ReturnType<typeof h.createParams>>> = {},
 ) {
-  return createProjector({ ...(await createParams()), verboseLevel: "full", ...overrides });
+  return h.createProjector({ ...(await h.createParams()), verboseLevel: "full", ...overrides });
 }
 
 describe("Codex tool response fidelity", () => {
-  function toolResult(projector: Awaited<ReturnType<typeof createProjector>>) {
+  function toolResult(projector: Awaited<ReturnType<typeof h.createProjector>>) {
     const results = projector
-      .buildResult(buildEmptyToolTelemetry())
+      .buildResult(h.buildEmptyToolTelemetry())
       .messagesSnapshot.filter((message) => message.role === "toolResult");
     expect(results).toHaveLength(1);
-    return requireRecord(results[0], "result");
+    return h.requireRecord(results[0], "result");
   }
 
   function outputText(result: Record<string, unknown>) {
-    return requireRecord(requireArray(result.content, "content")[0], "output").text;
+    return h.requireRecord(h.requireArray(result.content, "content")[0], "output").text;
+  }
+  function outcome(result: Record<string, unknown>) {
+    const metadata = h.requireRecord(result["__openclaw"], "metadata");
+    return h.requireRecord(metadata.toolOutput, "provenance").outcome;
   }
 
-  async function projectCodeModeOutput(output: string, input: string) {
-    const projector = await createProjector();
-    const callId = "outer-exec";
+  async function projectExec(output: unknown, input: string, callId = "outer-exec") {
+    const projector = await h.createProjector();
     for (const item of [
       { type: "custom_tool_call", call_id: callId, name: "exec", input },
       { type: "custom_tool_call_output", call_id: callId, output },
     ]) {
       await raw(projector, item);
     }
-    await projector.handleNotification(turnCompleted());
-    return toolResult(projector);
+    return projector;
   }
 
-  // The response notification is distinct from the command's raw stdout. Codex
-  // may further truncate history after constructing this response; do not claim
-  // exact model-input fidelity from this notification alone.
+  // Provider responses differ from raw stdout and may still be truncated before model input.
 
   it("preserves structured text boundaries without moving private media into plaintext", async () => {
-    const projector = await createProjector();
-    await raw(projector, {
-      type: "custom_tool_call",
-      call_id: "structured",
-      name: "exec",
-      input: "text('result')",
-    });
     const text = " \r\n" + "x".repeat(34_766) + "TAIL\r\n ";
-    await raw(projector, {
-      type: "custom_tool_call_output",
-      call_id: "structured",
-      output: [
+    const projector = await projectExec(
+      [
         { type: "input_text", text },
         { type: "input_image", image_url: "data:image/png;base64,PRIVATE_PAYLOAD" },
         { type: "input_text", text: "" },
       ],
-    });
+      "text('result')",
+      "structured",
+    );
     expect(outputText(toolResult(projector))).toBe(
       JSON.stringify(
         [
@@ -109,36 +90,30 @@ describe("Codex tool response fidelity", () => {
 
   it("retains completed outer code-mode output under its own call ID", async () => {
     const output = "Script completed\nWall time 0.1 seconds\nOutput:\n" + "x".repeat(34_766);
-    const result = await projectCodeModeOutput(
+    const projector = await projectExec(
       output,
       "text(await tools.exec_command({cmd: 'transcript'}))",
     );
+    await projector.handleNotification(h.turnCompleted());
+    const result = toolResult(projector);
     expect(result.toolCallId).toBe("outer-exec");
     expect(result.isError).toBe(false);
-    expect(
-      requireRecord(requireRecord(result["__openclaw"], "metadata").toolOutput, "provenance")
-        .outcome,
-    ).toBeUndefined();
+    expect(outcome(result)).toBeUndefined();
     expect(outputText(result)).toBe(output);
   });
 
-  it.each([
-    { order: "before", status: "failed", isError: true },
-    { order: "after", status: "failed", isError: true },
-  ])(
-    "uses the native collaboration $status outcome when output arrives $order completion",
-    async ({ order, status, isError }) => {
-      const projector = await createProjector();
-      const callId = `spawn-${order}-${status}`;
-      const call = forCurrentTurn("rawResponseItem/completed", {
-        item: {
-          type: "function_call",
-          call_id: callId,
-          name: "spawn_agent",
-          arguments: JSON.stringify({ message: "inspect the owner" }),
-        },
+  it.each(["before", "after"])(
+    "uses the native collaboration failure when output arrives %s completion",
+    async (order) => {
+      const projector = await h.createProjector();
+      const callId = `spawn-${order}-failed`;
+      await raw(projector, {
+        type: "function_call",
+        call_id: callId,
+        name: "spawn_agent",
+        arguments: JSON.stringify({ message: "inspect the owner" }),
       });
-      const output = forCurrentTurn("rawResponseItem/completed", {
+      const output = h.forCurrentTurn("rawResponseItem/completed", {
         item: { type: "function_call_output", call_id: callId, output: "Agent started." },
       });
       const native = {
@@ -149,34 +124,30 @@ describe("Codex tool response fidelity", () => {
         receiverThreadIds: ["child-1"],
         agentsStates: {},
       };
-      await projector.handleNotification(call);
       await itemEvent(projector, "started", { ...native, status: "inProgress" });
       if (order === "before") {
         await projector.handleNotification(output);
       }
-      await itemEvent(projector, "completed", { ...native, status });
+      await itemEvent(projector, "completed", { ...native, status: "failed" });
       if (order === "after") {
         await projector.handleNotification(output);
       }
-      await projector.handleNotification(turnCompleted([{ ...native, status }]));
+      await projector.handleNotification(h.turnCompleted([{ ...native, status: "failed" }]));
 
       const result = toolResult(projector);
       expect(result).toMatchObject({
         toolCallId: callId,
         toolName: "spawn_agent",
-        isError,
+        isError: true,
         content: [{ type: "text", text: "Agent started." }],
         __openclaw: { toolOutput: { source: "provider-response", modelInput: "unverified" } },
       });
-      expect(
-        requireRecord(requireRecord(result["__openclaw"], "metadata").toolOutput, "provenance")
-          .outcome,
-      ).toBeUndefined();
+      expect(outcome(result)).toBeUndefined();
     },
   );
 
   it("preserves the complete response after the terminal item with null aggregate", async () => {
-    const projector = await createProjector();
+    const projector = await h.createProjector();
     const output = " \n" + "transcript 😀\n".repeat(2_700) + "END OF TRANSCRIPT\n ";
     const command = {
       type: "commandExecution",
@@ -189,7 +160,7 @@ describe("Codex tool response fidelity", () => {
     await itemEvent(projector, "started", { ...command, status: "inProgress" });
     await itemEvent(projector, "completed", command);
     await raw(projector, { type: "function_call_output", call_id: command.id, output });
-    await projector.handleNotification(turnCompleted([command]));
+    await projector.handleNotification(h.turnCompleted([command]));
     const result = toolResult(projector);
     expect(outputText(result)).toBe(output);
     expect(result["__openclaw"]).toMatchObject({
@@ -200,13 +171,13 @@ describe("Codex tool response fidelity", () => {
 
 describe("streamed-output-echo", () => {
   function rawMessage(text: string, id = "raw-echo") {
-    return forCurrentTurn("rawResponseItem/completed", {
+    return h.forCurrentTurn("rawResponseItem/completed", {
       item: { type: "message", id, role: "assistant", content: [{ type: "output_text", text }] },
     });
   }
 
   function expectNoReply(projector: Projector) {
-    const result = projector.buildResult(buildEmptyToolTelemetry());
+    const result = projector.buildResult(h.buildEmptyToolTelemetry());
     expect(result.assistantTexts).toEqual([]);
     expect(result.lastAssistant).toBeUndefined();
     expect(result.currentAttemptAssistant).toBeUndefined();
@@ -222,13 +193,7 @@ describe("streamed-output-echo", () => {
       aggregatedOutput: output,
       durationMs: 12,
     });
-    await itemEvent(projector, "started", {
-      ...item,
-      status: "inProgress",
-      aggregatedOutput: null,
-      exitCode: null,
-      durationMs: null,
-    });
+    await startCommand(projector, item);
     await delta(projector, item.id, output);
     await itemEvent(projector, "completed", item);
     await itemEvent(projector, "completed", {
@@ -236,8 +201,8 @@ describe("streamed-output-echo", () => {
       id: "msg-verbatim",
       text: output,
     });
-    await projector.handleNotification(turnCompleted());
-    const result = projector.buildResult(buildEmptyToolTelemetry());
+    await projector.handleNotification(h.turnCompleted());
+    const result = projector.buildResult(h.buildEmptyToolTelemetry());
     expect(result.assistantTexts).toEqual([output]);
     expect(result.lastAssistant).toBeDefined();
     expect(result.currentAttemptAssistant).toBeDefined();
@@ -252,12 +217,7 @@ describe("streamed-output-echo", () => {
       onAgentEvent,
     });
     const item = createNativeCommandItem({ id: "cmd-multi-shape" });
-    await itemEvent(projector, "started", {
-      ...item,
-      status: "inProgress",
-      exitCode: null,
-      durationMs: null,
-    });
+    await startCommand(projector, item);
     const summary = onToolResult.mock.calls[0]?.[0].text;
     expect(summary).toBe("Bash");
     const output = "streamed-output-chunk-that-would-overwrite-summary";
@@ -285,7 +245,7 @@ describe("streamed-output-echo", () => {
       onToolResult.mock.calls.map(([payload]) => payload.channelData?.openclawToolProgressId),
     ).toEqual([prepared[0]?.data.itemId, prepared[0]?.data.itemId]);
     await projector.handleNotification(rawMessage(summary));
-    await projector.handleNotification(turnCompleted());
+    await projector.handleNotification(h.turnCompleted());
     expectNoReply(projector);
   });
 
@@ -294,9 +254,9 @@ describe("streamed-output-echo", () => {
     const projector = await createVerboseProjector({ onToolResult });
     const command = "pnpm test";
     const cwd = `/very-long-root/${"a".repeat(10_500)}`;
-    const summary = formatToolAggregate(
+    const summary = h.formatToolAggregate(
       "bash",
-      [inferToolMetaFromArgs("exec", { command, cwd }, { detailMode: "explain" }) ?? ""],
+      [h.inferToolMetaFromArgs("exec", { command, cwd }, { detailMode: "explain" }) ?? ""],
       { markdown: true },
     );
     expect(summary.length).toBeGreaterThan(10_000);
@@ -304,11 +264,8 @@ describe("streamed-output-echo", () => {
       id: "cmd-summary-then-stream",
       command,
       cwd,
-      status: "inProgress",
-      exitCode: null,
-      durationMs: null,
     });
-    await itemEvent(projector, "started", item);
+    await startCommand(projector, item);
     expect(onToolResult.mock.calls[0]?.[0].text).toHaveLength(10_000);
     expect(onToolResult.mock.calls[0]?.[0].text).toContain(
       "OpenClaw truncated Codex native tool output",
@@ -326,7 +283,7 @@ describe("streamed-output-echo", () => {
     await projector.handleNotification(rawMessage(summary, "raw-summary"));
     await projector.handleNotification(rawMessage(chunks.join(""), "raw-stream"));
     await projector.handleNotification(
-      turnCompleted([createNativeCommandItem({ id: item.id, command, cwd })]),
+      h.turnCompleted([createNativeCommandItem({ id: item.id, command, cwd })]),
     );
     const result = expectNoReply(projector);
     const toolResult = result.messagesSnapshot.find((message) => message.role === "toolResult");
@@ -339,22 +296,20 @@ describe("streamed-output-echo", () => {
   });
 });
 
-describe("CodexAppServerEventProjector command output projection", () => {
-  it("keeps streamed progress UTF-16 safe with 7999 chars already emitted", async () => {
-    const onToolResult = vi.fn();
-    const projector = await createVerboseProjector({ onToolResult });
+it("keeps streamed progress UTF-16 safe with 7999 chars already emitted", async () => {
+  const onToolResult = vi.fn();
+  const projector = await createVerboseProjector({ onToolResult });
 
-    await delta(projector, "cmd-progress-utf16", "a".repeat(7_999));
-    onToolResult.mockClear();
-    await delta(projector, "cmd-progress-utf16", "😀tail");
+  await delta(projector, "cmd-progress-utf16", "a".repeat(7_999));
+  onToolResult.mockClear();
+  await delta(projector, "cmd-progress-utf16", "😀tail");
 
-    expect(onToolResult).toHaveBeenCalledTimes(1);
-    expect(onToolResult).toHaveBeenCalledWith({
-      text: "Bash\n```txt\n...(truncated)...\n```",
-    });
-    const text = (mockCallArg(onToolResult, 0, 0, "onToolResult") as { text?: string }).text;
-    expect(text).not.toMatch(
-      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u,
-    );
+  expect(onToolResult).toHaveBeenCalledTimes(1);
+  expect(onToolResult).toHaveBeenCalledWith({
+    text: "Bash\n```txt\n...(truncated)...\n```",
   });
+  const text = (h.mockCallArg(onToolResult, 0, 0, "onToolResult") as { text?: string }).text;
+  expect(text).not.toMatch(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u,
+  );
 });

@@ -19,8 +19,9 @@ import {
 } from "./inference-proxy.capacity-test-support.js";
 import assert from "node:assert/strict";
 import { EventEmitter, once } from "node:events";
-import type { IncomingMessage } from "node:http";
+import { IncomingMessage } from "node:http";
 import { createConnection, Socket } from "node:net";
+import { buffer as readBody } from "node:stream/consumers";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { WebSocket } from "openclaw/plugin-sdk/websocket-runtime";
 import { describe, expect, it, onTestFinished, vi } from "vitest";
@@ -86,12 +87,26 @@ function holdSend(socket: WebSocket, receive: (release: () => void) => void) {
 }
 
 async function expectHandshake(response: IncomingMessage, status: number, body: string) {
-  const chunks: Buffer[] = [];
-  for await (const chunk of response) {
-    chunks.push(Buffer.from(chunk));
-  }
   expect(response.statusCode).toBe(status);
-  expect(Buffer.concat(chunks).toString()).toBe(body);
+  expect((await readBody(response)).toString()).toBe(body);
+}
+
+async function expireHandshake(rejected: Promise<unknown[]>, expiry: string, finish: () => void) {
+  if (expiry === "timer") {
+    await vi.advanceTimersByTimeAsync(10_000);
+  } else {
+    // Finish the pending work after its deadline, before the timer callback runs.
+    const clock = vi.spyOn(performance, "now").mockReturnValue(performance.now() + 10_000);
+    onTestFinished(() => clock.mockRestore());
+    finish();
+  }
+  const [, response] = await rejected;
+  assert(response instanceof IncomingMessage);
+  await expectHandshake(
+    response,
+    504,
+    "Codex parent-local inference transport failed; retry on a fresh connection.",
+  );
 }
 
 describe("inference relay capacity", () => {
@@ -288,9 +303,6 @@ describe("inference relay capacity", () => {
   });
 
   it("cancels every fully read pipelined request when its shared socket closes", async () => {
-    if (process.env.OPENCLAW_VITEST_RUNTIME === "bun") {
-      expect(process.versions.bun).toBeTruthy();
-    }
     const started = createDeferred<void>();
     const backpressured = createDeferred<void>();
     const released = createDeferred<void>();
@@ -436,13 +448,10 @@ describe("inference relay capacity", () => {
     await queued.promise;
     const rejected = connect();
     const [, response] = await once(rejected, "unexpected-response");
-    const chunks: Buffer[] = [];
-    for await (const chunk of response) {
-      chunks.push(Buffer.from(chunk));
-    }
+    const body = await readBody(response);
     expect(response.statusCode).toBe(503);
     expect(response.headers["retry-after"]).toBe("1");
-    expect(JSON.parse(Buffer.concat(chunks).toString())).toMatchObject({
+    expect(JSON.parse(body.toString())).toMatchObject({
       status: 503,
       error: { code: "inference_relay_busy" },
     });
@@ -666,20 +675,7 @@ describe("inference relay capacity", () => {
       const stalled = connect();
       const rejected = once(stalled, "unexpected-response");
       await started.promise;
-      if (expiry === "timer") {
-        await vi.advanceTimersByTimeAsync(10_000);
-      } else {
-        // DNS can settle after the deadline before the queued timer callback runs.
-        const clock = vi.spyOn(performance, "now").mockReturnValue(performance.now() + 10_000);
-        onTestFinished(() => clock.mockRestore());
-        dns.resolve({ lookup: undefined });
-      }
-      const [, response] = await rejected;
-      await expectHandshake(
-        response,
-        504,
-        "Codex parent-local inference transport failed; retry on a fresh connection.",
-      );
+      await expireHandshake(rejected, expiry, () => dns.resolve({ lookup: undefined }));
       dns.resolve({ lookup: undefined });
       const streams = await holdUploads();
       expect(upstreams).toHaveLength(16);
@@ -737,19 +733,7 @@ describe("inference relay capacity", () => {
         stalled.once("close", () => resolve());
       });
       await received.promise;
-      if (expiry === "timer") {
-        await vi.advanceTimersByTimeAsync(10_000);
-      } else {
-        const clock = vi.spyOn(performance, "now").mockReturnValue(performance.now() + 10_000);
-        onTestFinished(() => clock.mockRestore());
-        finishBody();
-      }
-      const [, response] = await rejected;
-      await expectHandshake(
-        response,
-        504,
-        "Codex parent-local inference transport failed; retry on a fresh connection.",
-      );
+      await expireHandshake(rejected, expiry, finishBody);
       stalled.terminate();
       await Promise.all([closed, disconnected.promise]);
       handlers.forEach((handler) => server.on("upgrade", handler));

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import {
   CODEX_INFERENCE_GENERATION_KEY,
   createCodexInferenceContext,
@@ -6,34 +6,42 @@ import {
 import { readCodexInferenceMetadata } from "./inference-metadata.js";
 import type { JsonObject } from "./protocol.js";
 
+function wire(nested: JsonObject, flat: JsonObject = {}, body: JsonObject = {}): JsonObject {
+  return {
+    instructions: "native base",
+    input: [{ role: "developer", content: "native catalog collaboration" }],
+    ...body,
+    client_metadata: { ...flat, "x-codex-turn-metadata": JSON.stringify(nested) },
+  };
+}
+
 function request(
   threadId: string,
   generation?: string,
   extra: JsonObject = {},
   flat: JsonObject = {},
 ): JsonObject {
-  return {
-    instructions: "native base",
-    input: [{ role: "developer", content: "native catalog collaboration" }],
-    client_metadata: {
+  return wire(
+    {
       thread_id: threadId,
-      ...flat,
-      "x-codex-turn-metadata": JSON.stringify({
-        thread_id: threadId,
-        request_kind: "turn",
-        ...(generation ? { [CODEX_INFERENCE_GENERATION_KEY]: generation } : {}),
-        ...extra,
-      }),
+      request_kind: "turn",
+      ...(generation ? { [CODEX_INFERENCE_GENERATION_KEY]: generation } : {}),
+      ...extra,
     },
-  };
+    { thread_id: threadId, ...flat },
+  );
 }
 
 function fixture(assertCurrent = () => {}) {
   const context = createCodexInferenceContext(() => {});
+  onTestFinished(() => context.close());
   const controller = new AbortController();
-  const register = (text: string) =>
-    context.register({ threadId: "root", text, signal: controller.signal, assertCurrent });
-  return { context, controller, register };
+  const register = (text: string, threadId = "root") =>
+    context.register({ threadId, text, signal: controller.signal, assertCurrent });
+  const prepare = context.prepare.bind(context);
+  const rejects = (body: JsonObject, message: string) =>
+    expect(() => prepare(body)).toThrow(message);
+  return { context, controller, register, prepare, rejects };
 }
 
 function forkContext(
@@ -161,18 +169,17 @@ describe("native inference metadata", () => {
 describe("parent-local inference context", () => {
   it("forks the retained prepared prefix after parent cleanup under only the new root's authority", () => {
     let parentActive = true;
-    const { context, controller, register } = fixture(() => {
+    const { context, controller, register, prepare, rejects } = fixture(() => {
       if (!parentActive) {
         throw new Error("parent authority ended");
       }
     });
     const parent = register("private persona\n\nskills\n\nmemory");
-    const expectedInstructions = context.prepare(request("root", parent.generation)).body
-      .instructions;
+    const expectedInstructions = prepare(request("root", parent.generation)).body.instructions;
     parent.release();
     controller.abort();
     parentActive = false;
-    expect(() => context.prepare(request("root", parent.generation))).toThrow("current admitted");
+    rejects(request("root", parent.generation), "current admitted");
     let forkActive = true;
     const forkController = new AbortController();
     const fork = forkContext(context, {
@@ -184,39 +191,38 @@ describe("parent-local inference context", () => {
       },
     });
     const source = request("fork", fork.generation);
-    const prepared = context.prepare(source);
+    const prepared = prepare(source);
     expect(prepared.body.instructions).toBe(expectedInstructions);
     parent.release();
-    expect(context.prepare(source).body.instructions).toBe(expectedInstructions);
-    expect(() => context.prepare(request("fork", parent.generation))).toThrow("current admitted");
+    expect(prepare(source).body.instructions).toBe(expectedInstructions);
+    rejects(request("fork", parent.generation), "current admitted");
     expect(() => forkContext(context, { sourceThreadId: "missing", threadId: "another" })).toThrow(
       "prepared parent",
     );
     context.forget("root");
     expect(() => forkContext(context, { threadId: "later" })).toThrow("prepared parent");
-    expect(context.prepare(source).body.instructions).toBe(expectedInstructions);
+    expect(prepare(source).body.instructions).toBe(expectedInstructions);
     forkActive = false;
-    expect(() => context.prepare(source)).toThrow("fork authority ended");
+    rejects(source, "fork authority ended");
     forkActive = true;
     forkController.abort();
     expect(() => prepared.assertCurrent()).toThrow();
-    expect(() => context.prepare(source)).toThrow("current admitted");
-    context.close();
+    rejects(source, "current admitted");
   });
 
   it("preserves parent tool declarations but uses native history after a WebSocket continuation", () => {
-    const { context, register } = fixture();
+    const { context, register, prepare } = fixture();
     const parent = register("private");
     const declarations = {
       type: "additional_tools",
       role: "developer",
       tools: [{ type: "custom", name: "exec", description: "exact catalog including web.run" }],
     };
-    context.prepare({
+    prepare({
       ...request("root", parent.generation),
       input: [declarations, { role: "user", content: "parent task" }],
     });
-    context.prepare({
+    prepare({
       ...request("root", parent.generation),
       previous_response_id: "parent-response",
       input: [{ type: "function_call_output", call_id: "call", output: "one" }],
@@ -228,22 +234,18 @@ describe("parent-local inference context", () => {
       { role: "assistant", content: "native reconstructed answer" },
       { role: "user", content: "side question" },
     ];
-    try {
-      const prepared = context.prepare({
-        ...request("fork", fork.generation),
-        input: [{ ...declarations, tools: [] }, ...history],
-      }).body;
-      expect(prepared.input).toEqual([declarations, ...history]);
-      expect(prepared.tool_choice).toBe("none");
-      expect(prepared).not.toHaveProperty("previous_response_id");
-    } finally {
-      context.close();
-    }
+    const prepared = prepare({
+      ...request("fork", fork.generation),
+      input: [{ ...declarations, tools: [] }, ...history],
+    }).body;
+    expect(prepared.input).toEqual([declarations, ...history]);
+    expect(prepared.tool_choice).toBe("none");
+    expect(prepared).not.toHaveProperty("previous_response_id");
   });
 
   it("falls back to native reconstruction when the global wire-prefix LRU evicts a session", () => {
-    const contexts = Array.from({ length: 3 }, () => createCodexInferenceContext(() => {}));
-    const contextAt = (index: number) => {
+    const contexts = Array.from({ length: 3 }, () => fixture());
+    const fixtureAt = (index: number) => {
       const context = contexts[index];
       if (!context) {
         throw new Error(`Missing inference context ${index}`);
@@ -252,133 +254,98 @@ describe("parent-local inference context", () => {
     };
     const payload = "x".repeat(11 * 1024 * 1024);
     const prepareParent = (index: number) => {
-      const context = contextAt(index);
-      const parent = context.register({
-        threadId: "parent",
-        text: "private",
-        signal: new AbortController().signal,
-        assertCurrent: () => {},
-      });
-      context.prepare({
+      const { register, prepare } = fixtureAt(index);
+      const parent = register("private", "parent");
+      prepare({
         ...request("parent", parent.generation),
         input: [{ role: "user", content: payload }],
       });
       parent.release();
     };
-    const fork = (index: number) => forkContext(contextAt(index), { sourceThreadId: "parent" });
-    try {
-      prepareParent(0);
-      prepareParent(1);
-      fork(0).release();
-      prepareParent(2);
-      for (const index of [0, 1, 2]) {
-        const child = fork(index);
-        const rebuilt = {
-          ...request("fork", child.generation),
-          instructions: "rebuilt",
-          input: [
-            { role: "user", content: payload },
-            { role: "user", content: "side question" },
-          ],
-        };
-        const prepared = contextAt(index).prepare(rebuilt).body;
-        expect(prepared.instructions).toBe(
-          index === 1 ? "rebuilt\n\nprivate" : "native base\n\nprivate",
-        );
-        expect(prepared.input).toHaveLength(2);
-        child.release();
-      }
-    } finally {
-      for (const context of contexts) {
-        context.close();
-      }
+    const fork = (index: number) =>
+      forkContext(fixtureAt(index).context, { sourceThreadId: "parent" });
+    prepareParent(0);
+    prepareParent(1);
+    fork(0).release();
+    prepareParent(2);
+    for (const index of [0, 1, 2]) {
+      const child = fork(index);
+      const rebuilt = {
+        ...request("fork", child.generation),
+        instructions: "rebuilt",
+        input: [
+          { role: "user", content: payload },
+          { role: "user", content: "side question" },
+        ],
+      };
+      const prepared = fixtureAt(index).prepare(rebuilt).body;
+      expect(prepared.instructions).toBe(
+        index === 1 ? "rebuilt\n\nprivate" : "native base\n\nprivate",
+      );
+      expect(prepared.input).toHaveLength(2);
+      child.release();
     }
   });
 
-  it("rejects explicit non-string instructions", () => {
-    const { context, register } = fixture();
-    expect(() =>
-      context.prepare({ ...request("root", register("persona").generation), instructions: null }),
-    ).toThrow("instructions");
-    context.close();
-  });
-
   it("refreshes and removes parent instructions without rewriting native history or affecting children", () => {
-    const { context, register } = fixture();
+    const { context, register, prepare, rejects } = fixture();
     const first = register("persona A");
     const source = request("root", first.generation);
     const original = structuredClone(source);
-    const prepared = context.prepare(source);
+    const prepared = prepare(source);
     expect(prepared.body).toEqual({ ...source, instructions: "native base\n\npersona A" });
     expect(source).toEqual(original);
     const second = register("persona B");
     first.release();
     expect(prepared.signal?.aborted).toBe(true);
     expect(() => prepared.assertCurrent()).toThrow();
-    expect(() => context.prepare(source)).toThrow("current admitted");
-    expect(context.prepare(request("root", second.generation)).body.instructions).toBe(
+    rejects(source, "current admitted");
+    expect(prepare(request("root", second.generation)).body.instructions).toBe(
       "native base\n\npersona B",
     );
     const child = request("child", second.generation, {
       parent_thread_id: "root",
       subagent_kind: "collab_spawn",
     });
-    expect(context.prepare(child).body).toEqual(child);
+    expect(prepare(child).body).toEqual(child);
     const removed = register("");
     const after = request("root", removed.generation);
-    expect(context.prepare(after).body).toEqual(after);
+    expect(prepare(after).body).toEqual(after);
     context.close();
-    expect(() => context.prepare(after)).toThrow("closed");
+    rejects(after, "closed");
   });
 
   it("requires exact physical owner, root identity and admitted generation", () => {
     let active = true;
-    const { context, register } = fixture(() => {
+    const { register, prepare, rejects } = fixture(() => {
       if (!active) {
         throw new Error("owner retired");
       }
     });
     const registration = register("private");
     const source = request("root", registration.generation);
-    const prepared = context.prepare(source);
-    expect(() => context.prepare(request("other", registration.generation))).toThrow(
-      "current admitted",
-    );
+    const prepared = prepare(source);
+    rejects(request("other", registration.generation), "current admitted");
     expect(() => createCodexInferenceContext(() => {}).prepare(source)).toThrow("current admitted");
-    expect(() => context.prepare(request("root"))).toThrow("current admitted");
-    expect(() =>
-      context.prepare({
-        ...source,
-        client_metadata: {
-          thread_id: "root",
-          "x-codex-turn-metadata": JSON.stringify({
-            request_kind: "turn",
-            [CODEX_INFERENCE_GENERATION_KEY]: registration.generation,
-          }),
-        },
-      }),
-    ).toThrow("native thread metadata");
-    expect(() =>
-      context.prepare({
-        ...source,
-        client_metadata: {
-          thread_id: "conflicting-root",
-          "x-codex-turn-metadata": JSON.stringify({
-            thread_id: "root",
-            request_kind: "turn",
-            [CODEX_INFERENCE_GENERATION_KEY]: registration.generation,
-          }),
-        },
-      }),
-    ).toThrow("metadata disagrees");
+    rejects(request("root"), "current admitted");
+    rejects(
+      wire(
+        { request_kind: "turn", [CODEX_INFERENCE_GENERATION_KEY]: registration.generation },
+        { thread_id: "root" },
+      ),
+      "native thread metadata",
+    );
+    rejects(
+      request("root", registration.generation, {}, { thread_id: "conflicting-root" }),
+      "metadata disagrees",
+    );
     active = false;
     expect(() => prepared.assertCurrent()).toThrow("owner retired");
-    expect(() => context.prepare(source)).toThrow("owner retired");
-    context.close();
+    rejects(source, "owner retired");
   });
 
   it("does not contaminate local compaction, memory, review or unadmitted startup prewarm", () => {
-    const { context, register } = fixture();
+    const { prepare, register } = fixture();
     const registration = register("persona B");
     const exclusions: JsonObject[] = [
       { request_kind: "compaction" },
@@ -387,43 +354,36 @@ describe("parent-local inference context", () => {
     ];
     for (const extra of exclusions) {
       const source = request("root", registration.generation, extra);
-      expect(context.prepare(source).body).toEqual(source);
+      expect(prepare(source).body).toEqual(source);
     }
     // Native Memory metadata intentionally omits its nested thread identity while
     // client_metadata still carries the physical thread ID.
-    const memory = {
-      instructions: "native memory instructions",
-      input: [],
-      client_metadata: {
-        thread_id: "memory-thread",
-        "x-codex-turn-metadata": JSON.stringify({ request_kind: "memory" }),
-      },
-    };
-    expect(context.prepare(memory).body).toEqual(memory);
+    const memory = wire(
+      { request_kind: "memory" },
+      { thread_id: "memory-thread" },
+      { instructions: "native memory instructions", input: [] },
+    );
+    expect(prepare(memory).body).toEqual(memory);
     expect(readCodexInferenceMetadata(memory)).toMatchObject({
       threadId: "memory-thread",
       requestKind: "memory",
     });
-    const classifier = {
-      instructions: "native classifier instructions",
-      input: [],
-      client_metadata: {
-        session_id: "session",
-        thread_id: "classifier-connection",
-        turn_id: "classification-turn",
-        parent_turn_id: "parent-turn",
-        "x-openai-subagent": "guardian",
-        "x-codex-turn-metadata": JSON.stringify({
-          session_id: "session",
-          thread_id: "classifier-connection",
-          turn_id: "classification-turn",
-          parent_turn_id: "parent-turn",
-          root_turn_id: "root-turn",
-          guardian_classifier_source_thread_id: "root",
-          thread_source: "guardian_classifier",
-        }),
-      },
+    const classifierIdentity = {
+      session_id: "session",
+      thread_id: "classifier-connection",
+      turn_id: "classification-turn",
+      parent_turn_id: "parent-turn",
     };
+    const classifier = wire(
+      {
+        ...classifierIdentity,
+        root_turn_id: "root-turn",
+        guardian_classifier_source_thread_id: "root",
+        thread_source: "guardian_classifier",
+      },
+      { ...classifierIdentity, "x-openai-subagent": "guardian" },
+      { instructions: "native classifier instructions", input: [] },
+    );
     const classifierMetadata = readCodexInferenceMetadata(classifier);
     expect(classifierMetadata).toMatchObject({
       threadId: "classifier-connection",
@@ -433,29 +393,22 @@ describe("parent-local inference context", () => {
       subagent: "guardian",
     });
     expect(classifierMetadata.requestKind).toBeUndefined();
-    expect(context.prepare(classifier, classifierMetadata).body).toBe(classifier);
+    expect(prepare(classifier, classifierMetadata).body).toBe(classifier);
     const rootWithClassifierHint = request("root", registration.generation, {
       guardian_classifier_source_thread_id: "root",
     });
-    expect(context.prepare(rootWithClassifierHint).body.instructions).toContain("persona B");
+    expect(prepare(rootWithClassifierHint).body.instructions).toContain("persona B");
     const startup = { ...request("root", undefined, { request_kind: "prewarm" }), generate: false };
-    expect(context.prepare(startup).body).toEqual(startup);
+    expect(prepare(startup).body).toEqual(startup);
     // Immediate normal continuation after compaction still reads the current snapshot.
-    expect(context.prepare(request("root", registration.generation)).body.instructions).toContain(
+    expect(prepare(request("root", registration.generation)).body.instructions).toContain(
       "persona B",
     );
-    context.close();
   });
 
   it("bounds retained prefixes independently of completed turn registrations", () => {
-    const { context, controller } = fixture();
-    const register = (threadId: string) =>
-      context.register({
-        threadId,
-        text: "prepared",
-        signal: controller.signal,
-        assertCurrent: () => {},
-      });
+    const { context, controller, register: registerRoot } = fixture();
+    const register = (threadId: string) => registerRoot("prepared", threadId);
     for (let index = 0; index < 256; index += 1) {
       register(`thread-${index}`).release();
     }
@@ -477,33 +430,28 @@ describe("parent-local inference context", () => {
     ).toThrow("closed");
   });
 
-  it("bounds context and fences aborts, missing metadata and unsupported request kinds", () => {
-    const { context, controller, register } = fixture();
+  it("bounds context and rejects invalid requests or aborted registrations", () => {
+    const { controller, register, prepare, rejects } = fixture();
     expect(() => register("x".repeat(256 * 1024 + 1))).toThrow("limit");
     const registered = register("private");
     const source = request("root", registered.generation);
-    expect(() => context.prepare({ instructions: "base" })).toThrow("metadata");
+    rejects({ ...source, instructions: null }, "instructions");
+    rejects({ instructions: "base" }, "metadata");
     const invalidMetadata: JsonObject[] = [
       { thread_id: "x".repeat(257) },
       { auto_review_enabled: "true" },
     ];
     for (const extra of invalidMetadata) {
-      expect(() => context.prepare(request("root", registered.generation, extra))).toThrow(
-        "metadata",
-      );
+      rejects(request("root", registered.generation, extra), "metadata");
     }
-    expect(() =>
-      context.prepare({
-        client_metadata: { "x-codex-turn-metadata": "x".repeat(1024 * 1024 + 1) },
-      }),
-    ).toThrow("bounded native metadata");
-    expect(() =>
-      context.prepare(request("root", registered.generation, { request_kind: "other" })),
-    ).toThrow("purpose");
-    const prepared = context.prepare(source);
+    rejects(
+      { client_metadata: { "x-codex-turn-metadata": "x".repeat(1024 * 1024 + 1) } },
+      "bounded native metadata",
+    );
+    rejects(request("root", registered.generation, { request_kind: "other" }), "purpose");
+    const prepared = prepare(source);
     controller.abort();
     expect(prepared.signal?.aborted).toBe(true);
-    expect(() => context.prepare(source)).toThrow("current admitted");
-    context.close();
+    rejects(source, "current admitted");
   });
 });

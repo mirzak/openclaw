@@ -1,4 +1,5 @@
-import { EventEmitter } from "node:events";
+import assert from "node:assert/strict";
+import { EventEmitter, once } from "node:events";
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
@@ -18,8 +19,6 @@ import { CODEX_APP_SERVER_VERSION } from "./version.js";
 
 const transport = vi.hoisted(() => ({
   upstream: "",
-  dials: 0,
-  upgrades: new Set<string>(),
   rejected: [] as { status: number; connected: boolean; threadId?: string }[],
   socketThreads: new WeakMap<object, string>(),
   closedSockets: new WeakSet<object>(),
@@ -52,7 +51,6 @@ vi.mock("node:http", async (original) => {
         server.on("upgrade", (request, socket) => {
           const threadId = request.headers["thread-id"];
           if (typeof threadId === "string") {
-            transport.upgrades.add(threadId);
             transport.socketThreads.set(socket, threadId);
           }
           socket.once("close", () => {
@@ -92,7 +90,6 @@ vi.mock("openclaw/plugin-sdk/websocket-runtime", async (original) => {
     ...actual,
     WebSocket: class extends actual.WebSocket {
       constructor(url: string | URL, options?: ClientOptions) {
-        transport.dials++;
         super(String(url).startsWith("wss:") ? transport.upstream : url, options);
       }
     },
@@ -206,31 +203,20 @@ describe.skipIf(process.platform === "win32")("native inference admission", () =
       const changed = new EventEmitter();
       changed.setMaxListeners(64);
       transport.upstream = "";
-      transport.dials = 0;
-      transport.upgrades.clear();
       transport.closedThreads.clear();
       transport.httpSockets.clear();
       transport.httpClosed = 0;
       transport.fetch.mockReset().mockRejectedValue(new Error("Unexpected native HTTP fallback"));
       transport.rejected = [];
       transport.changed = () => changed.emit("changed");
-      const waitFor = <T>(read: () => T | undefined): Promise<T> => {
-        const value = read();
-        if (value !== undefined) {
-          return Promise.resolve(value);
+      const waitFor = async <T>(read: () => T | undefined): Promise<T> => {
+        for (;;) {
+          const value = read();
+          if (value !== undefined) {
+            return value;
+          }
+          await once(changed, "changed");
         }
-        return new Promise((resolve) => {
-          const check = () => {
-            const next = read();
-            if (next === undefined) {
-              return;
-            }
-            changed.off("changed", check);
-            resolve(next);
-          };
-          changed.on("changed", check);
-          check();
-        });
       };
       const upstream = http.createServer();
       const wss = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
@@ -256,9 +242,7 @@ describe.skipIf(process.platform === "win32")("native inference admission", () =
       };
       const finish = (threadId: string) => {
         const socket = held.get(threadId);
-        if (!socket) {
-          throw new Error("Fixture thread has no held response");
-        }
+        assert(socket, "Fixture thread has no held response");
         held.delete(threadId);
         reply(socket, assistantMessage(`answer-${responseSequence}`, "synthetic complete"));
         changed.emit("changed");
@@ -273,21 +257,19 @@ describe.skipIf(process.platform === "win32")("native inference admission", () =
           changed.emit("changed");
         });
         socket.on("message", (raw) => {
-          if (!Buffer.isBuffer(raw)) {
-            throw new Error("Expected a native WebSocket text buffer");
-          }
+          assert(Buffer.isBuffer(raw), "Expected a native WebSocket text buffer");
           const body: unknown = JSON.parse(raw.toString("utf8"));
-          if (!isJsonObject(body) || !isJsonObject(body.client_metadata)) {
-            throw new Error("Native metadata missing");
-          }
+          assert(
+            isJsonObject(body) && isJsonObject(body.client_metadata),
+            "Native metadata missing",
+          );
           const encoded = body.client_metadata["x-codex-turn-metadata"];
-          if (typeof encoded !== "string") {
-            throw new Error("Native turn metadata missing");
-          }
+          assert(typeof encoded === "string", "Native turn metadata missing");
           const info: unknown = JSON.parse(encoded);
-          if (!isJsonObject(info) || typeof info.thread_id !== "string") {
-            throw new Error("Native thread identity missing");
-          }
+          assert(
+            isJsonObject(info) && typeof info.thread_id === "string",
+            "Native thread identity missing",
+          );
           metadata.set(info.thread_id, info);
           if (body.generate === false) {
             reply(socket);
@@ -314,9 +296,7 @@ describe.skipIf(process.platform === "win32")("native inference admission", () =
         upstream.listen(0, "127.0.0.1", resolve);
       });
       const address = upstream.address();
-      if (!address || typeof address === "string") {
-        throw new Error("Fixture listener missing");
-      }
+      assert(address && typeof address !== "string", "Fixture listener missing");
       transport.upstream = `ws://127.0.0.1:${address.port}`;
       const proxy = await createCodexInferenceProxy({
         upstream: new URL("https://api.openai.com/v1"),
@@ -430,7 +410,6 @@ describe.skipIf(process.platform === "win32")("native inference admission", () =
       await waitFor(() => (transport.closedThreads.has(cancelled.threadId) ? true : undefined));
       expect(transport.rejected.some((entry) => entry.threadId === cancelled.threadId)).toBe(false);
       await waitFor(() => (!held.has(cancelled.threadId) ? true : undefined));
-      expect(held.has(cancelled.threadId)).toBe(false);
       const parent = await begin(true);
       const childId = await waitFor(
         () => [...metadata].find(([, info]) => info.parent_thread_id === parent.threadId)?.[0],
