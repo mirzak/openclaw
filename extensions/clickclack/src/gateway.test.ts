@@ -4,6 +4,8 @@ import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ResolvedClickClackAccount } from "./types.js";
 
+type GatewayContext = ChannelGatewayContext<ResolvedClickClackAccount>;
+
 class FakeSocket extends EventEmitter {
   emitErrorOnClose = false;
 
@@ -48,17 +50,13 @@ vi.mock("./http-client.js", async (importOriginal) => {
   };
 });
 
-vi.mock("./inbound.js", () => ({
-  handleClickClackInbound: mocks.handleClickClackInbound,
-}));
+vi.mock("./inbound.js", () => ({ handleClickClackInbound: mocks.handleClickClackInbound }));
 
 vi.mock("openclaw/plugin-sdk/native-command-registry", () => ({
   listNativeCommandSpecsForConfig: () => [],
 }));
 
-vi.mock("./resolve.js", () => ({
-  resolveWorkspaceId: mocks.resolveWorkspaceId,
-}));
+vi.mock("./resolve.js", () => ({ resolveWorkspaceId: mocks.resolveWorkspaceId }));
 
 import { startClickClackGatewayAccount } from "./gateway.js";
 import { ClickClackHttpError } from "./http-client.js";
@@ -68,7 +66,7 @@ function createGatewayContext(
   options: {
     commandMenu?: boolean;
   } = {},
-): ChannelGatewayContext<ResolvedClickClackAccount> {
+): GatewayContext {
   const setStatus = vi.fn();
   const log = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
   return {
@@ -83,16 +81,13 @@ function createGatewayContext(
           ...(options.commandMenu === undefined ? {} : { commandMenu: options.commandMenu }),
         },
       },
-    } as ChannelGatewayContext<ResolvedClickClackAccount>["cfg"],
+    } as GatewayContext["cfg"],
     accountId: "default",
     account: {} as ResolvedClickClackAccount,
-    runtime: {} as ChannelGatewayContext<ResolvedClickClackAccount>["runtime"],
+    runtime: {} as GatewayContext["runtime"],
     abortSignal,
     log,
-    getStatus: () =>
-      ({ accountId: "default" }) as ReturnType<
-        ChannelGatewayContext<ResolvedClickClackAccount>["getStatus"]
-      >,
+    getStatus: () => ({ accountId: "default" }) as ReturnType<GatewayContext["getStatus"]>,
     setStatus,
   };
 }
@@ -103,6 +98,25 @@ async function startGateway(options: { commandMenu?: boolean } = {}) {
   const run = startClickClackGatewayAccount(ctx);
   await waitForGatewayState(() => expect(mocks.client.websocket).toHaveBeenCalledTimes(1));
   return { abort, ctx, run };
+}
+
+function reconnectSockets() {
+  const firstSocket = new FakeSocket();
+  const secondSocket = new FakeSocket();
+  mocks.client.websocket.mockReturnValueOnce(firstSocket).mockReturnValueOnce(secondSocket);
+  return { firstSocket, secondSocket };
+}
+
+async function stopGateway(abort: AbortController, run: Promise<void>) {
+  abort.abort();
+  await run;
+}
+
+function expectBacklogPage(call: number, afterCursor: string) {
+  expect(mocks.client.eventPage).toHaveBeenNthCalledWith(call, "workspace-1", {
+    afterCursor,
+    limit: 500,
+  });
 }
 
 function createBacklogEvent(index: number, type = "channel.updated") {
@@ -187,8 +201,7 @@ describe("ClickClack gateway", () => {
       terminalDisconnect: undefined,
     });
 
-    abort.abort();
-    await run;
+    await stopGateway(abort, run);
   });
 
   it.each([
@@ -217,9 +230,8 @@ describe("ClickClack gateway", () => {
       message: "[default] ClickClack command menu sync failed: network unavailable",
     },
   ])("continues startup after $label", async ({ error, level, message }) => {
+    mocks.client.websocket.mockReturnValue(new FakeSocket());
     mocks.client.setBotCommands.mockRejectedValueOnce(error);
-    const socket = new FakeSocket();
-    mocks.client.websocket.mockReturnValue(socket);
     const { abort, ctx, run } = await startGateway();
 
     expect(ctx.log?.[level]).toHaveBeenCalledWith(message);
@@ -232,13 +244,11 @@ describe("ClickClack gateway", () => {
       baseUrl: "https://clickclack.example",
     });
 
-    abort.abort();
-    await run;
+    await stopGateway(abort, run);
   });
 
   it("drains and processes every reconnect page before reopening realtime", async () => {
-    const firstSocket = new FakeSocket();
-    const secondSocket = new FakeSocket();
+    const { firstSocket } = reconnectSockets();
     const firstReconnectPage = Array.from({ length: 500 }, (_, index) =>
       createBacklogEvent(index + 1),
     );
@@ -246,28 +256,17 @@ describe("ClickClack gateway", () => {
       .mockResolvedValueOnce({ events: [], tailCursor: "" })
       .mockResolvedValueOnce({ events: firstReconnectPage })
       .mockResolvedValueOnce({ events: [createBacklogEvent(501, "message.created")] });
-    mocks.client.websocket.mockReturnValueOnce(firstSocket).mockReturnValueOnce(secondSocket);
     const { abort, run } = await startGateway();
     firstSocket.emit("close");
     await waitForGatewayState(() => expect(mocks.client.websocket).toHaveBeenCalledTimes(2));
 
-    expect(mocks.client.eventPage).toHaveBeenNthCalledWith(2, "workspace-1", {
-      afterCursor: "",
-      limit: 500,
-    });
-    expect(mocks.client.eventPage).toHaveBeenNthCalledWith(3, "workspace-1", {
-      afterCursor: "cursor-500",
-      limit: 500,
-    });
-    expect(mocks.client.eventPage).toHaveBeenNthCalledWith(4, "workspace-1", {
-      afterCursor: "cursor-501",
-      limit: 500,
-    });
+    expectBacklogPage(2, "");
+    expectBacklogPage(3, "cursor-500");
+    expectBacklogPage(4, "cursor-501");
     expect(mocks.handleClickClackInbound).toHaveBeenCalledTimes(1);
     expect(mocks.client.websocket).toHaveBeenLastCalledWith("workspace-1", "cursor-501");
 
-    abort.abort();
-    await run;
+    await stopGateway(abort, run);
   });
 
   it("skips malformed websocket frames without stopping the monitor", async () => {
@@ -300,15 +299,12 @@ describe("ClickClack gateway", () => {
     });
     expect(mocks.createClickClackClient).toHaveBeenCalledTimes(1);
     expect(mocks.handleClickClackInbound.mock.calls[0]?.[0]).not.toHaveProperty("correlationId");
-    abort.abort();
-    await run;
+    await stopGateway(abort, run);
     expect(runError).toBeUndefined();
   });
 
   it("processes websocket events in order before reconnecting from their cursor", async () => {
-    const firstSocket = new FakeSocket();
-    const secondSocket = new FakeSocket();
-    mocks.client.websocket.mockReturnValueOnce(firstSocket).mockReturnValueOnce(secondSocket);
+    const { firstSocket } = reconnectSockets();
     let finishFirstEvent: (() => void) | undefined;
     mocks.handleClickClackInbound.mockImplementationOnce(
       () =>
@@ -336,8 +332,7 @@ describe("ClickClack gateway", () => {
       limit: 500,
     });
 
-    abort.abort();
-    await run;
+    await stopGateway(abort, run);
   });
 
   it("does not dispatch queued websocket events after the account stops", async () => {
@@ -350,8 +345,7 @@ describe("ClickClack gateway", () => {
     emitMessageEvent(socket, 2);
     await waitForGatewayState(() => expect(mocks.handleClickClackInbound).toHaveBeenCalledOnce());
 
-    abort.abort();
-    await run;
+    await stopGateway(abort, run);
     expect(ctx.setStatus).toHaveBeenLastCalledWith(
       expect.objectContaining({ lifecycle: "stopped" }),
     );
@@ -414,8 +408,7 @@ describe("ClickClack gateway", () => {
   );
 
   it("replays a failed websocket event on reconnect without processing later queued events", async () => {
-    const firstSocket = new FakeSocket();
-    const secondSocket = new FakeSocket();
+    const { firstSocket } = reconnectSockets();
     const events = [
       createBacklogEvent(1, "message.created"),
       createBacklogEvent(2, "message.created"),
@@ -424,7 +417,6 @@ describe("ClickClack gateway", () => {
       .mockResolvedValueOnce({ events: [], tailCursor: "" })
       .mockResolvedValueOnce({ events })
       .mockResolvedValueOnce({ events: [] });
-    mocks.client.websocket.mockReturnValueOnce(firstSocket).mockReturnValueOnce(secondSocket);
     mocks.handleClickClackInbound.mockRejectedValueOnce(new Error("dispatch failed"));
     const { abort, ctx, run } = await startGateway();
 
@@ -436,28 +428,22 @@ describe("ClickClack gateway", () => {
 
     expect(mocks.handleClickClackInbound).toHaveBeenCalledTimes(3);
     expect(firstSocket.close).toHaveBeenCalledOnce();
-    expect(mocks.client.eventPage).toHaveBeenNthCalledWith(2, "workspace-1", {
-      afterCursor: "",
-      limit: 500,
-    });
+    expectBacklogPage(2, "");
     expect(mocks.client.websocket).toHaveBeenLastCalledWith("workspace-1", "cursor-2");
     expect(ctx.log?.warn).toHaveBeenCalledWith(
       "[default] ClickClack event processing failed; reconnecting: dispatch failed",
     );
 
-    abort.abort();
-    await run;
+    await stopGateway(abort, run);
   });
 
   it("replays a transient authoritative message fetch before committing its cursor", async () => {
-    const firstSocket = new FakeSocket();
-    const secondSocket = new FakeSocket();
+    const { firstSocket } = reconnectSockets();
     const event = createBacklogEvent(1, "message.created");
     mocks.client.eventPage
       .mockResolvedValueOnce({ events: [], tailCursor: "" })
       .mockResolvedValueOnce({ events: [event] })
       .mockResolvedValueOnce({ events: [] });
-    mocks.client.websocket.mockReturnValueOnce(firstSocket).mockReturnValueOnce(secondSocket);
     mocks.client.message.mockRejectedValueOnce(new Error("message fetch failed"));
     const { abort, ctx, run } = await startGateway();
 
@@ -467,17 +453,13 @@ describe("ClickClack gateway", () => {
     expect(mocks.client.message).toHaveBeenCalledTimes(2);
     expect(mocks.handleClickClackInbound).toHaveBeenCalledOnce();
     expect(firstSocket.close).toHaveBeenCalledOnce();
-    expect(mocks.client.eventPage).toHaveBeenNthCalledWith(2, "workspace-1", {
-      afterCursor: "",
-      limit: 500,
-    });
+    expectBacklogPage(2, "");
     expect(mocks.client.websocket).toHaveBeenLastCalledWith("workspace-1", "cursor-1");
     expect(ctx.log?.warn).toHaveBeenCalledWith(
       "[default] ClickClack event processing failed; reconnecting: message fetch failed",
     );
 
-    abort.abort();
-    await run;
+    await stopGateway(abort, run);
   });
 
   it("does not serialize unrelated gateway streams", async () => {
@@ -542,8 +524,7 @@ describe("ClickClack gateway", () => {
     expect(ctx.log?.info).toHaveBeenCalledWith(
       expect.stringContaining("skipped ClickClack message before agent dispatch"),
     );
-    abort.abort();
-    await run;
+    await stopGateway(abort, run);
   });
 
   it("passes other bot-authored messages to ClickClack access policy", async () => {
@@ -594,15 +575,12 @@ describe("ClickClack gateway", () => {
       expect.objectContaining({ correlationId: "fakeco.case_1" }),
     );
 
-    abort.abort();
-    await run;
+    await stopGateway(abort, run);
   });
 
   it("reconnects after ClickClack websocket errors", async () => {
-    const firstSocket = new FakeSocket();
+    const { firstSocket } = reconnectSockets();
     firstSocket.emitErrorOnClose = true;
-    const secondSocket = new FakeSocket();
-    mocks.client.websocket.mockReturnValueOnce(firstSocket).mockReturnValueOnce(secondSocket);
     const { abort, ctx, run } = await startGateway();
 
     firstSocket.emit("error", new Error("gateway dropped"));
@@ -617,16 +595,13 @@ describe("ClickClack gateway", () => {
       lifecycle: "recovering",
       lastError: "gateway dropped",
     });
-    abort.abort();
-    await run;
+    await stopGateway(abort, run);
   });
 
   it("cancels the reconnect delay when the gateway aborts", async () => {
     vi.useFakeTimers();
     try {
-      const firstSocket = new FakeSocket();
-      const secondSocket = new FakeSocket();
-      mocks.client.websocket.mockReturnValueOnce(firstSocket).mockReturnValueOnce(secondSocket);
+      const { firstSocket } = reconnectSockets();
       const abort = new AbortController();
       const ctx = createGatewayContext(abort.signal);
       const run = startClickClackGatewayAccount(ctx);
@@ -660,14 +635,12 @@ describe("ClickClack gateway", () => {
   });
 
   it("logs non-Error websocket failures before replaying them", async () => {
-    const firstSocket = new FakeSocket();
-    const secondSocket = new FakeSocket();
+    const { firstSocket } = reconnectSockets();
     const event = createBacklogEvent(1, "message.created");
     mocks.client.eventPage
       .mockResolvedValueOnce({ events: [], tailCursor: "" })
       .mockResolvedValueOnce({ events: [event] })
       .mockResolvedValueOnce({ events: [] });
-    mocks.client.websocket.mockReturnValueOnce(firstSocket).mockReturnValueOnce(secondSocket);
     const rejection = { code: "ECONNRESET", retryable: true };
     mocks.resolveClickClackInboundAccess.mockRejectedValueOnce(rejection);
     const { abort, ctx, run } = await startGateway();
@@ -680,7 +653,6 @@ describe("ClickClack gateway", () => {
     );
     expect(mocks.client.websocket).toHaveBeenLastCalledWith("workspace-1", "cursor-1");
 
-    abort.abort();
-    await run;
+    await stopGateway(abort, run);
   });
 });

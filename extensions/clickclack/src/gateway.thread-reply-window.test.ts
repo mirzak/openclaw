@@ -5,15 +5,14 @@ import { WebSocketServer } from "ws";
 import type { ClickClackMessage, ResolvedClickClackAccount } from "./types.js";
 
 const CLICKCLACK_THREAD_DEFAULT_LIMIT = 100;
+type GatewayContext = ChannelGatewayContext<ResolvedClickClackAccount>;
 
 const mocks = vi.hoisted(() => ({
   handleClickClackInbound: vi.fn(),
   resolveClickClackInboundAccess: vi.fn(),
 }));
 
-vi.mock("./inbound.js", () => ({
-  handleClickClackInbound: mocks.handleClickClackInbound,
-}));
+vi.mock("./inbound.js", () => ({ handleClickClackInbound: mocks.handleClickClackInbound }));
 
 vi.mock("./access.js", () => ({
   resolveClickClackInboundAccess: mocks.resolveClickClackInboundAccess,
@@ -21,29 +20,7 @@ vi.mock("./access.js", () => ({
 
 const { startClickClackGatewayAccount } = await import("./gateway.js");
 
-function threadReply(index: number): ClickClackMessage {
-  return {
-    id: `msg-${index}`,
-    workspace_id: "wsp_1",
-    channel_id: "chn_1",
-    author_id: "usr_human",
-    parent_message_id: "msg_root",
-    thread_root_id: "msg_root",
-    thread_seq: index,
-    body: `reply ${index}`,
-    body_format: "markdown",
-    created_at: "2026-01-01T00:00:00.000Z",
-    author: {
-      id: "usr_human",
-      kind: "human",
-      display_name: "Human",
-      handle: "human",
-      avatar_url: "",
-      created_at: "2026-01-01T00:00:00.000Z",
-    },
-  };
-}
-
+const CREATED_AT = "2026-01-01T00:00:00.000Z";
 const THREAD_ROOT: ClickClackMessage = {
   id: "msg_root",
   workspace_id: "wsp_1",
@@ -53,35 +30,43 @@ const THREAD_ROOT: ClickClackMessage = {
   channel_seq: 1,
   body: "root",
   body_format: "markdown",
-  created_at: "2026-01-01T00:00:00.000Z",
+  created_at: CREATED_AT,
 };
-
+function threadReply(index: number): ClickClackMessage {
+  return {
+    ...THREAD_ROOT,
+    channel_seq: undefined,
+    id: `msg-${index}`,
+    parent_message_id: "msg_root",
+    thread_seq: index,
+    body: `reply ${index}`,
+    author: {
+      id: "usr_human",
+      kind: "human",
+      display_name: "Human",
+      handle: "human",
+      avatar_url: "",
+      created_at: CREATED_AT,
+    },
+  };
+}
 const ALL_REPLIES = Array.from({ length: 101 }, (_, index) => threadReply(index + 1));
 const LATEST_REPLY = ALL_REPLIES[ALL_REPLIES.length - 1];
-
 const DM_ROOT: ClickClackMessage = {
+  ...THREAD_ROOT,
   id: "msg_dm_root",
-  workspace_id: "wsp_1",
+  channel_id: undefined,
   direct_conversation_id: "dmc_1",
-  author_id: "usr_human",
   thread_root_id: "msg_dm_root",
-  channel_seq: 1,
   body: "dm root",
-  body_format: "markdown",
-  created_at: "2026-01-01T00:00:00.000Z",
 };
-
 const DM_THREAD_REPLY: ClickClackMessage = {
+  ...DM_ROOT,
   id: "msg_dm_reply",
-  workspace_id: "wsp_1",
-  direct_conversation_id: "dmc_1",
-  author_id: "usr_human",
+  channel_seq: undefined,
   parent_message_id: "msg_dm_root",
-  thread_root_id: "msg_dm_root",
   thread_seq: 1,
   body: "dm thread reply",
-  body_format: "markdown",
-  created_at: "2026-01-01T00:00:00.000Z",
 };
 
 const RESOLVABLE_MESSAGES = [...ALL_REPLIES, DM_THREAD_REPLY];
@@ -105,35 +90,26 @@ async function startClickClackTestServer(): Promise<ClickClackTestServer> {
       res.end(JSON.stringify(body));
     };
     if (url.pathname === "/api/me") {
-      json(200, {
+      return json(200, {
         user: {
           id: "usr_bot",
           kind: "bot",
           display_name: "Bot",
           handle: "bot",
           avatar_url: "",
-          created_at: "2026-01-01T00:00:00.000Z",
+          created_at: CREATED_AT,
         },
       });
-      return;
     }
     if (url.pathname === "/api/workspaces") {
-      json(200, {
+      return json(200, {
         workspaces: [
-          {
-            id: "wsp_1",
-            route_id: "rt_1",
-            name: "Main",
-            slug: "main",
-            created_at: "2026-01-01T00:00:00.000Z",
-          },
+          { id: "wsp_1", route_id: "rt_1", name: "Main", slug: "main", created_at: CREATED_AT },
         ],
       });
-      return;
     }
     if (url.pathname === "/api/realtime/events") {
-      json(200, { events: [], tail_cursor: "cursor-0" });
-      return;
+      return json(200, { events: [], tail_cursor: "cursor-0" });
     }
     const threadMatch = url.pathname.match(/^\/api\/messages\/([^/]+)\/thread$/u);
     if (threadMatch) {
@@ -146,7 +122,7 @@ async function startClickClackTestServer(): Promise<ClickClackTestServer> {
         url.searchParams.get("latest") === "true"
           ? ALL_REPLIES.slice(-limit)
           : ALL_REPLIES.slice(0, limit);
-      json(200, {
+      return json(200, {
         root: THREAD_ROOT,
         replies: window,
         thread_state: {
@@ -156,11 +132,9 @@ async function startClickClackTestServer(): Promise<ClickClackTestServer> {
           last_reply_author_ids: ["usr_human"],
         },
       });
-      return;
     }
     if (/^\/api\/dms\/[^/]+\/messages$/u.test(url.pathname)) {
-      json(200, { messages: [DM_ROOT], oldest_seq: 1, has_older: false });
-      return;
+      return json(200, { messages: [DM_ROOT], oldest_seq: 1, has_older: false });
     }
     const messageMatch = url.pathname.match(/^\/api\/messages\/([^/]+)$/u);
     if (messageMatch) {
@@ -169,11 +143,9 @@ async function startClickClackTestServer(): Promise<ClickClackTestServer> {
         ? undefined
         : RESOLVABLE_MESSAGES.find((candidate) => candidate.id === messageId);
       if (!message) {
-        json(404, { error: "message not found" });
-        return;
+        return json(404, { error: "message not found" });
       }
-      json(200, { message });
-      return;
+      return json(200, { message });
     }
     json(404, { error: `unhandled ${url.pathname}` });
   });
@@ -208,7 +180,7 @@ async function startClickClackTestServer(): Promise<ClickClackTestServer> {
         workspace_id: "wsp_1",
         channel_id: "chn_1",
         seq: 1,
-        created_at: "2026-01-01T00:00:00.000Z",
+        created_at: CREATED_AT,
         payload: {
           message_id: messageId,
           root_message_id: "msg_root",
@@ -234,10 +206,7 @@ async function startClickClackTestServer(): Promise<ClickClackTestServer> {
   };
 }
 
-function createGatewayContext(
-  apiBaseUrl: string,
-  abortSignal: AbortSignal,
-): ChannelGatewayContext<ResolvedClickClackAccount> {
+function createGatewayContext(apiBaseUrl: string, abortSignal: AbortSignal): GatewayContext {
   return {
     cfg: {
       channels: {
@@ -250,26 +219,31 @@ function createGatewayContext(
           commandMenu: false,
         },
       },
-    } as ChannelGatewayContext<ResolvedClickClackAccount>["cfg"],
+    } as GatewayContext["cfg"],
     accountId: "default",
     account: {} as ResolvedClickClackAccount,
-    runtime: {} as ChannelGatewayContext<ResolvedClickClackAccount>["runtime"],
+    runtime: {} as GatewayContext["runtime"],
     abortSignal,
     log: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    getStatus: () =>
-      ({ accountId: "default" }) as ReturnType<
-        ChannelGatewayContext<ResolvedClickClackAccount>["getStatus"]
-      >,
+    getStatus: () => ({ accountId: "default" }) as ReturnType<GatewayContext["getStatus"]>,
     setStatus: vi.fn(),
   };
 }
 
 describe("ClickClack gateway thread reply resolution", () => {
+  async function expectDispatch(id: string, body: string) {
+    await vi.waitFor(() => expect(mocks.handleClickClackInbound).toHaveBeenCalledTimes(1));
+    expect(mocks.handleClickClackInbound).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.objectContaining({ id, body }) }),
+    );
+    expect(testServer.requestPaths).toContain(`GET /api/messages/${id}`);
+  }
+
   let testServer: ClickClackTestServer;
   let abort: AbortController | undefined;
   let run: Promise<void> | undefined;
 
-  function startGateway(): ChannelGatewayContext<ResolvedClickClackAccount> {
+  function startGateway(): GatewayContext {
     abort = new AbortController();
     const ctx = createGatewayContext(testServer.apiBaseUrl, abort.signal);
     run = startClickClackGatewayAccount(ctx);
@@ -302,14 +276,7 @@ describe("ClickClack gateway thread reply resolution", () => {
     const ctx = startGateway();
 
     await testServer.emitThreadReplyEvent("msg-101");
-    await vi.waitFor(() => expect(mocks.handleClickClackInbound).toHaveBeenCalledTimes(1));
-
-    expect(mocks.handleClickClackInbound).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: expect.objectContaining({ id: "msg-101", body: "reply 101" }),
-      }),
-    );
-    expect(testServer.requestPaths).toContain("GET /api/messages/msg-101");
+    await expectDispatch("msg-101", "reply 101");
     expect(ctx.log?.warn).not.toHaveBeenCalled();
   });
 
@@ -320,14 +287,7 @@ describe("ClickClack gateway thread reply resolution", () => {
       direct_conversation_id: "dmc_1",
       root_message_id: "msg_dm_root",
     });
-    await vi.waitFor(() => expect(mocks.handleClickClackInbound).toHaveBeenCalledTimes(1));
-
-    expect(mocks.handleClickClackInbound).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: expect.objectContaining({ id: "msg_dm_reply", body: "dm thread reply" }),
-      }),
-    );
-    expect(testServer.requestPaths).toContain("GET /api/messages/msg_dm_reply");
+    await expectDispatch("msg_dm_reply", "dm thread reply");
   });
 
   it("records a warning instead of silently handling an unreadable event message", async () => {

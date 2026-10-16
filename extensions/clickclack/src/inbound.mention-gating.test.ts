@@ -30,6 +30,30 @@ beforeEach(() => {
   setClickClackRuntime(runtime);
 });
 
+function rootResponse(overrides: Partial<ClickClackMessage> = {}) {
+  return Response.json({
+    message: createMessage({
+      id: "msg_root",
+      thread_root_id: "msg_root",
+      author_id: "usr_receiver",
+      ...overrides,
+    }),
+  });
+}
+
+function admissionCase<T extends object>(name: string, options: T, shouldDispatch = false) {
+  return { name, shouldDispatch, ...options };
+}
+
+async function handleCurrent(
+  account: ResolvedClickClackAccount,
+  config: CoreConfig,
+  message: Partial<ClickClackMessage>,
+) {
+  vi.mocked(runtime.config.current).mockReturnValue(config);
+  await handleClickClackInbound({ account, config, message: createMessage(message) });
+}
+
 describe("ClickClack inbound mention gating", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -53,15 +77,14 @@ describe("ClickClack inbound mention gating", () => {
     });
 
     const currentConfig = createInboundDiscussionConfig() satisfies CoreConfig;
-    vi.mocked(runtime.config.current).mockReturnValue(currentConfig);
-    await handleClickClackInbound({
-      account: createAgentAccount({
+    await handleCurrent(
+      createAgentAccount({
         replyMode: "model",
         discussions: { enabled: true, workspace: "wsp_1", section: "Sessions" },
       }),
-      config: currentConfig,
-      message: createMessage({ channel_id: "chn_1", body: "Old discussion" }),
-    });
+      currentConfig,
+      { channel_id: "chn_1", body: "Old discussion" },
+    );
 
     expect(runtime.channel.inbound.dispatch).not.toHaveBeenCalled();
     expect(bindingStore.get(mainSessionKey)).toMatchObject({ sessionId: "old-session-id" });
@@ -179,83 +202,52 @@ describe("ClickClack inbound mention gating", () => {
     unavailable?: boolean;
     shouldDispatch: boolean;
   }>([
-    {
-      name: "preserves mention gating for another bot's thread",
+    admissionCase("preserves mention gating for another bot's thread", {
       root: { author_id: "usr_other_bot" },
-      shouldDispatch: false,
-    },
-    {
-      name: "rejects a mismatched root message",
+    }),
+    admissionCase("rejects a mismatched root message", {
       root: { id: "msg_other", thread_root_id: "msg_other" },
-      shouldDispatch: false,
-    },
-    {
-      name: "rejects a root from another workspace",
-      root: { workspace_id: "wsp_other" },
-      shouldDispatch: false,
-    },
-    {
-      name: "rejects a root from another channel",
-      root: { channel_id: "chn_other" },
-      shouldDispatch: false,
-    },
-    {
-      name: "does not equate a bot reply with owning the thread",
+    }),
+    admissionCase("rejects a root from another workspace", { root: { workspace_id: "wsp_other" } }),
+    admissionCase("rejects a root from another channel", { root: { channel_id: "chn_other" } }),
+    admissionCase("does not equate a bot reply with owning the thread", {
       root: { parent_message_id: "msg_actual_root", thread_root_id: "msg_actual_root" },
-      shouldDispatch: false,
-    },
-    {
-      name: "preserves mention gating when root lookup fails",
-      unavailable: true,
-      shouldDispatch: false,
-    },
-    {
-      name: "preserves the mention-only bot sender policy in this bot's thread",
+    }),
+    admissionCase("preserves mention gating when root lookup fails", { unavailable: true }),
+    admissionCase("preserves the mention-only bot sender policy in this bot's thread", {
       account: { allowFrom: ["usr_owner"], allowBots: "mentions" },
       message: { author: createAuthor({ kind: "bot" }) },
-      shouldDispatch: false,
-    },
-    {
-      name: "preserves mention gating in the parent channel",
+    }),
+    admissionCase("preserves mention gating in the parent channel", {
       message: { parent_message_id: undefined, thread_root_id: "msg_1" },
-      shouldDispatch: false,
-    },
-    {
-      name: "uses exact channel policy over the wildcard and account",
+    }),
+    admissionCase("uses exact channel policy over the wildcard and account", {
       account: {
         groups: {
           "*": { requireMentionInBotThreads: false },
           chn_1: { requireMentionInBotThreads: true },
         },
       },
-      shouldDispatch: false,
-    },
-    {
-      name: "inherits wildcard thread policy through a partial channel rule",
-      account: {
-        requireMentionInBotThreads: true,
-        groups: {
-          "*": { requireMentionInBotThreads: false },
-          chn_1: { mentionPatterns: [] },
+    }),
+    admissionCase(
+      "inherits wildcard thread policy through a partial channel rule",
+      {
+        account: {
+          requireMentionInBotThreads: true,
+          groups: {
+            "*": { requireMentionInBotThreads: false },
+            chn_1: { mentionPatterns: [] },
+          },
         },
       },
-      shouldDispatch: true,
-    },
+      true,
+    ),
   ])("$name", async ({ account, message, root, unavailable, shouldDispatch }) => {
     const fetchRoot = vi.fn<typeof fetch>();
     if (unavailable) {
       fetchRoot.mockRejectedValue(new Error("ClickClack unavailable"));
     } else {
-      fetchRoot.mockResolvedValue(
-        Response.json({
-          message: createMessage({
-            id: "msg_root",
-            thread_root_id: "msg_root",
-            author_id: "usr_receiver",
-            ...root,
-          }),
-        }),
-      );
+      fetchRoot.mockResolvedValue(rootResponse(root));
     }
     vi.stubGlobal("fetch", fetchRoot);
     const resolvedAccount = createAgentAccount({
@@ -264,17 +256,11 @@ describe("ClickClack inbound mention gating", () => {
       ...account,
     });
     const config = createAccountConfig(resolvedAccount);
-    vi.mocked(runtime.config.current).mockReturnValue(config);
-
-    await handleClickClackInbound({
-      account: resolvedAccount,
-      config,
-      message: createMessage({
-        parent_message_id: "msg_root",
-        thread_root_id: "msg_root",
-        body: "please follow up",
-        ...message,
-      }),
+    await handleCurrent(resolvedAccount, config, {
+      parent_message_id: "msg_root",
+      thread_root_id: "msg_root",
+      body: "please follow up",
+      ...message,
     });
 
     expect(runtime.channel.inbound.dispatch).toHaveBeenCalledTimes(shouldDispatch ? 1 : 0);
@@ -287,10 +273,7 @@ describe("ClickClack inbound mention gating", () => {
     removeChannel?: boolean;
     botSender?: boolean;
   }>([
-    {
-      name: "thread mentions become required",
-      patch: { requireMentionInBotThreads: true },
-    },
+    { name: "thread mentions become required", patch: { requireMentionInBotThreads: true } },
     { name: "sender access is revoked", patch: { allowFrom: ["usr_other"] } },
     { name: "bot senders are disabled", patch: { allowBots: false }, botSender: true },
     { name: "the account is disabled", patch: { enabled: false } },
@@ -346,15 +329,7 @@ describe("ClickClack inbound mention gating", () => {
               },
             },
       );
-      root.resolve(
-        Response.json({
-          message: createMessage({
-            id: "msg_root",
-            thread_root_id: "msg_root",
-            author_id: "usr_receiver",
-          }),
-        }),
-      );
+      root.resolve(rootResponse());
       await handling;
 
       expect(runtime.channel.inbound.dispatch).not.toHaveBeenCalled();
@@ -372,69 +347,55 @@ describe("ClickClack inbound mention gating", () => {
     omitThreadPolicy?: boolean;
     shouldDispatch: boolean;
   }>([
-    { name: "bot identity changes", patch: { botUserId: "usr_other_bot" }, shouldDispatch: false },
-    {
-      name: "thread mentions become required",
+    admissionCase("bot identity changes", { patch: { botUserId: "usr_other_bot" } }),
+    admissionCase("thread mentions become required", {
       patch: { requireMentionInBotThreads: true },
-      shouldDispatch: false,
-    },
-    {
-      name: "ordinary group sender access is revoked without a thread option",
+    }),
+    admissionCase("ordinary group sender access is revoked without a thread option", {
       patch: { allowFrom: ["usr_other"] },
       omitThreadPolicy: true,
-      shouldDispatch: false,
-    },
-    {
-      name: "ordinary group bot access is revoked without a thread option",
+    }),
+    admissionCase("ordinary group bot access is revoked without a thread option", {
       patch: { allowBots: false },
       botSender: true,
       omitThreadPolicy: true,
-      shouldDispatch: false,
-    },
-    {
-      name: "static sender group membership is revoked",
+    }),
+    admissionCase("static sender group membership is revoked", {
       patch: {},
       senderGroup: true,
       accessGroups: {
         operators: { type: "message.senders", members: { clickclack: ["usr_other"] } },
       },
-      shouldDispatch: false,
-    },
-    {
-      name: "static sender group is cloned without changing membership",
-      patch: {},
-      senderGroup: true,
-      accessGroups: {
-        operators: { type: "message.senders", members: { clickclack: ["usr_owner"] } },
+    }),
+    admissionCase(
+      "static sender group is cloned without changing membership",
+      {
+        patch: {},
+        senderGroup: true,
+        accessGroups: {
+          operators: { type: "message.senders", members: { clickclack: ["usr_owner"] } },
+        },
       },
-      shouldDispatch: true,
-    },
-    {
-      name: "bot sender now requires a mention",
+      true,
+    ),
+    admissionCase("bot sender now requires a mention", {
       patch: { allowBots: "mentions" },
       botSender: true,
-      shouldDispatch: false,
-    },
-    {
-      name: "bot sender satisfies its new mention restriction",
-      patch: { allowBots: "mentions" },
-      body: "@blackbird please follow up",
-      botSender: true,
-      shouldDispatch: true,
-    },
-    {
-      name: "bot sender is replaced by a human-only wildcard",
+    }),
+    admissionCase(
+      "bot sender satisfies its new mention restriction",
+      { patch: { allowBots: "mentions" }, body: "@blackbird please follow up", botSender: true },
+      true,
+    ),
+    admissionCase("bot sender is replaced by a human-only wildcard", {
       patch: { allowFrom: ["*"] },
       botSender: true,
-      shouldDispatch: false,
-    },
-    {
-      name: "an authorized command retains activation",
-      patch: { requireMentionInBotThreads: true },
-      body: "/status",
-      command: true,
-      shouldDispatch: true,
-    },
+    }),
+    admissionCase(
+      "an authorized command retains activation",
+      { patch: { requireMentionInBotThreads: true }, body: "/status", command: true },
+      true,
+    ),
   ])(
     "rechecks admission when $name while ingress settles",
     async ({
@@ -468,18 +429,7 @@ describe("ClickClack inbound mention gating", () => {
           : {}),
       };
       vi.mocked(runtime.config.current).mockReturnValue(config);
-      vi.stubGlobal(
-        "fetch",
-        vi.fn<typeof fetch>().mockResolvedValue(
-          Response.json({
-            message: createMessage({
-              id: "msg_root",
-              thread_root_id: "msg_root",
-              author_id: "usr_receiver",
-            }),
-          }),
-        ),
-      );
+      vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(rootResponse()));
       const admitted = createDeferred<void>();
       const resume = createDeferred<void>();
       const resolveStable = runtime.channel.inbound.ingress.resolveStable;
@@ -506,9 +456,7 @@ describe("ClickClack inbound mention gating", () => {
       vi.mocked(runtime.config.current).mockReturnValue({
         ...config,
         ...(accessGroups ? { accessGroups } : {}),
-        channels: {
-          clickclack: { ...config.channels?.clickclack, ...patch },
-        },
+        channels: { clickclack: { ...config.channels?.clickclack, ...patch } },
       });
       resume.resolve();
       await handling;
@@ -556,15 +504,7 @@ describe("ClickClack inbound mention gating", () => {
         clickclack: { ...config.channels?.clickclack, discussions: { enabled: false } },
       },
     });
-    root.resolve(
-      Response.json({
-        message: createMessage({
-          id: "msg_root",
-          thread_root_id: "msg_root",
-          author_id: "usr_receiver",
-        }),
-      }),
-    );
+    root.resolve(rootResponse());
     await handling;
 
     expect(runtime.channel.inbound.dispatch).not.toHaveBeenCalled();
@@ -589,10 +529,7 @@ describe("ClickClack inbound mention gating", () => {
         },
       },
       bindings: [
-        {
-          agentId: "service-bot",
-          match: { channel: "clickclack", accountId: "default" },
-        },
+        { agentId: "service-bot", match: { channel: "clickclack", accountId: "default" } },
       ],
       channels: {
         clickclack: {
@@ -604,16 +541,15 @@ describe("ClickClack inbound mention gating", () => {
         },
       },
     } satisfies CoreConfig;
-    vi.mocked(runtime.config.current).mockReturnValue(currentConfig);
-    await handleClickClackInbound({
-      account: createAgentAccount({
+    await handleCurrent(
+      createAgentAccount({
         agentId: "service-bot",
         requireMention: true,
         discussions: { enabled: true, workspace: "wsp_1", section: "Sessions" },
       }),
-      config: currentConfig,
-      message: createMessage({ body: "@research investigate this" }),
-    });
+      currentConfig,
+      { body: "@research investigate this" },
+    );
 
     const dispatch = vi.mocked(runtime.channel.inbound.dispatch);
     expect(dispatch).toHaveBeenCalledTimes(1);
