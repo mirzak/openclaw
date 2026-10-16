@@ -46,7 +46,9 @@ const readGeometry = () => ({
   },
 });
 
-function snapshotRoutes(cdpUrl: string) {
+type Target = { cdpUrl: string; targetId: string };
+
+function snapshotRoutes({ cdpUrl, targetId }: Target) {
   const state: BrowserServerState = {
     port: 0,
     resolved: resolveBrowserConfig({
@@ -60,11 +62,25 @@ function snapshotRoutes(cdpUrl: string) {
     routes.app,
     createBrowserRouteContext({ getState: () => state }),
   );
-  return routes;
+  return async (
+    route: "/snapshot" | "/screenshot",
+    options: Record<string, unknown> = {},
+    expectedStatus = 200,
+  ) => {
+    const response = createBrowserRouteResponse();
+    const data = { targetId, ...(route === "/snapshot" ? { format: "ai" } : {}), ...options };
+    if (route === "/snapshot") {
+      await routes.getHandlers.get(route)!({ params: {}, query: data }, response.res);
+    } else {
+      await routes.postHandlers.get(route)!({ params: {}, query: {}, body: data }, response.res);
+    }
+    expect(response.statusCode, JSON.stringify(response.body)).toBe(expectedStatus);
+    return response;
+  };
 }
 
 async function withBrowser(
-  run: (target: { cdpUrl: string; targetId: string }, page: Page, wsUrl: string) => Promise<void>,
+  run: (target: Target, page: Page, wsUrl: string) => Promise<void>,
   deviceScaleFactor?: number,
   showScrollbars = false,
 ) {
@@ -104,7 +120,7 @@ async function expectImage(
   page: Page,
   buffer: Buffer,
   size: [number, number],
-  points: Array<{ x: number; y: number; rgb: number[] }>,
+  points: Array<[x: number, y: number, rgb: number[]]>,
 ) {
   expect([buffer.readUInt32BE(16), buffer.readUInt32BE(20)]).toEqual(size);
   const pixels = await page.evaluate(
@@ -117,13 +133,23 @@ async function expectImage(
       canvas.height = image.height;
       const context = canvas.getContext("2d")!;
       context.drawImage(image, 0, 0);
-      return samplePoints.map(({ x, y }) =>
+      return samplePoints.map(([x, y]) =>
         Array.from(context.getImageData(x, y, 1, 1).data).slice(0, 3),
       );
     },
     { base64: buffer.toString("base64"), points },
   );
-  expect(pixels).toEqual(points.map(({ rgb }) => rgb));
+  expect(pixels).toEqual(points.map((point) => point[2]));
+}
+
+const frameButton = (page: Page, selector = "iframe", name?: string) =>
+  page.frameLocator(selector).getByRole("button", name ? { name } : {});
+
+async function replaceFrame(page: Page, selector: string, name: string, observer = page) {
+  await page.locator(selector).evaluate((frame, label) => {
+    (frame as HTMLIFrameElement).srcdoc = `<button>${label}</button>`;
+  }, name);
+  await frameButton(observer, selector, name).waitFor();
 }
 
 async function readLabelBox(page: Page, buffer: Buffer) {
@@ -177,8 +203,8 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
           await page.setContent(
             `<iframe id="selected" srcdoc="<button onclick=&quot;this.textContent='Selected clicked'&quot;>Original child</button>"></iframe><iframe id="sibling" srcdoc="<button>Sibling child</button>"></iframe>`,
           );
-          await page.frameLocator("#selected").getByRole("button").waitFor();
-          await page.frameLocator("#sibling").getByRole("button").waitFor();
+          await frameButton(page, "#selected").waitFor();
+          await frameButton(page, "#sibling").waitFor();
           const capturedPage = await getPageForTargetId(target);
           const capture = capturedPage.ariaSnapshot.bind(capturedPage);
           let captured = false;
@@ -195,13 +221,7 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
           const navigatedSelector = stage === "sibling" ? "#sibling" : "#selected";
           const navigateChild = async () => {
             navigated = true;
-            await page.locator(navigatedSelector).evaluate((frame) => {
-              (frame as HTMLIFrameElement).srcdoc = "<button>Replacement child</button>";
-            });
-            await capturedPage
-              .frameLocator(navigatedSelector)
-              .getByRole("button", { name: "Replacement child" })
-              .waitFor();
+            await replaceFrame(page, navigatedSelector, "Replacement child", capturedPage);
           };
           const sessionSpy = vi
             .spyOn(context, "newCDPSession")
@@ -237,33 +257,21 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
               return cdp;
             });
           try {
-            const routes = snapshotRoutes(target.cdpUrl);
-            const response = createBrowserRouteResponse();
-            await routes.getHandlers.get("/snapshot")!(
-              {
-                params: {},
-                query: {
-                  targetId: target.targetId,
-                  format: "ai",
-                  ...(stage !== "response" ? { frame: "#selected" } : {}),
-                },
-              },
-              response.res,
+            const response = await snapshotRoutes(target)(
+              "/snapshot",
+              stage !== "response" ? { frame: "#selected" } : {},
+              stage === "sibling" ? 200 : 500,
             );
             expect(navigated).toBe(true);
             if (stage === "sibling") {
-              expect(response.statusCode, JSON.stringify(response.body)).toBe(200);
               const snapshot = response.body as { refs: Record<string, { name?: string }> };
               const ref = Object.entries(snapshot.refs).find(
                 ([, info]) => info.name === "Original child",
               )![0];
               await clickViaPlaywright({ ...target, ref, timeoutMs: 1_000 });
-              expect(await page.frameLocator("#selected").getByRole("button").textContent()).toBe(
-                "Selected clicked",
-              );
+              expect(await frameButton(page, "#selected").textContent()).toBe("Selected clicked");
               return;
             }
-            expect(response.statusCode).toBe(500);
             expect(response.body).toEqual({
               error: "Error: Frame changed while its browser snapshot was being captured; retry.",
             });
@@ -281,48 +289,22 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
       async (scope) => {
         await withBrowser(async (target, page) => {
           await page.setContent('<iframe srcdoc="<button>Original document</button>"></iframe>');
-          await page
-            .frameLocator("iframe")
-            .getByRole("button", { name: "Original document" })
-            .waitFor();
-          const routes = snapshotRoutes(target.cdpUrl);
-          const capture = async () => {
-            const result = createBrowserRouteResponse();
-            await routes.getHandlers.get("/snapshot")!(
-              {
-                params: {},
-                query: {
-                  targetId: target.targetId,
-                  format: "ai",
-                  ...(scope === "frame" ? { frame: "iframe" } : {}),
-                },
-              },
-              result.res,
-            );
-            expect(result.statusCode, JSON.stringify(result.body)).toBe(200);
-            return result.body;
-          };
+          await frameButton(page, "iframe", "Original document").waitFor();
+          const routes = snapshotRoutes(target);
+          const capture = async () =>
+            (await routes("/snapshot", scope === "frame" ? { frame: "iframe" } : {})).body;
           const original = await capture();
           expect(original).not.toHaveProperty("newElements");
-          await page
-            .frameLocator("iframe")
-            .getByRole("button")
-            .evaluate((button) => {
-              button.insertAdjacentHTML("afterend", "<button>Same-document addition</button>");
-            });
+          await frameButton(page).evaluate((button) => {
+            button.insertAdjacentHTML("afterend", "<button>Same-document addition</button>");
+          });
           const mutated = await capture();
           expect(mutated).toHaveProperty("newElements");
           expect(mutated).toHaveProperty(
             "snapshot",
             expect.stringMatching(/button "Same-document addition".*\[new\]/),
           );
-          await page.locator("iframe").evaluate((frame) => {
-            (frame as HTMLIFrameElement).srcdoc = "<button>Replacement document</button>";
-          });
-          await page
-            .frameLocator("iframe")
-            .getByRole("button", { name: "Replacement document" })
-            .waitFor();
+          await replaceFrame(page, "iframe", "Replacement document");
           const replacement = await capture();
           expect(replacement).not.toHaveProperty("newElements");
         });
@@ -339,21 +321,12 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
             <h1>Page heading</h1><button onclick="document.querySelector('output').textContent='clicked'">Target</button><output></output>
             <a href="https://parent.test/docs">Parent docs</a>
             <iframe srcdoc="<style>html,body{margin:0}button{display:block;width:180px;height:80px;background:rgb(224,79,95);border:0}</style><button onclick=&quot;document.querySelector('output').textContent='clicked'&quot;>Frame target</button><output></output><a href='https://frame.test/docs'>Frame docs</a>"></iframe>`);
-          await page.frameLocator("iframe").getByRole("button").waitFor();
-          const routes = snapshotRoutes(target.cdpUrl);
-          const snapshot = createBrowserRouteResponse();
-          await routes.getHandlers.get("/snapshot")!(
-            {
-              params: {},
-              query: {
-                targetId: target.targetId,
-                format: "ai",
-                ...(mode === "frame" ? { frame: "iframe", urls: true } : {}),
-              },
-            },
-            snapshot.res,
+          await frameButton(page).waitFor();
+          const routes = snapshotRoutes(target);
+          const snapshot = await routes(
+            "/snapshot",
+            mode === "frame" ? { frame: "iframe", urls: true } : {},
           );
-          expect(snapshot.statusCode, JSON.stringify(snapshot.body)).toBe(200);
           const result = snapshot.body as {
             snapshot: string;
             refs: Record<string, { name?: string }>;
@@ -364,25 +337,12 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
             expect.soft(result.snapshot).toContain("Frame docs -> https://frame.test/docs");
             expect.soft(result.snapshot).not.toContain("Parent docs -> https://parent.test/docs");
           }
-          const capture = createBrowserRouteResponse();
-          await routes.postHandlers.get("/screenshot")!(
-            {
-              params: {},
-              query: {},
-              body: {
-                targetId: target.targetId,
-                ref,
-                labels: true,
-              },
-            },
-            capture.res,
-          );
-          expect(capture.statusCode, JSON.stringify(capture.body)).toBe(200);
+          const capture = await routes("/screenshot", { ref, labels: true });
           const screenshot = capture.body as { path: string; annotations: AnnotationItem[] };
           try {
             const buffer = await fs.readFile(screenshot.path);
             await expectImage(page, buffer, mode === "frame" ? [180, 80] : [120, 60], [
-              { x: 10, y: 40, rgb: [224, 79, 95] },
+              [10, 40, [224, 79, 95]],
             ]);
             expect(screenshot.annotations).toContainEqual(expect.objectContaining({ ref, name }));
             await clickViaPlaywright({ ...target, ref, timeoutMs: 1_000 });
@@ -405,8 +365,8 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
           buffer,
           [before.width, 1200],
           [
-            { x: 20, y: 20, rgb: [16, 42, 67] },
-            { x: before.width - 20, y: 1180, rgb: [51, 78, 104] },
+            [20, 20, [16, 42, 67]],
+            [before.width - 20, 1180, [51, 78, 104]],
           ],
         );
         expect(await page.evaluate(readGeometry)).toEqual(before);
@@ -424,8 +384,8 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
           buffer,
           [1280, 720],
           [
-            { x: 1250, y: 20, rgb: [16, 42, 67] },
-            { x: 1250, y: 700, rgb: [51, 78, 104] },
+            [1250, 20, [16, 42, 67]],
+            [1250, 700, [51, 78, 104]],
           ],
         );
         expect(await page.evaluate(readGeometry)).toEqual(before);
@@ -461,8 +421,8 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
             element ? [360, 180] : [1170, mode === "fullpage" ? 3600 : 1992],
             [
               element
-                ? { x: 180, y: 90, rgb: [224, 79, 95] }
-                : { x: 100, y: mode === "fullpage" ? 3000 : 1700, rgb: [51, 78, 104] },
+                ? [180, 90, [224, 79, 95]]
+                : [100, mode === "fullpage" ? 3000 : 1700, [51, 78, 104]],
             ],
           );
           if (result.annotations) {
@@ -483,12 +443,7 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
         });
         const touch = await page.evaluate(() => navigator.maxTouchPoints);
         const cropped = await takeScreenshotViaPlaywright({ ...target, element: "button" });
-        await expectImage(
-          page,
-          cropped.buffer,
-          [900, 700],
-          [{ x: 850, y: 350, rgb: [224, 79, 95] }],
-        );
+        await expectImage(page, cropped.buffer, [900, 700], [[850, 350, [224, 79, 95]]]);
         expect(await page.evaluate(() => navigator.maxTouchPoints)).toBe(touch);
       });
     }, 30_000);
@@ -518,7 +473,7 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
             const zoom = await page.context().newCDPSession(page);
             await zoom.send("Emulation.setPageScaleFactor", { pageScaleFactor: pageScale });
             await zoom.detach();
-            const routes = snapshotRoutes(target.cdpUrl);
+            const routes = snapshotRoutes(target);
             for (const mode of ["viewport", "fullpage", "element", "snapshot"] as const) {
               await page.evaluate(() => scrollTo(0, 420));
               if (mode === "element") {
@@ -533,28 +488,15 @@ describe.runIf(process.env.OPENCLAW_BROWSER_SNAPSHOT_E2E === "1")(
               if (showScrollbars) {
                 expect(before.width - before.visual.width).toBe(16);
               }
-              const response = createBrowserRouteResponse();
-              const request = { targetId: target.targetId, labels: true };
-              if (mode === "snapshot") {
-                await routes.getHandlers.get("/snapshot")!(
-                  { params: {}, query: { ...request, format: "ai" } },
-                  response.res,
-                );
-              } else {
-                await routes.postHandlers.get("/screenshot")!(
-                  {
-                    params: {},
-                    query: {},
-                    body: {
-                      ...request,
+              const response = await routes(mode === "snapshot" ? "/snapshot" : "/screenshot", {
+                labels: true,
+                ...(mode === "snapshot"
+                  ? {}
+                  : {
                       fullPage: mode === "fullpage",
                       element: mode === "element" ? "section" : undefined,
-                    },
-                  },
-                  response.res,
-                );
-              }
-              expect(response.statusCode, JSON.stringify(response.body)).toBe(200);
+                    }),
+              });
               const result = response.body as {
                 path?: string;
                 imagePath?: string;

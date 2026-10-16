@@ -1,4 +1,3 @@
-// Browser tests cover proxy files plugin behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { extractOriginalFilename } from "openclaw/plugin-sdk/media-runtime";
@@ -9,6 +8,11 @@ import { persistBrowserProxyResultFiles } from "./proxy-files.js";
 
 const BROWSER_PROXY_MAX_FILES = 256;
 const BROWSER_PROXY_MAX_TOTAL_FILE_BYTES = 16 * 1024 * 1024;
+const file = (filePath: string, contents: string | Buffer = "", mimeType?: string) => ({
+  path: filePath,
+  base64: Buffer.from(contents).toString("base64"),
+  ...(mimeType ? { mimeType } : {}),
+});
 
 describe("persistBrowserProxyResultFiles", () => {
   let tempHome: TempHomeEnv;
@@ -21,19 +25,22 @@ describe("persistBrowserProxyResultFiles", () => {
     await tempHome.restore();
   });
 
+  async function expectRejected(result: unknown, files: unknown, message: string) {
+    const persisting = persistBrowserProxyResultFiles(result, files);
+    await expect(persisting).rejects.toBeInstanceOf(Error);
+    await expect(persisting).rejects.toThrow(new Error(message));
+    await expect(
+      fs.stat(path.join(tempHome.home, ".openclaw", "media", "browser")),
+    ).rejects.toHaveProperty("code", "ENOENT");
+  }
+
   it.each([
     { sourcePath: "C:\\downloads\\quarterly-report.pdf", expectedFilename: "quarterly-report.pdf" },
     { sourcePath: "/tmp/my <file>:test!.bin", expectedFilename: "my_filetest.pdf" },
   ])("preserves a safe filename from $sourcePath", async ({ sourcePath, expectedFilename }) => {
     const contents = "%PDF-1.7 browser proxy download";
     const result = { download: { path: sourcePath, suggestedFilename: "website-title.pdf" } };
-    await persistBrowserProxyResultFiles(result, [
-      {
-        path: sourcePath,
-        base64: Buffer.from(contents).toString("base64"),
-        mimeType: "application/pdf",
-      },
-    ]);
+    await persistBrowserProxyResultFiles(result, [file(sourcePath, contents, "application/pdf")]);
 
     const savedPath = result.download.path;
     expect(path.dirname(savedPath)).toBe(path.join(tempHome.home, ".openclaw", "media", "browser"));
@@ -46,7 +53,7 @@ describe("persistBrowserProxyResultFiles", () => {
     const sourcePath = "/tmp/empty-browser-download.bin";
     const result = { path: sourcePath };
     await persistBrowserProxyResultFiles(result, [
-      { path: sourcePath, base64: "", mimeType: "application/octet-stream" },
+      file(sourcePath, "", "application/octet-stream"),
     ]);
 
     const savedPath = result.path;
@@ -62,124 +69,71 @@ describe("persistBrowserProxyResultFiles", () => {
       0x42,
     );
 
-    const error = await persistBrowserProxyResultFiles(
+    await expectRejected(
       { downloads: [{ path: "/tmp/first.bin" }, { path: "/tmp/second.bin" }] },
       [
-        {
-          path: "/tmp/first.bin",
-          base64: first.toString("base64"),
-          mimeType: "application/octet-stream",
-        },
-        {
-          path: "/tmp/second.bin",
-          base64: second.toString("base64"),
-          mimeType: "application/octet-stream",
-        },
+        file("/tmp/first.bin", first, "application/octet-stream"),
+        file("/tmp/second.bin", second, "application/octet-stream"),
       ],
-    ).then(
-      () => null,
-      (err: unknown) => err,
+      "browser proxy files exceed 16 MiB aggregate limit",
     );
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toBe("browser proxy files exceed 16 MiB aggregate limit");
-
-    await expect(
-      fs.stat(path.join(tempHome.home, ".openclaw", "media", "browser")),
-    ).rejects.toHaveProperty("code", "ENOENT");
   });
 
   it("rejects a file above the proxy per-file limit", async () => {
     const oversized = Buffer.alloc(BROWSER_PROXY_MAX_FILE_BYTES + 1, 0x41);
-    const error = await persistBrowserProxyResultFiles({ path: "/tmp/oversized.bin" }, [
-      {
-        path: "/tmp/oversized.bin",
-        base64: oversized.toString("base64"),
-        mimeType: "application/octet-stream",
-      },
-    ]).then(
-      () => null,
-      (err: unknown) => err,
+    await expectRejected(
+      { path: "/tmp/oversized.bin" },
+      [file("/tmp/oversized.bin", oversized, "application/octet-stream")],
+      "browser proxy file exceeds 10 MiB limit",
     );
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toBe("browser proxy file exceeds 10 MiB limit");
-
-    await expect(
-      fs.stat(path.join(tempHome.home, ".openclaw", "media", "browser")),
-    ).rejects.toHaveProperty("code", "ENOENT");
   });
 
   it("rejects a later malformed file without persisting an earlier valid file", async () => {
-    await expect(
-      persistBrowserProxyResultFiles(
-        {
-          downloads: [
-            { path: "/tmp/valid-browser-download.txt" },
-            { path: "/tmp/malformed-browser-download.bin" },
-          ],
-        },
-        [
-          {
-            path: "/tmp/valid-browser-download.txt",
-            base64: Buffer.from("valid browser download").toString("base64"),
-            mimeType: "text/plain",
-          },
-          { path: "/tmp/malformed-browser-download.bin", base64: "ZE==" },
+    await expectRejected(
+      {
+        downloads: [
+          { path: "/tmp/valid-browser-download.txt" },
+          { path: "/tmp/malformed-browser-download.bin" },
         ],
-      ),
-    ).rejects.toThrow("browser proxy file contains malformed base64 data");
-
-    await expect(
-      fs.stat(path.join(tempHome.home, ".openclaw", "media", "browser")),
-    ).rejects.toHaveProperty("code", "ENOENT");
+      },
+      [
+        file("/tmp/valid-browser-download.txt", "valid browser download", "text/plain"),
+        { path: "/tmp/malformed-browser-download.bin", base64: "ZE==" },
+      ],
+      "browser proxy file contains malformed base64 data",
+    );
   });
 
   it("rejects too many files before persisting any", async () => {
-    const files = Array.from({ length: BROWSER_PROXY_MAX_FILES + 1 }, (_, index) => ({
-      path: `/tmp/file-${index}.bin`,
-      base64: "",
-      mimeType: "application/octet-stream",
-    }));
+    const files = Array.from({ length: BROWSER_PROXY_MAX_FILES + 1 }, (_, index) =>
+      file(`/tmp/file-${index}.bin`, "", "application/octet-stream"),
+    );
 
-    await expect(
-      persistBrowserProxyResultFiles(
-        { downloads: files.map((file) => ({ path: file.path })) },
-        files,
-      ),
-    ).rejects.toThrow("browser proxy response exceeds 256 file limit");
-    await expect(
-      fs.stat(path.join(tempHome.home, ".openclaw", "media", "browser")),
-    ).rejects.toHaveProperty("code", "ENOENT");
+    await expectRejected(
+      { downloads: files.map(({ path: filePath }) => ({ path: filePath })) },
+      files,
+      "browser proxy response exceeds 256 file limit",
+    );
   });
 
   it.each([
-    {
-      name: "missing payload",
-      result: { path: "/node/missing.png" },
-      files: undefined,
-    },
-    {
-      name: "duplicate payload path",
-      result: { path: "/node/duplicate.png" },
-      files: [
-        { path: "/node/duplicate.png", base64: "" },
-        { path: "/node/duplicate.png", base64: "" },
-      ],
-    },
-    {
-      name: "unreferenced extra payload",
-      result: { path: "/node/owned.png" },
-      files: [
-        { path: "/node/owned.png", base64: "" },
-        { path: "/node/unowned.png", base64: "" },
-      ],
-    },
-  ])("rejects $name before persisting any files", async ({ result, files }) => {
-    await expect(persistBrowserProxyResultFiles(result, files)).rejects.toThrow(
+    ["missing payload", "/node/missing.png", undefined],
+    [
+      "duplicate payload path",
+      "/node/duplicate.png",
+      [file("/node/duplicate.png"), file("/node/duplicate.png")],
+    ],
+    [
+      "unreferenced extra payload",
+      "/node/owned.png",
+      [file("/node/owned.png"), file("/node/unowned.png")],
+    ],
+  ] as const)("rejects %s before persisting any files", async (_name, sourcePath, files) => {
+    await expectRejected(
+      { path: sourcePath },
+      files,
       "browser proxy returned an invalid file envelope",
     );
-    await expect(
-      fs.stat(path.join(tempHome.home, ".openclaw", "media", "browser")),
-    ).rejects.toHaveProperty("code", "ENOENT");
   });
 
   it("rewrites a complete file mapping without traversing nested page data", async () => {
@@ -210,10 +164,7 @@ describe("persistBrowserProxyResultFiles", () => {
     ];
     await persistBrowserProxyResultFiles(
       result,
-      routePaths.map((filePath) => ({
-        path: filePath,
-        base64: Buffer.from(filePath).toString("base64"),
-      })),
+      routePaths.map((filePath) => file(filePath, filePath)),
     );
 
     expect(result.path).not.toBe(routePaths[0]);
