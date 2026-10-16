@@ -136,13 +136,13 @@ async function seedSession(
   return { sessionId: created.payload.sessionId, storePath };
 }
 
-function placementReq<T = unknown>(
+function placementReq(
   method: Parameters<typeof directSessionReq>[0],
   key: string,
   context: Record<string, unknown>,
   params: Record<string, unknown> = {},
-): ReturnType<typeof directSessionReq<T>> {
-  return directSessionReq<T>(method, { key, ...params }, { context });
+) {
+  return directSessionReq(method, { key, ...params }, { context });
 }
 
 function sequencedPlacementReader(
@@ -279,10 +279,10 @@ test("sessions.reset preserves device-folder affinity after reclaim and refuses 
   await harness.service.dispatch(REQUEST);
   expect(await harness.service.reclaim(REQUEST)).toMatchObject({ state: "reclaimed" });
 
-  const reset = await placementReq<{ entry: { deviceFolder?: typeof deviceFolder } }>(
+  const reset = await directSessionReq<{ entry: { deviceFolder?: typeof deviceFolder } }>(
     "sessions.reset",
-    REQUEST.sessionKey,
-    { workerSessionPlacementService: placementStore },
+    { key: REQUEST.sessionKey },
+    { context: { workerSessionPlacementService: placementStore } },
   );
   expect(reset.ok, JSON.stringify(reset.error)).toBe(true);
   expect(placementStore.get(REQUEST.sessionId)).toBeUndefined();
