@@ -18,9 +18,7 @@ const owner = vi.hoisted(() => ({
   startedAt: 100,
   port: 18789,
   mode: "foreground" as const,
-  supervisor: null,
   state: "live" as const,
-  expired: false,
 }));
 const readyProbe = vi.hoisted(() => ({
   ok: true,
@@ -41,12 +39,8 @@ const lock = {
   pid: owner.pid,
   port: owner.port,
   createdAt: "2026-09-13T02:27:25Z",
-  startTime: owner.startedAt,
 };
-const command = {
-  programArguments: ["gateway", "--port", "18789"],
-  environment: {},
-};
+const command = { programArguments: ["gateway", "--port", "18789"], environment: {} };
 
 vi.mock("../../runtime.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../runtime.js")>()),
@@ -61,16 +55,12 @@ vi.mock("../../config/config.js", async (original) => ({
   readBestEffortConfig: async () => ({ gateway: { port: 18789 } }),
 }));
 vi.mock("../../config/io.js", () => ({
-  createConfigIO: () => ({
-    readBestEffortConfig: async () => ({ gateway: { port: 18789 } }),
-  }),
+  createConfigIO: () => ({ readBestEffortConfig: async () => ({ gateway: { port: 18789 } }) }),
 }));
 vi.mock("./lifecycle-action-preflight.js", () => ({
   getServiceActionPreflightFailure: async () => null,
 }));
-vi.mock("../../infra/gateway-owner-lease.js", () => ({
-  readGatewayOwnerLease: mocks.readOwner,
-}));
+vi.mock("../../infra/gateway-owner-lease.js", () => ({ readGatewayOwnerLease: mocks.readOwner }));
 vi.mock("../../infra/gateway-lock.js", () => ({
   readActiveGatewayLockPort: async () => owner.port,
   readActiveGatewayLockIdentity: mocks.readLock,
@@ -82,9 +72,7 @@ vi.mock("../../infra/gateway-processes.js", () => ({
   signalVerifiedGatewayPidSync: mocks.signalPid,
   formatGatewayPidList: (pids: number[]) => pids.join(", "),
 }));
-vi.mock("../../gateway/probe.js", () => ({
-  probeGateway: mocks.probeGateway,
-}));
+vi.mock("../../gateway/probe.js", () => ({ probeGateway: mocks.probeGateway }));
 vi.mock("../../gateway/call.js", () => ({ callGatewayCli: mocks.callGatewayCli }));
 vi.mock("./restart-health.js", async (original) => ({
   ...(await original<typeof import("./restart-health.js")>()),
@@ -129,18 +117,6 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-async function expectChangedOwnerRefusal() {
-  const { signalGatewayRestart } = await import("./lifecycle-unmanaged.js");
-  await expect(
-    signalGatewayRestart(owner.port, {
-      enforceRestartConfig: true,
-      processLabel: "unmanaged",
-      auditSource: "cli",
-    }),
-  ).rejects.toThrow("gateway lock owner changed");
-  expectNoCalls(mocks.signalPid, mocks.callGatewayCli);
-}
-
 it.each(["config probe", "legacy intent write"])(
   "refuses a replacement owner at %s",
   async (phase) => {
@@ -159,7 +135,15 @@ it.each(["config probe", "legacy intent write"])(
         return true;
       });
     }
-    await expectChangedOwnerRefusal();
+    const { signalGatewayRestart } = await import("./lifecycle-unmanaged.js");
+    await expect(
+      signalGatewayRestart(owner.port, {
+        enforceRestartConfig: true,
+        processLabel: "unmanaged",
+        auditSource: "cli",
+      }),
+    ).rejects.toThrow("gateway lock owner changed");
+    expectNoCalls(mocks.signalPid, mocks.callGatewayCli);
     if (phase === "config probe") {
       expect(mocks.writeIntent).not.toHaveBeenCalled();
     } else {
@@ -177,10 +161,7 @@ it("restarts the selected foreground owner before reporting healthy recovery", a
   const { runDaemonRestart } = await import("./lifecycle.js");
   await expect(runDaemonRestart({ json: true })).resolves.toBe(true);
   expect(lifecycleRuntimeLogs).toHaveLength(1);
-  expect(JSON.parse(lifecycleRuntimeLogs[0]!)).toMatchObject({
-    ok: true,
-    result: "restarted",
-  });
+  expect(JSON.parse(lifecycleRuntimeLogs[0]!)).toMatchObject({ ok: true, result: "restarted" });
   expectPartialCall(mocks.callGatewayCli, {
     method: "gateway.restart.request",
     params: expect.objectContaining({
